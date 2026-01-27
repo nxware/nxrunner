@@ -17,6 +17,7 @@ class MongoDB(r.BaseJobExecutor):
     def __init__(self, connection_url=None, args: u.Args = None):
         super().__init__('mongodb')
         self.define_sig(d.PStr('op', 'insert_one'), d.PStr('db', 'main'), d.PStr('collection', 'log'))
+        self.define_sig(d.PStr('op', 'find'))
         if args is None:
             args = u.Args()
         if connection_url is None:
@@ -55,6 +56,10 @@ class MongoDB(r.BaseJobExecutor):
         else:
             row = data
         return self.success(result=str(self.insert_one(data['db'], data['collection'], row)))
+
+    def execute_find(self, data):
+        items = self.find(data['db'], data['collection'], data['q'])
+        return self.success(items=items)
 
     def part_db(self, p: b.Page, params={}):
         dbname = params['db']
