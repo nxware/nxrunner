@@ -14,3 +14,4 @@ include = [ "nxrunner/*.py" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner:MongoDB"
+audio_convert = "nxrunner.audio:Convert"
