@@ -14,3 +14,4 @@ include = [ "nxrunner/*.py" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner:MongoDB"
+pihole = "nxrunner.apis:PiHoleApi"
