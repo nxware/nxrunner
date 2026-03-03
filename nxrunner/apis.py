@@ -10,6 +10,8 @@ class PiHoleApi(r.BaseJobExecutor):
     """
       https://github.com/sbarbett/pihole6api
     """
+    MODULES = ['pihole6api']
+
     def __init__(self, url='http://127.0.0.1:7101/', password=None):
         super().__init__('pihole_api')
         from pihole6api import PiHole6Client

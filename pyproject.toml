@@ -14,6 +14,6 @@ include = [ "nxrunner/*.py" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner:MongoDB"
-pihole = "nxrunner.apis:PiHoleApi"
+pihole_api = "nxrunner.apis:PiHoleApi"
 audio_convert = "nxrunner.audio:Convert"
 
