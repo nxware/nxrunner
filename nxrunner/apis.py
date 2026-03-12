@@ -21,6 +21,9 @@ class PiHoleApi(r.BaseJobExecutor):
         history = self.client.metrics.get_history()
         print(history)  # {'history': [{'timestamp': 1740120900, 'total': 0, 'cached': 0 ...}]}
         queries = self.client.metrics.get_queries()
-        p.div(f"Queries: {queries}")
-        p.pre(history)
+        p.div(f"Queries: {queries['recordsTotal']}")
+        #p.pre(history)
+
+        p.h2("See also")
+        p.ul([w.a("pihole6api", 'https://github.com/sbarbett/pihole6api')])
 
