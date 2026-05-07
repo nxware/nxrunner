@@ -19,3 +19,4 @@ audio_convert = "nxrunner.audio:Convert"
 
 [nx]
 pydeps="-xx nxrunner"
+
