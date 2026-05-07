@@ -17,3 +17,5 @@ mongo = "nxrunner:MongoDB"
 pihole_api = "nxrunner.apis:PiHoleApi"
 audio_convert = "nxrunner.audio:Convert"
 
+[nx]
+pydeps="-xx nxrunner"
