@@ -3,6 +3,20 @@
 
 System Automation made simple.
 
+## Running
+
+Der Runner wird über die `nweb.json` oder das `nx.d`-Verzeichnis konfiguriert. Die `nweb.json` wird in `.` oder `/etc` gesucht.
+
+```
+python -m nwebclient.runner --rest
+```
+
+Default-Port für das Webinterface ist `7070`
+
+## Runners/Features
+
+TODO add list
+
 ## Adding Features
 Creeate an EntryPoint in the category `nweb_runner` like `myname = "myns:MyRunnerClass"`, make sure your class
 inherited from `nwebclient.runner.BaseJobExecutor`
