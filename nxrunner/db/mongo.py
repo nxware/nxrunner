@@ -57,6 +57,7 @@ class MongoDB(r.BaseJobExecutor):
 
     def part_index(self, p: b.Page, params={}):
         p.ul(map(lambda x: w.a(str(x), self.link(self.part_db, db=str(x))), self.list_database_names()))
+        p(w.a("Jobs", self.link(self.part_npy)))
 
     def execute_insert_one(self, data):
         if 'row' in data:
@@ -68,6 +69,10 @@ class MongoDB(r.BaseJobExecutor):
     def execute_find(self, data):
         items = self.find(data['db'], data['collection'], data['q'])
         return self.success(items=items)
+
+    def execute_create_ticker(self, data):
+        self.ticker = self.delayed(self.args.get('mongo_job_cron', 623), self.tick)
+        return self.success()
 
     def execute_jobs(self, data=dict()):
         jobs = self.find('nweb', 'jobs')
@@ -89,5 +94,15 @@ class MongoDB(r.BaseJobExecutor):
     def part_col(self, p: b.Page, params={}):
         dbname = params['db']
         colname = params['col']
+        limit = params.get('limit', 50)
         p.h2(f"DB: {dbname} Collection: {colname}")
-        p.pre(json.dumps(list(self.find(dbname, colname, {}, limit=50)), indent=2))
+        rows = list(self.find(dbname, colname, {}, limit=int(limit)))
+        p.pre(json.dumps(rows, indent=2))
+
+    def part_npy(self, p: b.Page, params={}):
+        with p.section(h="npy"):
+            p.div("Query Npy Jobs")
+            if self.ticker is None:
+                p(self.action_btn(dict(title="Create", type=self.type, op='create_ticker')))
+            else:
+                p.prop("Ticker", "active")
