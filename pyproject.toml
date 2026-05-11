@@ -13,7 +13,10 @@ build-backend = "hatchling.build"
 include = [ "nxrunner/*.py" ]
 
 [project.entry-points.nweb_runner]
-mongo = "nxrunner.db.mongo:MongoDB"
+mongo = "nxrunner:MongoDB"
 pihole_api = "nxrunner.apis:PiHoleApi"
 audio_convert = "nxrunner.audio:Convert"
+
+[nx]
+pydeps="-xx nxrunner"
 

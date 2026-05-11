@@ -56,12 +56,27 @@ class MongoDB(r.BaseJobExecutor):
         return col.delete_one(q)
 
     def part_index(self, p: b.Page, params={}):
-        p.ul(map(lambda x: w.a(str(x), self.link(self.part_db, db=str(x))), self.list_database_names()))
-        p(w.a("Jobs", self.link(self.part_npy)))
+        with p.section(h="Databases"):
+            p.ul(map(lambda x: w.a(str(x), self.link(self.part_db, db=str(x))), self.list_database_names()))
+        with p.section(h="nweb"):
+            p(w.a("Jobs", self.link(self.part_npy)))
+            p.prop("Ticker Active", self.ticker is not None)
+            p(self.action_btn(dict(type=self.type, op='jobs')))
+            p(" TODO  jobque verarbeiten")
+            # TODO create job ui
+
+    def create_done_writer(self):
+        def process_done(data):
+            self.insert_one('nweb', 'results', data)
+        root = self.getRoot().jobexecutor
+        # TODO or on emit
+        root.add_runner(r.LambdaRunner('done', process_done))
 
     def execute_insert_one(self, data):
         if 'row' in data:
             row = data['row']
+        elif u.contains_like(data.key, r"row\_%"):
+            row = u.dict_extract_by_prefix(data, 'row_')
         else:
             row = data
         return self.success(result=str(self.insert_one(data['db'], data['collection'], row)))
