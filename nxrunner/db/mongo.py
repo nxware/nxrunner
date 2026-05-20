@@ -1,5 +1,8 @@
 
 import json
+import glob
+import os
+import base64
 
 from nwebclient import runner as r
 from nwebclient import base as b
@@ -16,21 +19,34 @@ class MongoDB(r.BaseJobExecutor):
 
     def __init__(self, connection_url=None, args: u.Args = None):
         super().__init__('mongodb')
+        self.tick_count = 0
         self.ticker = None
+        self.define_vars('tick_count')
         self.define_sig(d.PStr('op', 'insert_one'), d.PStr('db', 'main'), d.PStr('collection', 'log'))
         self.define_sig(d.PStr('op', 'find'))
         self.define_sig(d.PStr('op', 'jobs'))
+        self.define_sig(d.PStr('op', 'collect_files'))
+        self.define_sig(d.PStr('op', 'set_ticker'), d.PInt('value', 600))
         if args is None:
             args = u.Args()
         if connection_url is None:
             connection_url = args.get('mongo_url', "mongodb://localhost:27017/")
         import pymongo
+        from bson import json_util
+        self.json_util = json_util
         self.client = pymongo.MongoClient(connection_url)
         self.args = args
         if 'mongo_job_cron' in args:
             self.ticker = self.delayed(args.get('mongo_job_cron', 623), self.tick)
 
+    def execute_set_ticker(self, data: dict):
+        if self.ticker is not None:
+            from signal import pthread_kill, SIGTSTP
+            pthread_kill(self.ticker.ident, SIGTSTP)
+        self.ticker = self.delayed(int(data['value']), self.tick)
+
     def tick(self):
+        self.tick_count += 1
         self.execute_jobs()
 
     def list_database_names(self):
@@ -75,14 +91,15 @@ class MongoDB(r.BaseJobExecutor):
     def execute_insert_one(self, data):
         if 'row' in data:
             row = data['row']
-        elif u.contains_like(data.key, r"row\_%"):
+        elif u.contains_like(data.keys(), r"row\_%"):
             row = u.dict_extract_by_prefix(data, 'row_')
         else:
             row = data
+            row['debug_info'] = 'execute_insert_one from data'
         return self.success(result=str(self.insert_one(data['db'], data['collection'], row)))
 
     def execute_find(self, data):
-        items = self.find(data['db'], data['collection'], data['q'])
+        items = self.find(data['db'], data['collection'], u.load_to_dict(data.get('q', '{}')))
         return self.success(items=items)
 
     def execute_create_ticker(self, data):
@@ -93,6 +110,34 @@ class MongoDB(r.BaseJobExecutor):
         jobs = self.find('nweb', 'jobs')
         for job in jobs:
             self.process_job(job)
+
+    def execute_collect_files(self, data: dict):
+        db = data.get('db', 'nweb')
+        collection = data.get('collection', 'files')
+        count = 0
+        for filepath in glob.glob(data['path']):
+            if self.mv_file(filepath, db, collection, data):
+                count += 1
+        return self.success(count=count)
+
+    def mv_file(self, filepath: str, db: str, collection: str, data: dict = {}) -> None:
+        bin_data = u.file_get_contents(filepath)
+        root = self.getRoot().jobexecutor
+        crypted = 'crypt' in root
+        if crypted:
+            f_data = root.execute(dict(type='crypt', op='encrypt', value=bin_data))['value']
+        else:
+            f_data = base64.b64encode(bin_data)
+        if 'force_crypt' in data and not crypted:
+            return False
+        mdata = dict(
+            file=f_data,
+            name=os.path.basename(filepath),
+            crypted=crypted
+        )
+        self.insert_one(db, collection, mdata)
+        os.remove(filepath)
+        return True
 
     def process_job(self, job: dict):
         executor: r.BaseJobExecutor = self.getRoot().jobexecutor
@@ -112,7 +157,7 @@ class MongoDB(r.BaseJobExecutor):
         limit = params.get('limit', 50)
         p.h2(f"DB: {dbname} Collection: {colname}")
         rows = list(self.find(dbname, colname, {}, limit=int(limit)))
-        p.pre(json.dumps(rows, indent=2))
+        p.pre(json.dumps(rows, indent=2, default=self.json_util.default))
 
     def part_npy(self, p: b.Page, params={}):
         with p.section(h="npy"):

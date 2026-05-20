@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = ""
-version = "1.0.0"
+version = "1.0.1"
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"
@@ -10,10 +10,10 @@ Repository = "https://github.com/nxware/nxrunner"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build]
-include = [ "nxrunner/*.py" ]
+include = [ "nxrunner/**/*.py" ]
 
 [project.entry-points.nweb_runner]
-mongo = "nxrunner:MongoDB"
+mongo = "nxrunner.db.mongo:MongoDB"
 pihole_api = "nxrunner.apis:PiHoleApi"
 audio_convert = "nxrunner.audio:Convert"
 

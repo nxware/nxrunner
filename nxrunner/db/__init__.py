@@ -106,18 +106,19 @@ class NxConnection(PGConnection):
         return NxSession(self, conn, self)
 
 
-address = ("localhost", 5433)
-server = BuenaVistaServer(
-    address,
-    NxConnection(
-        conninfo="",
-        host="localhost",
-        port=5432,
-        user='postgres',
-        password='password',
-        dbname="postgres"
-    ),
-)
-ip, port = server.server_address
-print(f"Listening on {ip}:{port}")
-server.serve_forever()
+if __name__ == '__main__':
+    address = ("localhost", 5433)
+    server = BuenaVistaServer(
+        address,
+        NxConnection(
+            conninfo="",
+            host="localhost",
+            port=5432,
+            user='postgres',
+            password='password',
+            dbname="postgres"
+        ),
+    )
+    ip, port = server.server_address
+    print(f"Listening on {ip}:{port}")
+    server.serve_forever()
