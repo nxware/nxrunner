@@ -2,6 +2,11 @@
 name = "nxrunner"
 description = ""
 version = "1.0.1"
+dependencies = ["nwebclient"]
+
+[project.optional-dependencies]
+full = ["pymongo", "buenavista", "pihole6api", "pydub"]
+mongo = ["pymongo"]
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"

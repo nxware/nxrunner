@@ -1,0 +1,10 @@
+services:
+ app:
+    build: .
+    container_name: nxrunner
+    restart: always
+    ports:
+      - "7070:7070"
+#    environment:
+    volumes:
+      - ./app:/app
