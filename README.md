@@ -39,7 +39,7 @@ class MyFeature(r.BaseJobExecutor):
     def execute_mycall(self, data):
         return self.success()
 ```
-You can use `part_index(self, p:b.Page, params={})` for HTML-Outputs. Page is a Helper-Class for rendering HTML-Page, methods like `h(str)`, `div(str)`, `a(content, href)` or `ul(list)`
+You can use `part_index(self, p:b.Page, params={})` for HTML-Outputs. Page is a Helper-Class for rendering HTML-Page, methods like `h(str)`, `div(str)`, `a(content, href)` or `ul(list)`. More at [https://gitlab.com/bsalgert/nwebclient/-/blob/master/docs/Page.md](https://gitlab.com/bsalgert/nwebclient/-/blob/master/docs/Page.md?ref_type=heads)
 
 ## See also
  - nwebclient
