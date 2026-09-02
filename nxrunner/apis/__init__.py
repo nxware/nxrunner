@@ -1,9 +1,8 @@
 
 from nwebclient import runner as r, base
-from nwebclient import base as b
-from nwebclient import util as u
 from nwebclient import web as w
-from nwebclient import dev as d
+
+from .trello import Trello
 
 
 class PiHoleApi(r.BaseJobExecutor):

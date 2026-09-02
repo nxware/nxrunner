@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = ""
-version = "1.0.1"
+version = "1.0.2"
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"
@@ -14,8 +14,10 @@ include = [ "nxrunner/**/*.py" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner.db.mongo:MongoDB"
+smb = "nxrunner.fs:Smb"
 pihole_api = "nxrunner.apis:PiHoleApi"
 audio_convert = "nxrunner.audio:Convert"
+jocystick = "nxrunner.hw.i2c:JoystickM5"
 
 [nx]
 pydeps="-xx nxrunner"
