@@ -11,14 +11,14 @@ Der Runner wird über die `nweb.json` oder das `nx.d`-Verzeichnis konfiguriert. 
 python -m nwebclient.runner --rest
 ```
 
-Default-Port für das Webinterface ist `7070`
+Default-Port für das Webinterface ist `7070` (`--port 7070`)
 
 ## Runners/Features
 
 TODO add list
 
 ## Adding Features
-Creeate an EntryPoint in the category `nweb_runner` like `myname = "myns:MyRunnerClass"`, make sure your class
+Create an EntryPoint in the category `nweb_runner` like `myname = "myns:MyRunnerClass"`, make sure your class
 inherited from `nwebclient.runner.BaseJobExecutor`
 
 ```
@@ -39,7 +39,7 @@ class MyFeature(r.BaseJobExecutor):
     def execute_mycall(self, data):
         return self.success()
 ```
-You can use `part_index(self, p:b.Page, params={})` for HTML-Outputs.
+You can use `part_index(self, p:b.Page, params={})` for HTML-Outputs. Page is a Helper-Class for rendering HTML-Page, methods like `h(str)`, `div(str)`, `a(content, href)` or `ul(list)`. More at [https://gitlab.com/bsalgert/nwebclient/-/blob/master/docs/Page.md](https://gitlab.com/bsalgert/nwebclient/-/blob/master/docs/Page.md?ref_type=heads)
 
 ## See also
  - nwebclient

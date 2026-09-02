@@ -37,13 +37,14 @@ class MongoDB(r.BaseJobExecutor):
         self.client = pymongo.MongoClient(connection_url)
         self.args = args
         if 'mongo_job_cron' in args:
-            self.ticker = self.delayed(args.get('mongo_job_cron', 623), self.tick)
+            self.ticker = self.periodic(args.get('mongo_job_cron', 623), self.tick)
 
     def execute_set_ticker(self, data: dict):
+        s = int(data['value'])
         if self.ticker is not None:
-            from signal import pthread_kill, SIGTSTP
-            pthread_kill(self.ticker.ident, SIGTSTP)
-        self.ticker = self.delayed(int(data['value']), self.tick)
+            self.ticker.time_s = s
+        else:
+            self.ticker = self.periodic(s, self.tick)
 
     def tick(self):
         self.tick_count += 1
