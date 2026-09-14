@@ -1,5 +1,6 @@
 from nwebclient import runner as r
 from nwebclient import base as b
+from nwebclient import util as u
 from nwebclient import dev as d
 
 
@@ -25,11 +26,11 @@ class JoystickM5(r.BaseJobExecutor):
         from smbus2 import SMBus
 
         self.bus = SMBus(1)
+        self.ticker = None
+        self.jobdef = None
+        self.jobdef_x_name = None
 
-        self.define_sig(
-            d.PStr("op", "read"),
-        )
-
+        self.define_sig(d.PStr("op", "read"))
         self.define_sig(
             d.PStr("op", "rgb"),
             d.Param("r", "int"),
@@ -138,9 +139,9 @@ class JoystickM5(r.BaseJobExecutor):
         return self.success({
             "x16": x16,
             "y16": y16,
-            "x8": x8,
-            "y8": y8,
-            "button": self.get_button(),
+            "x": x8,
+            "y": y8,
+            "button": self.get_button(), # 0 für pressed
             "firmware": self.get_firmware_version(),
             "bootloader": self.get_bootloader_version(),
             "address": hex(self.get_i2c_address())
@@ -165,8 +166,6 @@ class JoystickM5(r.BaseJobExecutor):
         x16, y16 = self.get_adc_16bit_xy()
         x8, y8 = self.get_adc_8bit_xy()
 
-        p.h("Joystick 2")
-
         p.ul([
             f"X (16 Bit): {x16}",
             f"Y (16 Bit): {y16}",
@@ -178,11 +177,33 @@ class JoystickM5(r.BaseJobExecutor):
             f"I2C-Adresse: 0x{self.get_i2c_address():02X}"
         ])
 
-        p.div(
-            p.a(
-                "Aktualisieren",
-                "?op=index"
-            )
-        )
+        p.ul([
+            p.a("Aktualisieren", self.link(self.part_index)),
+            p.a("Bind", self.link(self.part_bind))
+        ])
 
-        return p
+    def tick(self):
+        x, y = self.get_adc_8bit_xy()
+        if self.jobdef is not None:
+            data = {self.jobdef_x_name: x, **self.jobdef}
+            self.owner().execute(data)
+
+    def execute_setaction(self, data):
+        jobdef = data['jobdef']
+        x_var = data['x_var']
+        self.jobdef = u.load_to_dict(jobdef)
+        self.jobdef_x_name = x_var
+        if self.ticker is None:
+            self.ticker = self.periodic(0.5, self.tick)
+
+    def part_bind(self, p: b.Page, params={}):
+        p("Set Actions")
+        p("X-Achse")
+        p.form_input("Jobdef", "x_def")
+        p.form_input("X-Varname", "x_var")
+        p(self.action_btn_parametric("Bind", dict(
+            type=self.type,
+            op='setaction',
+            jobdef='#x_def',
+            x_var='#x_var'
+        )))
