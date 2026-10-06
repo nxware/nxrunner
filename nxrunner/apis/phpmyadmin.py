@@ -2,10 +2,11 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import json
+import os
 
 
 class PhpMyAdminClient:
-    def __init__(self, base_url, username, password, database = None):
+    def __init__(self, base_url, username, password, database=None):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
@@ -118,16 +119,16 @@ class PhpMyAdminClient:
 
 if __name__ == "__main__":
     pma = PhpMyAdminClient(
-        "https://example.com/phpmyadmin",
-        "user",
-        "password"
+        os.environ.get("DB_URL", "https://example.com/phpmyadmin"),
+        os.environ.get("DB_USER"),
+        os.environ.get("DB_PASS")
     )
 
     pma.login()
 
     result = pma.execute_sql(
-        "mydatabase",
-        "SELECT * FROM users LIMIT 10"
+        os.environ.get("SQL", "SELECT * FROM users LIMIT 10"),
+        os.environ.get("DB_NAME")
     )
 
     print(result)
