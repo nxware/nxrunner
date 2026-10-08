@@ -23,4 +23,5 @@ class Trello(r.BaseJobExecutor):
         return self.api.list_boards()
 
     def part_index(self, p: base.Page, params={}):
-        pass
+        with p.section(h="Boards"):
+            p.ul(map(lambda board: w.a(board.name, board.url), self.boards()))
