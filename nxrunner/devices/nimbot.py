@@ -327,7 +327,8 @@ class NimbotB1(r.BaseJobExecutor):
         width_mm, height_mm = self.parse_label(label)
         return min(width_mm * self.DPMM, self.PRINTHEAD_PX), height_mm * self.DPMM
 
-    def prepare_image(self, img, rotate=0):
+    def prepare_image(self, img, rotate=0, label=None):
+        """ label: Bild unter Beibehaltung des Seitenverhaeltnisses mittig auf das Etikett einpassen """
         from PIL import Image, ImageOps
         if rotate:
             img = img.rotate(-int(rotate), expand=True)
@@ -335,6 +336,12 @@ class NimbotB1(r.BaseJobExecutor):
             img = img.convert('RGBA')
             bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
             img = Image.alpha_composite(bg, img)
+        if label:
+            size = self.label_size_px(label)
+            img = ImageOps.contain(img.convert('L'), size)
+            canvas = Image.new('L', size, 255)
+            canvas.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
+            img = canvas
         if img.width > self.PRINTHEAD_PX:
             img = img.resize((self.PRINTHEAD_PX, int(img.height * self.PRINTHEAD_PX / img.width)))
         # Schwarz = 1
@@ -377,8 +384,8 @@ class NimbotB1(r.BaseJobExecutor):
             y += line_h
         return img
 
-    def print_image(self, img, quantity=1, density=None, rotate=0):
-        img = self.prepare_image(img, rotate)
+    def print_image(self, img, quantity=1, density=None, rotate=0, label=None):
+        img = self.prepare_image(img, rotate, label)
         quantity = int(quantity)
         with self.lock:
             try:
@@ -438,7 +445,7 @@ class NimbotB1(r.BaseJobExecutor):
         return self.success()
 
     def execute_print_image(self, data):
-        self.print_image(self.load_image(data), **self.print_opts(data))
+        self.print_image(self.load_image(data), label=data.get('label'), **self.print_opts(data))
         return self.success()
 
     def execute_info(self, data):
@@ -548,3 +555,48 @@ class NimbotB1(r.BaseJobExecutor):
             p.form_input("quantity", "Anzahl", id='quantity', value='1', type='number', min='1')
             p(self.action_btn_parametric("Drucken", dict(type=self.type, op='print_text', text='#text',
                                                          label='#label', quantity='#quantity')))
+        with p.section(h="Bild drucken"):
+            p.form_input("image_file", "Bild", id='image_file', type='file', accept='image/*')
+            p('<div><img id="image_preview" style="max-width: 384px; max-height: 240px; border: 1px solid #ccc; display: none"/></div>')
+            p.form_elem(w.combo('image_label', {l + ' mm': l for l in labels}, id='image_label'), "Etikett")
+            p.form_elem(w.combo('image_rotate', {'0°': '0', '90°': '90', '180°': '180', '270°': '270'},
+                                id='image_rotate'), "Drehen")
+            p.form_input("image_quantity", "Anzahl", id='image_quantity', value='1', type='number', min='1')
+            p(w.button_js("Drucken", 'nimbot_print_image();'))
+            p.script(self.build_image_script())
+
+    def build_image_script(self):
+        return f"""
+        document.addEventListener("DOMContentLoaded", function() {{
+            document.getElementById("image_file").addEventListener("change", function(e) {{
+                const file = e.target.files[0];
+                const img = document.getElementById("image_preview");
+                if (!file) {{ img.style.display = "none"; return; }}
+                img.src = URL.createObjectURL(file);
+                img.style.display = "block";
+            }});
+        }});
+        function nimbot_print_image() {{
+            const file = document.getElementById("image_file").files[0];
+            if (!file) {{ alert("Bitte ein Bild auswaehlen"); return; }}
+            // im Browser verkleinern, damit der Upload klein bleibt (Etikett max. {self.PRINTHEAD_PX}px)
+            const img = new Image();
+            img.onload = function() {{
+                const max = {self.PRINTHEAD_PX * 2};
+                const scale = Math.min(1, max / Math.max(img.width, img.height));
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.round(img.width * scale);
+                canvas.height = Math.round(img.height * scale);
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#fff";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                let data = canvas.toDataURL("image/png");
+                if (data.length > 400000) data = canvas.toDataURL("image/jpeg", 0.9);
+                URL.revokeObjectURL(img.src);
+                exec_job_p({{type: "{self.type}", op: "print_image", image: data,
+                    label: "#image_label", rotate: "#image_rotate", quantity: "#image_quantity"}});
+            }};
+            img.src = URL.createObjectURL(file);
+        }}
+        """
