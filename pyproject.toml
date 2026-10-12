@@ -15,7 +15,7 @@ Repository = "https://github.com/nxware/nxrunner"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build]
-include = [ "nxrunner/**/*.py" ]
+include = [ "nxrunner/**/*.py", "nxrunner/resources/*" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner.db.mongo:MongoDB"

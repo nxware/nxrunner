@@ -6,6 +6,9 @@ import os
 
 
 class PhpMyAdminClient:
+    """
+      nxrunner.apis.phpmyadmin:PhpMyAdminClient
+    """
     def __init__(self, base_url, username, password, database=None):
         self.base_url = base_url.rstrip("/")
         self.username = username
