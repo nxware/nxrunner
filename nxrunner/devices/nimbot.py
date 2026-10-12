@@ -154,6 +154,9 @@ class NimbotB1(r.BaseJobExecutor):
     MODULES = ['pillow', 'bleak']
 
     PRINTHEAD_PX = 384
+
+    # gaengige B1-Etiketten (Breite x Hoehe in mm)
+    LABEL_SIZES = ['50x30', '50x20', '50x40', '50x50', '50x80', '40x30', '40x20', '30x20', '30x15', '25x15']
     DPMM = 8  # 203 dpi
 
     CMD_CONNECT = 0xC1
@@ -313,8 +316,16 @@ class NimbotB1(r.BaseJobExecutor):
     # Bild
     # ------------------------------------------------------------------
 
-    def label_size_px(self):
-        return min(self.width_mm * self.DPMM, self.PRINTHEAD_PX), self.height_mm * self.DPMM
+    def parse_label(self, label=None):
+        """ '50x30' -> (50, 30), ohne Angabe die konfigurierte Groesse """
+        if not label:
+            return self.width_mm, self.height_mm
+        width, height = str(label).lower().replace(' ', '').split('x')
+        return int(width), int(height)
+
+    def label_size_px(self, label=None):
+        width_mm, height_mm = self.parse_label(label)
+        return min(width_mm * self.DPMM, self.PRINTHEAD_PX), height_mm * self.DPMM
 
     def prepare_image(self, img, rotate=0):
         from PIL import Image, ImageOps
@@ -346,9 +357,9 @@ class NimbotB1(r.BaseJobExecutor):
         total = sum(bin(b).count('1') for b in line)
         return b'\x00' + struct.pack('>H', total)
 
-    def render_text(self, text, font_size=None, font=None):
+    def render_text(self, text, font_size=None, font=None, label=None):
         from PIL import Image, ImageDraw, ImageFont
-        width, height = self.label_size_px()
+        width, height = self.label_size_px(label)
         lines = str(text).replace('\\n', '\n').split('\n')
         if font_size is None:
             font_size = max(12, min(80, int(height / max(1, len(lines)) * 0.7)))
@@ -395,8 +406,8 @@ class NimbotB1(r.BaseJobExecutor):
             finally:
                 self.disconnect()
 
-    def print_text(self, text, quantity=1, font_size=None, **kwargs):
-        self.print_image(self.render_text(text, font_size), quantity, **kwargs)
+    def print_text(self, text, quantity=1, font_size=None, label=None, **kwargs):
+        self.print_image(self.render_text(text, font_size, label=label), quantity, **kwargs)
 
     @staticmethod
     def load_image(data):
@@ -422,7 +433,8 @@ class NimbotB1(r.BaseJobExecutor):
 
     def execute_print_text(self, data):
         font_size = data.get('font_size')
-        self.print_text(data['text'], font_size=int(font_size) if font_size else None, **self.print_opts(data))
+        self.print_text(data['text'], font_size=int(font_size) if font_size else None, label=data.get('label'),
+                        **self.print_opts(data))
         return self.success()
 
     def execute_print_image(self, data):
@@ -530,5 +542,9 @@ class NimbotB1(r.BaseJobExecutor):
             p(self.action_btn(dict(title="Info", type=self.type, op='info')))
         with p.section(h="Text drucken"):
             p.form_input("text", "Text", id='text')
+            default = f"{self.width_mm}x{self.height_mm}"
+            labels = [default] + [l for l in self.LABEL_SIZES if l != default]
+            p.form_elem(w.combo('label', {l + ' mm': l for l in labels}, id='label'), "Etikett")
             p.form_input("quantity", "Anzahl", id='quantity', value='1', type='number', min='1')
-            p(self.action_btn_parametric("Drucken", dict(type=self.type, op='print_text', text='#text', quantity='#quantity')))
+            p(self.action_btn_parametric("Drucken", dict(type=self.type, op='print_text', text='#text',
+                                                         label='#label', quantity='#quantity')))
