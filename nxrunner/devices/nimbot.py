@@ -1,7 +1,8 @@
 """
 Etikettendruck auf einem Niimbot/Nimbot B1 per Bluetooth (RFCOMM).
 
-Protokoll analog zu https://github.com/AndBondStyle/niimprint
+Protokoll analog zu https://github.com/AndBondStyle/niimprint und
+https://github.com/MultiMote/niimbluelib (B1PrintTask)
 
     from nxrunner.devices.nimbot import NimbotB1
     p = NimbotB1(address='AA:BB:CC:DD:EE:FF')
@@ -155,6 +156,7 @@ class NimbotB1(r.BaseJobExecutor):
     PRINTHEAD_PX = 384
     DPMM = 8  # 203 dpi
 
+    CMD_CONNECT = 0xC1
     CMD_GET_INFO = 0x40
     CMD_HEARTBEAT = 0xDC
     CMD_SET_LABEL_TYPE = 0x23
@@ -172,6 +174,14 @@ class NimbotB1(r.BaseJobExecutor):
     INFO_DEVICE_SERIAL = 11
     INFO_SOFTWARE_VERSION = 9
     INFO_HARDWARE_VERSION = 12
+
+    ERRORS = {
+        0x01: 'Deckel offen', 0x02: 'Kein Papier', 0x03: 'Akku schwach', 0x04: 'Akkufehler',
+        0x05: 'Abgebrochen', 0x06: 'Datenfehler', 0x07: 'Ueberhitzt', 0x08: 'Papierausgabefehler',
+        0x09: 'Drucker beschaeftigt', 0x0A: 'Kein Druckkopf', 0x0B: 'Temperatur zu niedrig',
+        0x0C: 'Druckkopf lose', 0x10: 'Falsches Papier', 0x11: 'Papiertyp setzen fehlgeschlagen',
+        0x13: 'Dichte setzen fehlgeschlagen', 0x16: 'Kommunikationsfehler',
+    }
 
     def __init__(self, address=None, channel=1, width_mm=50, height_mm=30, density=3, transport='auto',
                  args: u.Args = {}):
@@ -244,14 +254,23 @@ class NimbotB1(r.BaseJobExecutor):
         while time.time() < deadline:
             for pkt in self.receive(deadline - time.time()):
                 if pkt.type == 0xDB:
-                    raise Exception(f"Druckerfehler: {pkt.data.hex()}")
+                    self.raise_error(pkt.data[0] if pkt.data else 0)
                 if pkt.type == resp_type:
                     return pkt
         raise TimeoutError(f"Keine Antwort auf Kommando 0x{cmd:02X}")
 
+    def raise_error(self, code):
+        raise Exception(f"Druckerfehler 0x{code:02X}: {self.ERRORS.get(code, 'unbekannt')}")
+
     # ------------------------------------------------------------------
     # Kommandos
     # ------------------------------------------------------------------
+
+    def handshake(self):
+        try:
+            self.transceive(self.CMD_CONNECT, b'\x01', timeout=3)
+        except TimeoutError:
+            self.info("Keine Antwort auf Connect, fahre fort")
 
     def get_info(self, key):
         pkt = self.transceive(self.CMD_GET_INFO, bytes([key]), resp_offset=key)
@@ -267,8 +286,8 @@ class NimbotB1(r.BaseJobExecutor):
     def set_label_density(self, n):
         return bool(self.transceive(self.CMD_SET_LABEL_DENSITY, bytes([n]), 16).data[0])
 
-    def start_print(self, quantity=1):
-        data = b'\x00' + struct.pack('>H', quantity) + b'\x00\x00\x00\x00'
+    def start_print(self, total_pages=1, page_color=0):
+        data = struct.pack('>H', total_pages) + b'\x00\x00\x00\x00' + bytes([page_color])
         return bool(self.transceive(self.CMD_START_PRINT, data).data[0])
 
     def end_print(self):
@@ -286,6 +305,8 @@ class NimbotB1(r.BaseJobExecutor):
     def get_print_status(self):
         data = self.transceive(self.CMD_GET_PRINT_STATUS, b'\x01', 16).data
         page, progress1, progress2 = struct.unpack('>HBB', data[:4])
+        if len(data) == 10 and data[6]:
+            self.raise_error(data[6])
         return {'page': page, 'progress1': progress1, 'progress2': progress2}
 
     # ------------------------------------------------------------------
@@ -315,8 +336,15 @@ class NimbotB1(r.BaseJobExecutor):
             if line == empty:
                 yield NiimbotPacket(self.CMD_PRINT_EMPTY_ROW, struct.pack('>HB', y, 1))
             else:
-                # Pixelzaehler werden vom B1 nicht geprueft, daher 0
-                yield NiimbotPacket(self.CMD_PRINT_BITMAP_ROW, struct.pack('>H3BB', y, 0, 0, 0, 1) + line)
+                yield NiimbotPacket(self.CMD_PRINT_BITMAP_ROW, struct.pack('>H', y) + self.pixel_counts(line) + b'\x01' + line)
+
+    def pixel_counts(self, line):
+        """ Anzahl schwarzer Pixel, aufgeteilt auf drei Druckkopf-Segmente (wie niimbluelib) """
+        chunk = self.PRINTHEAD_PX // 8 // 3
+        if len(line) <= chunk * 3:
+            return bytes(min(255, sum(bin(b).count('1') for b in line[i * chunk:(i + 1) * chunk])) for i in range(3))
+        total = sum(bin(b).count('1') for b in line)
+        return b'\x00' + struct.pack('>H', total)
 
     def render_text(self, text, font_size=None, font=None):
         from PIL import Image, ImageDraw, ImageFont
@@ -344,6 +372,7 @@ class NimbotB1(r.BaseJobExecutor):
         with self.lock:
             try:
                 self.connect()
+                self.handshake()
                 self.set_label_density(int(density or self.density))
                 self.set_label_type(1)
                 self.start_print(quantity)
@@ -354,10 +383,14 @@ class NimbotB1(r.BaseJobExecutor):
                 self.end_page_print()
                 time.sleep(0.3)
                 deadline = time.time() + 30 + 10 * quantity
+                status = None
                 while time.time() < deadline:
-                    if self.get_print_status()['page'] >= quantity:
+                    status = self.get_print_status()
+                    if status['page'] >= quantity:
                         break
-                    time.sleep(0.1)
+                    time.sleep(0.3)
+                else:
+                    raise TimeoutError(f"Druck nicht abgeschlossen, letzter Status: {status}")
                 self.end_print()
             finally:
                 self.disconnect()
@@ -383,9 +416,9 @@ class NimbotB1(r.BaseJobExecutor):
     # ------------------------------------------------------------------
 
     def print_opts(self, data):
-        return dict(quantity=int(data.get('quantity', 1)),
+        return dict(quantity=max(1, int(data.get('quantity') or 1)),
                     density=data.get('density'),
-                    rotate=int(data.get('rotate', 0)))
+                    rotate=int(data.get('rotate') or 0))
 
     def execute_print_text(self, data):
         font_size = data.get('font_size')
@@ -497,5 +530,5 @@ class NimbotB1(r.BaseJobExecutor):
             p(self.action_btn(dict(title="Info", type=self.type, op='info')))
         with p.section(h="Text drucken"):
             p.form_input("text", "Text", id='text')
-            p.form_input("quantity", "Anzahl", id='quantity')
+            p.form_input("quantity", "Anzahl", id='quantity', value='1', type='number', min='1')
             p(self.action_btn_parametric("Drucken", dict(type=self.type, op='print_text', text='#text', quantity='#quantity')))
