@@ -9,6 +9,7 @@ Protokoll analog zu https://github.com/AndBondStyle/niimprint
 """
 import base64
 import io
+import queue
 import socket
 import struct
 import threading
@@ -42,7 +43,8 @@ class NiimbotPacket:
         while True:
             start = buf.find(b'\x55\x55')
             if start < 0:
-                buf.clear()
+                # ein einzelnes 0x55 am Ende kann der Anfang des naechsten Pakets sein
+                del buf[:-1 if buf.endswith(b'\x55') else len(buf)]
                 break
             if start > 0:
                 del buf[:start]
@@ -63,14 +65,92 @@ class NiimbotPacket:
         return f"<NiimbotPacket type=0x{self.type:02X} data={self.data.hex()}>"
 
 
+class RfcommTransport:
+    """ Bluetooth Classic (Serial Port Profile) """
+
+    def __init__(self, address, channel=1, timeout=10):
+        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        self.sock.settimeout(timeout)
+        try:
+            self.sock.connect((address, channel))
+        except OSError:
+            self.sock.close()
+            raise
+
+    def write(self, data):
+        self.sock.sendall(data)
+
+    def read(self, timeout):
+        """ Liefert empfangene Bytes oder None bei Timeout """
+        self.sock.settimeout(max(0.05, timeout))
+        try:
+            chunk = self.sock.recv(1024)
+        except socket.timeout:
+            return None
+        if not chunk:
+            raise ConnectionError("Verbindung zum Drucker getrennt")
+        return chunk
+
+    def close(self):
+        self.sock.close()
+
+
+class BleTransport:
+    """ Bluetooth Low Energy via bleak, kein Koppeln noetig """
+
+    CHARACTERISTIC = 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f'
+
+    def __init__(self, address, timeout=15):
+        import asyncio
+        from bleak import BleakClient
+        self.asyncio = asyncio
+        self.queue = queue.Queue()
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.client = BleakClient(address, timeout=timeout)
+        try:
+            self.run(self.client.connect(), timeout + 5)
+            self.run(self.client.start_notify(self.CHARACTERISTIC, lambda _, data: self.queue.put(bytes(data))))
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self, coro, timeout=30):
+        return self.asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def write(self, data):
+        size = max(20, (self.client.mtu_size or 23) - 3)
+        for i in range(0, len(data), size):
+            self.run(self.client.write_gatt_char(self.CHARACTERISTIC, data[i:i + size], response=False))
+        # Drucker nicht ueberfluten
+        time.sleep(0.01)
+
+    def read(self, timeout):
+        try:
+            return self.queue.get(timeout=max(0.05, timeout))
+        except queue.Empty:
+            if not self.client.is_connected:
+                raise ConnectionError("Verbindung zum Drucker getrennt")
+            return None
+
+    def close(self):
+        try:
+            if self.client.is_connected:
+                self.run(self.client.disconnect())
+        finally:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+
 class NimbotB1(r.BaseJobExecutor):
     """
     Runner fuer den Etikettendrucker Niimbot B1.
 
     Der Druckkopf ist 384px (48mm @ 203dpi) breit, Bilder werden ggf. skaliert.
     Ein 50x30mm Etikett entspricht ca. 384x240px.
+
+    transport: 'auto' (RFCOMM, bei Fehler BLE), 'rfcomm' oder 'ble'
     """
-    MODULES = ['pillow']
+    MODULES = ['pillow', 'bleak']
 
     PRINTHEAD_PX = 384
     DPMM = 8  # 203 dpi
@@ -93,14 +173,16 @@ class NimbotB1(r.BaseJobExecutor):
     INFO_SOFTWARE_VERSION = 9
     INFO_HARDWARE_VERSION = 12
 
-    def __init__(self, address=None, channel=1, width_mm=50, height_mm=30, density=3, args: u.Args = {}):
+    def __init__(self, address=None, channel=1, width_mm=50, height_mm=30, density=3, transport='auto',
+                 args: u.Args = {}):
         super().__init__('nimbot_b1')
         self.address = args.get('nimbot_address', address)
         self.channel = int(args.get('nimbot_channel', channel))
+        self.transport = args.get('nimbot_transport', transport)
         self.width_mm = int(args.get('nimbot_width_mm', width_mm))
         self.height_mm = int(args.get('nimbot_height_mm', height_mm))
         self.density = int(args.get('nimbot_density', density))
-        self.sock = None
+        self.conn = None
         self.buffer = bytearray()
         self.lock = threading.Lock()
         self.define_sig(d.PStr('op', 'print_text'), d.Param('text', 'str'))
@@ -113,41 +195,46 @@ class NimbotB1(r.BaseJobExecutor):
     # ------------------------------------------------------------------
 
     def connect(self):
-        if self.sock is not None:
+        if self.conn is not None:
             return
         if not self.address:
             raise Exception("Keine Bluetooth-Adresse fuer Nimbot B1 konfiguriert")
-        self.info(f"Verbinde mit {self.address} (RFCOMM {self.channel})")
-        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-        self.sock.settimeout(10)
-        self.sock.connect((self.address, self.channel))
         self.buffer.clear()
+        if self.transport in ('auto', 'rfcomm'):
+            self.info(f"Verbinde mit {self.address} (RFCOMM {self.channel})")
+            try:
+                self.conn = RfcommTransport(self.address, self.channel)
+                return
+            except OSError as e:
+                if self.transport == 'rfcomm':
+                    raise
+                self.info(f"RFCOMM fehlgeschlagen ({e}), versuche BLE")
+        self.info(f"Verbinde mit {self.address} (BLE)")
+        self.conn = BleTransport(self.address)
 
     def disconnect(self):
-        if self.sock is not None:
+        if self.conn is not None:
             try:
-                self.sock.close()
+                self.conn.close()
             finally:
-                self.sock = None
+                self.conn = None
 
     def send(self, pkt: NiimbotPacket):
-        self.sock.sendall(pkt.to_bytes())
+        self.conn.write(pkt.to_bytes())
 
     def receive(self, timeout=10):
         deadline = time.time() + timeout
-        while time.time() < deadline:
+        while True:
             packets = NiimbotPacket.parse_buffer(self.buffer)
             if packets:
                 return packets
-            self.sock.settimeout(max(0.1, deadline - time.time()))
-            try:
-                chunk = self.sock.recv(1024)
-            except socket.timeout:
-                break
-            if not chunk:
-                raise ConnectionError("Verbindung zum Drucker getrennt")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return []
+            chunk = self.conn.read(remaining)
+            if chunk is None:
+                return []
             self.buffer.extend(chunk)
-        return []
 
     def transceive(self, cmd, data=b'', resp_offset=1, timeout=10):
         """ Sendet cmd und wartet auf die Antwort mit Typ cmd+resp_offset """
@@ -403,7 +490,7 @@ class NimbotB1(r.BaseJobExecutor):
 
     def part_index(self, p: base.Page, params={}):
         with p.section(h="Nimbot B1"):
-            p.div(f"Adresse: {self.address}, Etikett: {self.width_mm}x{self.height_mm}mm, Dichte: {self.density}")
+            p.div(f"Adresse: {self.address} ({self.transport}), Etikett: {self.width_mm}x{self.height_mm}mm, Dichte: {self.density}")
             p.ul([w.a("Drucker koppeln", self.link(self.part_install))])
             p.form_input("address", "Bluetooth-Adresse", id='address')
             p(self.action_btn_parametric("Adresse setzen", dict(type=self.type, op='set_address', address='#address')))
