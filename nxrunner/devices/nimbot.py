@@ -198,6 +198,9 @@ class NimbotB1(r.BaseJobExecutor):
         self.conn = None
         self.buffer = bytearray()
         self.lock = threading.Lock()
+        self.scan_results = {}
+        self.last_bt_output = ''
+        self.last_error = None
         self.define_sig(d.PStr('op', 'print_text'), d.Param('text', 'str'))
         self.define_sig(d.PStr('op', 'print_image'), d.Param('file', 'str'))
         self.define_sig(d.PStr('op', 'print_image'), d.Param('image', 'str'))
@@ -327,7 +330,8 @@ class NimbotB1(r.BaseJobExecutor):
         width_mm, height_mm = self.parse_label(label)
         return min(width_mm * self.DPMM, self.PRINTHEAD_PX), height_mm * self.DPMM
 
-    def prepare_image(self, img, rotate=0):
+    def prepare_image(self, img, rotate=0, label=None):
+        """ label: Bild unter Beibehaltung des Seitenverhaeltnisses mittig auf das Etikett einpassen """
         from PIL import Image, ImageOps
         if rotate:
             img = img.rotate(-int(rotate), expand=True)
@@ -335,6 +339,12 @@ class NimbotB1(r.BaseJobExecutor):
             img = img.convert('RGBA')
             bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
             img = Image.alpha_composite(bg, img)
+        if label:
+            size = self.label_size_px(label)
+            img = ImageOps.contain(img.convert('L'), size)
+            canvas = Image.new('L', size, 255)
+            canvas.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
+            img = canvas
         if img.width > self.PRINTHEAD_PX:
             img = img.resize((self.PRINTHEAD_PX, int(img.height * self.PRINTHEAD_PX / img.width)))
         # Schwarz = 1
@@ -377,8 +387,8 @@ class NimbotB1(r.BaseJobExecutor):
             y += line_h
         return img
 
-    def print_image(self, img, quantity=1, density=None, rotate=0):
-        img = self.prepare_image(img, rotate)
+    def print_image(self, img, quantity=1, density=None, rotate=0, label=None):
+        img = self.prepare_image(img, rotate, label)
         quantity = int(quantity)
         with self.lock:
             try:
@@ -403,6 +413,10 @@ class NimbotB1(r.BaseJobExecutor):
                 else:
                     raise TimeoutError(f"Druck nicht abgeschlossen, letzter Status: {status}")
                 self.end_print()
+                self.last_error = None
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"
+                raise
             finally:
                 self.disconnect()
 
@@ -438,7 +452,7 @@ class NimbotB1(r.BaseJobExecutor):
         return self.success()
 
     def execute_print_image(self, data):
-        self.print_image(self.load_image(data), **self.print_opts(data))
+        self.print_image(self.load_image(data), label=data.get('label'), **self.print_opts(data))
         return self.success()
 
     def execute_info(self, data):
@@ -481,61 +495,134 @@ class NimbotB1(r.BaseJobExecutor):
             out, _ = proc.communicate()
         return out
 
-    @classmethod
-    def bt_devices(cls):
-        """ Bekannte Bluetooth-Geraete als Liste von (Adresse, Name) """
+    @staticmethod
+    def bluetoothctl_cmd(*args, timeout=15):
+        """ bluetoothctl im Kommandomodus, z.B. bluetoothctl_cmd('show') """
+        import subprocess
+        try:
+            res = subprocess.run(['bluetoothctl', *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 universal_newlines=True, timeout=timeout)
+            return res.stdout
+        except subprocess.TimeoutExpired as e:
+            return e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or '')
+
+    @staticmethod
+    def parse_devices(out):
+        """ Liest 'Device <MAC> <Name>' Zeilen (auch [NEW] aus Scans), ignoriert [CHG]/[DEL] """
         import re
-        out = cls.bluetoothctl('devices', wait=1)
+        out = re.sub(r'\x1b\[[0-9;]*m', '', out)
         found = {}
-        for m in re.finditer(r'Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2}) ([^\r\n]*)', out):
-            found[m.group(1)] = m.group(2).strip()
-        return sorted(found.items(), key=lambda e: (not cls.is_niimbot(e[1]), e[1]))
+        for line in out.splitlines():
+            if '[CHG]' in line or '[DEL]' in line:
+                continue
+            m = re.search(r'Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})(?: (.*))?$', line.strip())
+            if m:
+                found[m.group(1)] = (m.group(2) or '').strip() or m.group(1)
+        return found
+
+    def bt_devices(self):
+        """ Bekannte und zuletzt gefundene Geraete als Liste von (Adresse, Name), Nimbot zuerst """
+        found = dict(self.scan_results)
+        found.update(self.parse_devices(self.bluetoothctl_cmd('devices')))
+        return sorted(found.items(), key=lambda e: (not self.is_niimbot(e[1]), e[1] == e[0], e[1]))
 
     @staticmethod
     def is_niimbot(name):
         return name.upper().startswith('B1')
 
+    def bt_status(self):
+        """ Zustand des Bluetooth-Adapters, z.B. {'Powered': 'yes', 'Discovering': 'no'} """
+        out = self.bluetoothctl_cmd('show')
+        if 'No default controller' in out or 'Waiting to connect' in out:
+            return {'error': out.strip()}
+        status = {}
+        for line in out.splitlines():
+            if ':' in line:
+                key, value = line.strip().split(':', 1)
+                if key in ('Name', 'Powered', 'Discoverable', 'Pairable', 'Discovering'):
+                    status[key] = value.strip()
+        return status
+
+    def execute_bt_power(self, data):
+        self.last_bt_output = self.bluetoothctl_cmd('power', 'on')
+        return self.success(output=self.last_bt_output, ui_reload=True)
+
     def execute_bt_scan(self, data):
         duration = int(data.get('duration', 10))
-        self.bluetoothctl('power on', 'scan on', duration, 'scan off', wait=1, timeout=duration + 15)
+        self.bluetoothctl_cmd('power', 'on')
+        out = self.bluetoothctl_cmd('--timeout', str(duration), 'scan', 'on', timeout=duration + 10)
+        self.last_bt_output = out
+        self.scan_results.update(self.parse_devices(out))
         devices = self.bt_devices()
         return self.success(devices=[dict(address=a, name=n) for a, n in devices], ui_reload=True)
+
+    def execute_bt_disconnect(self, data):
+        self.last_bt_output = self.bluetoothctl_cmd('disconnect', data['address'])
+        return self.success(output=self.last_bt_output, ui_reload=True)
+
+    def execute_bt_device_info(self, data):
+        self.last_bt_output = self.bluetoothctl_cmd('info', data['address'])
+        return self.success(output=self.last_bt_output, ui_reload=True)
 
     def execute_bt_pair(self, data):
         address = data['address']
         out = self.bluetoothctl('agent NoInputNoOutput', 'default-agent', f'pair {address}', 8,
                                 f'trust {address}', wait=1, timeout=40)
+        self.last_bt_output = out
         if 'Pairing successful' not in out and 'AlreadyExists' not in out:
             return self.fail('Koppeln fehlgeschlagen', address=address, output=out[-2000:])
         self.address = address
         return self.success(address=address, output=out[-2000:], ui_reload=True)
 
     def execute_bt_remove(self, data):
-        out = self.bluetoothctl(f"remove {data['address']}", wait=1)
-        return self.success(output=out[-1000:], ui_reload=True)
+        self.last_bt_output = self.bluetoothctl_cmd('remove', data['address'])
+        self.scan_results.pop(data['address'], None)
+        return self.success(output=self.last_bt_output, ui_reload=True)
 
     def part_install(self, p: base.Page, params={}):
         with p.section(h="Nimbot B1 koppeln"):
             p.div(f"Aktuelle Adresse: {self.address}")
-            p.div("Drucker einschalten und nach Geraeten suchen (dauert ca. 10 s).")
+            try:
+                status = self.bt_status()
+            except OSError as e:
+                status = {'error': f"bluetoothctl nicht verfuegbar: {e}"}
+            if 'error' in status:
+                p.div(f"Bluetooth-Adapter: {status['error']}", style='color: red')
+            else:
+                p.div("Bluetooth-Adapter: " + ', '.join(f"{k}: {v}" for k, v in status.items()))
+                if status.get('Powered') != 'yes':
+                    p.div("Adapter ist ausgeschaltet", style='color: red')
+            p(self.action_btn(dict(title="Bluetooth einschalten", type=self.type, op='bt_power')))
+            p.div("Drucker einschalten und nicht mit der Handy-App verbunden lassen, dann suchen (ca. 10 s).")
             p(self.action_btn(dict(title="Suchen", type=self.type, op='bt_scan')))
+            if self.last_error:
+                p.div(f"Letzter Druckfehler: {self.last_error}", style='color: red')
         with p.section(h="Geraete"):
             try:
                 devices = self.bt_devices()
-            except OSError as e:
-                p.div(f"bluetoothctl nicht verfuegbar: {e}")
+            except OSError:
                 devices = []
+            if not devices:
+                p.div("Keine Geraete gefunden")
             for address, name in devices:
                 label = f"{name} ({address})" + (" - Nimbot" if self.is_niimbot(name) else "")
                 p.div(label
                       + self.action_btn(dict(title="Koppeln", type=self.type, op='bt_pair', address=address))
                       + self.action_btn(dict(title="Verwenden", type=self.type, op='set_address', address=address))
+                      + self.action_btn(dict(title="Info", type=self.type, op='bt_device_info', address=address))
+                      + self.action_btn(dict(title="Trennen", type=self.type, op='bt_disconnect', address=address))
                       + self.action_btn(dict(title="Entfernen", type=self.type, op='bt_remove', address=address)))
+        if self.last_bt_output:
+            with p.section(h="Letzte bluetoothctl-Ausgabe"):
+                import html
+                p.pre(html.escape(self.last_bt_output[-3000:]))
         p.ul([w.a("Zurueck", self.link(self.part_index))])
 
     def part_index(self, p: base.Page, params={}):
         with p.section(h="Nimbot B1"):
             p.div(f"Adresse: {self.address} ({self.transport}), Etikett: {self.width_mm}x{self.height_mm}mm, Dichte: {self.density}")
+            if self.last_error:
+                p.div(f"Letzter Druckfehler: {self.last_error}", style='color: red')
             p.ul([w.a("Drucker koppeln", self.link(self.part_install))])
             p.form_input("address", "Bluetooth-Adresse", id='address')
             p(self.action_btn_parametric("Adresse setzen", dict(type=self.type, op='set_address', address='#address')))
@@ -548,3 +635,56 @@ class NimbotB1(r.BaseJobExecutor):
             p.form_input("quantity", "Anzahl", id='quantity', value='1', type='number', min='1')
             p(self.action_btn_parametric("Drucken", dict(type=self.type, op='print_text', text='#text',
                                                          label='#label', quantity='#quantity')))
+        with p.section(h="Bild drucken"):
+            p.form_input("image_file", "Bild", id='image_file', type='file', accept='image/*')
+            p('<div><img id="image_preview" style="max-width: 384px; max-height: 240px; border: 1px solid #ccc; display: none"/></div>')
+            p.form_elem(w.combo('image_label', {l + ' mm': l for l in labels}, id='image_label'), "Etikett")
+            p.form_elem(w.combo('image_rotate', {'0°': '0', '90°': '90', '180°': '180', '270°': '270'},
+                                id='image_rotate'), "Drehen")
+            p.form_input("image_quantity", "Anzahl", id='image_quantity', value='1', type='number', min='1')
+            p(w.button_js("Drucken", 'nimbot_print_image();'))
+            p.script(self.build_image_script())
+            p(self.label_table())
+
+    def label_table(self):
+        """ Etikettgroessen und passende Bildgroesse in Pixeln (8 px/mm, max. Druckkopfbreite) """
+        rows = ''.join(f'<tr><td>{l} mm</td><td>{"x".join(map(str, self.label_size_px(l)))} px</td></tr>'
+                       for l in self.LABEL_SIZES)
+        return (f'<table style="margin-top: 8px"><tr><th>Etikett</th><th>Bildgroesse</th></tr>{rows}</table>'
+                f'<div>{self.DPMM} px/mm, max. Breite {self.PRINTHEAD_PX} px</div>')
+
+    def build_image_script(self):
+        return f"""
+        document.addEventListener("DOMContentLoaded", function() {{
+            document.getElementById("image_file").addEventListener("change", function(e) {{
+                const file = e.target.files[0];
+                const img = document.getElementById("image_preview");
+                if (!file) {{ img.style.display = "none"; return; }}
+                img.src = URL.createObjectURL(file);
+                img.style.display = "block";
+            }});
+        }});
+        function nimbot_print_image() {{
+            const file = document.getElementById("image_file").files[0];
+            if (!file) {{ alert("Bitte ein Bild auswaehlen"); return; }}
+            // im Browser verkleinern, damit der Upload klein bleibt (Etikett max. {self.PRINTHEAD_PX}px)
+            const img = new Image();
+            img.onload = function() {{
+                const max = {self.PRINTHEAD_PX * 2};
+                const scale = Math.min(1, max / Math.max(img.width, img.height));
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.round(img.width * scale);
+                canvas.height = Math.round(img.height * scale);
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#fff";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                let data = canvas.toDataURL("image/png");
+                if (data.length > 400000) data = canvas.toDataURL("image/jpeg", 0.9);
+                URL.revokeObjectURL(img.src);
+                exec_job_p({{type: "{self.type}", op: "print_image", image: data,
+                    label: "#image_label", rotate: "#image_rotate", quantity: "#image_quantity"}});
+            }};
+            img.src = URL.createObjectURL(file);
+        }}
+        """
