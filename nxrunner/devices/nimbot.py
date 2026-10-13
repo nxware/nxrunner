@@ -1,5 +1,5 @@
 """
-Etikettendruck auf einem Niimbot/Nimbot B1 per Bluetooth (RFCOMM).
+Etikettendruck auf einem Niimbot/Nimbot B1 per Bluetooth (RFCOMM oder BLE).
 
 Protokoll analog zu https://github.com/AndBondStyle/niimprint und
 https://github.com/MultiMote/niimbluelib (B1PrintTask)
@@ -10,16 +10,15 @@ https://github.com/MultiMote/niimbluelib (B1PrintTask)
 """
 import base64
 import io
-import queue
-import socket
 import struct
-import threading
 import time
 
-from nwebclient import runner as r, base
+from nwebclient import base
 from nwebclient import util as u
 from nwebclient import web as w
 from nwebclient import dev as d
+
+from nxrunner.devices.bluetooth import BluetoothDevice
 
 
 class NiimbotPacket:
@@ -66,83 +65,7 @@ class NiimbotPacket:
         return f"<NiimbotPacket type=0x{self.type:02X} data={self.data.hex()}>"
 
 
-class RfcommTransport:
-    """ Bluetooth Classic (Serial Port Profile) """
-
-    def __init__(self, address, channel=1, timeout=10):
-        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-        self.sock.settimeout(timeout)
-        try:
-            self.sock.connect((address, channel))
-        except OSError:
-            self.sock.close()
-            raise
-
-    def write(self, data):
-        self.sock.sendall(data)
-
-    def read(self, timeout):
-        """ Liefert empfangene Bytes oder None bei Timeout """
-        self.sock.settimeout(max(0.05, timeout))
-        try:
-            chunk = self.sock.recv(1024)
-        except socket.timeout:
-            return None
-        if not chunk:
-            raise ConnectionError("Verbindung zum Drucker getrennt")
-        return chunk
-
-    def close(self):
-        self.sock.close()
-
-
-class BleTransport:
-    """ Bluetooth Low Energy via bleak, kein Koppeln noetig """
-
-    CHARACTERISTIC = 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f'
-
-    def __init__(self, address, timeout=15):
-        import asyncio
-        from bleak import BleakClient
-        self.asyncio = asyncio
-        self.queue = queue.Queue()
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        self.client = BleakClient(address, timeout=timeout)
-        try:
-            self.run(self.client.connect(), timeout + 5)
-            self.run(self.client.start_notify(self.CHARACTERISTIC, lambda _, data: self.queue.put(bytes(data))))
-        except BaseException:
-            self.close()
-            raise
-
-    def run(self, coro, timeout=30):
-        return self.asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
-
-    def write(self, data):
-        size = max(20, (self.client.mtu_size or 23) - 3)
-        for i in range(0, len(data), size):
-            self.run(self.client.write_gatt_char(self.CHARACTERISTIC, data[i:i + size], response=False))
-        # Drucker nicht ueberfluten
-        time.sleep(0.01)
-
-    def read(self, timeout):
-        try:
-            return self.queue.get(timeout=max(0.05, timeout))
-        except queue.Empty:
-            if not self.client.is_connected:
-                raise ConnectionError("Verbindung zum Drucker getrennt")
-            return None
-
-    def close(self):
-        try:
-            if self.client.is_connected:
-                self.run(self.client.disconnect())
-        finally:
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-
-class NimbotB1(r.BaseJobExecutor):
+class NimbotB1(BluetoothDevice):
     """
     Runner fuer den Etikettendrucker Niimbot B1.
 
@@ -152,6 +75,9 @@ class NimbotB1(r.BaseJobExecutor):
     transport: 'auto' (RFCOMM, bei Fehler BLE), 'rfcomm' oder 'ble'
     """
     MODULES = ['pillow', 'bleak']
+
+    DEVICE_NAME = 'Nimbot B1'
+    BLE_CHARACTERISTIC = 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f'
 
     PRINTHEAD_PX = 384
 
@@ -188,52 +114,30 @@ class NimbotB1(r.BaseJobExecutor):
 
     def __init__(self, address=None, channel=1, width_mm=50, height_mm=30, density=3, transport='auto',
                  args: u.Args = {}):
-        super().__init__('nimbot_b1')
-        self.address = args.get('nimbot_address', address)
-        self.channel = int(args.get('nimbot_channel', channel))
-        self.transport = args.get('nimbot_transport', transport)
+        super().__init__('nimbot_b1',
+                         address=args.get('nimbot_address', address),
+                         channel=args.get('nimbot_channel', channel),
+                         transport=args.get('nimbot_transport', transport))
         self.width_mm = int(args.get('nimbot_width_mm', width_mm))
         self.height_mm = int(args.get('nimbot_height_mm', height_mm))
         self.density = int(args.get('nimbot_density', density))
-        self.conn = None
         self.buffer = bytearray()
-        self.lock = threading.Lock()
-        self.scan_results = {}
-        self.last_bt_output = ''
-        self.last_error = None
         self.define_sig(d.PStr('op', 'print_text'), d.Param('text', 'str'))
         self.define_sig(d.PStr('op', 'print_image'), d.Param('file', 'str'))
         self.define_sig(d.PStr('op', 'print_image'), d.Param('image', 'str'))
         self.define_sig(d.PStr('op', 'info'))
 
+    def is_target_device(self, name):
+        return name.upper().startswith('B1')
+
     # ------------------------------------------------------------------
-    # Transport
+    # Pakete
     # ------------------------------------------------------------------
 
     def connect(self):
-        if self.conn is not None:
-            return
-        if not self.address:
-            raise Exception("Keine Bluetooth-Adresse fuer Nimbot B1 konfiguriert")
-        self.buffer.clear()
-        if self.transport in ('auto', 'rfcomm'):
-            self.info(f"Verbinde mit {self.address} (RFCOMM {self.channel})")
-            try:
-                self.conn = RfcommTransport(self.address, self.channel)
-                return
-            except OSError as e:
-                if self.transport == 'rfcomm':
-                    raise
-                self.info(f"RFCOMM fehlgeschlagen ({e}), versuche BLE")
-        self.info(f"Verbinde mit {self.address} (BLE)")
-        self.conn = BleTransport(self.address)
-
-    def disconnect(self):
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            finally:
-                self.conn = None
+        if self.conn is None:
+            self.buffer.clear()
+        super().connect()
 
     def send(self, pkt: NiimbotPacket):
         self.conn.write(pkt.to_bytes())
@@ -467,162 +371,10 @@ class NimbotB1(r.BaseJobExecutor):
             finally:
                 self.disconnect()
 
-    def execute_set_address(self, data):
-        self.address = data['address']
-        return self.success(address=self.address, ui_reload=True)
-
-    # ------------------------------------------------------------------
-    # Koppeln (bluetoothctl)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def bluetoothctl(*commands, wait=2.0, timeout=30):
-        """ Fuehrt Kommandos interaktiv in bluetoothctl aus und liefert die Ausgabe """
-        import subprocess
-        proc = subprocess.Popen(['bluetoothctl'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, universal_newlines=True)
-        try:
-            for cmd in commands:
-                if isinstance(cmd, (int, float)):
-                    time.sleep(cmd)
-                else:
-                    proc.stdin.write(cmd + '\n')
-                    proc.stdin.flush()
-                    time.sleep(wait)
-            out, _ = proc.communicate('quit\n', timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _ = proc.communicate()
-        return out
-
-    @staticmethod
-    def bluetoothctl_cmd(*args, timeout=15):
-        """ bluetoothctl im Kommandomodus, z.B. bluetoothctl_cmd('show') """
-        import subprocess
-        try:
-            res = subprocess.run(['bluetoothctl', *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 universal_newlines=True, timeout=timeout)
-            return res.stdout
-        except subprocess.TimeoutExpired as e:
-            return e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or '')
-
-    @staticmethod
-    def parse_devices(out):
-        """ Liest 'Device <MAC> <Name>' Zeilen (auch [NEW] aus Scans), ignoriert [CHG]/[DEL] """
-        import re
-        out = re.sub(r'\x1b\[[0-9;]*m', '', out)
-        found = {}
-        for line in out.splitlines():
-            if '[CHG]' in line or '[DEL]' in line:
-                continue
-            m = re.search(r'Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})(?: (.*))?$', line.strip())
-            if m:
-                found[m.group(1)] = (m.group(2) or '').strip() or m.group(1)
-        return found
-
-    def bt_devices(self):
-        """ Bekannte und zuletzt gefundene Geraete als Liste von (Adresse, Name), Nimbot zuerst """
-        found = dict(self.scan_results)
-        found.update(self.parse_devices(self.bluetoothctl_cmd('devices')))
-        return sorted(found.items(), key=lambda e: (not self.is_niimbot(e[1]), e[1] == e[0], e[1]))
-
-    @staticmethod
-    def is_niimbot(name):
-        return name.upper().startswith('B1')
-
-    def bt_status(self):
-        """ Zustand des Bluetooth-Adapters, z.B. {'Powered': 'yes', 'Discovering': 'no'} """
-        out = self.bluetoothctl_cmd('show')
-        if 'No default controller' in out or 'Waiting to connect' in out:
-            return {'error': out.strip()}
-        status = {}
-        for line in out.splitlines():
-            if ':' in line:
-                key, value = line.strip().split(':', 1)
-                if key in ('Name', 'Powered', 'Discoverable', 'Pairable', 'Discovering'):
-                    status[key] = value.strip()
-        return status
-
-    def execute_bt_power(self, data):
-        self.last_bt_output = self.bluetoothctl_cmd('power', 'on')
-        return self.success(output=self.last_bt_output, ui_reload=True)
-
-    def execute_bt_scan(self, data):
-        duration = int(data.get('duration', 10))
-        self.bluetoothctl_cmd('power', 'on')
-        out = self.bluetoothctl_cmd('--timeout', str(duration), 'scan', 'on', timeout=duration + 10)
-        self.last_bt_output = out
-        self.scan_results.update(self.parse_devices(out))
-        devices = self.bt_devices()
-        return self.success(devices=[dict(address=a, name=n) for a, n in devices], ui_reload=True)
-
-    def execute_bt_disconnect(self, data):
-        self.last_bt_output = self.bluetoothctl_cmd('disconnect', data['address'])
-        return self.success(output=self.last_bt_output, ui_reload=True)
-
-    def execute_bt_device_info(self, data):
-        self.last_bt_output = self.bluetoothctl_cmd('info', data['address'])
-        return self.success(output=self.last_bt_output, ui_reload=True)
-
-    def execute_bt_pair(self, data):
-        address = data['address']
-        out = self.bluetoothctl('agent NoInputNoOutput', 'default-agent', f'pair {address}', 8,
-                                f'trust {address}', wait=1, timeout=40)
-        self.last_bt_output = out
-        if 'Pairing successful' not in out and 'AlreadyExists' not in out:
-            return self.fail('Koppeln fehlgeschlagen', address=address, output=out[-2000:])
-        self.address = address
-        return self.success(address=address, output=out[-2000:], ui_reload=True)
-
-    def execute_bt_remove(self, data):
-        self.last_bt_output = self.bluetoothctl_cmd('remove', data['address'])
-        self.scan_results.pop(data['address'], None)
-        return self.success(output=self.last_bt_output, ui_reload=True)
-
-    def part_install(self, p: base.Page, params={}):
-        with p.section(h="Nimbot B1 koppeln"):
-            p.div(f"Aktuelle Adresse: {self.address}")
-            try:
-                status = self.bt_status()
-            except OSError as e:
-                status = {'error': f"bluetoothctl nicht verfuegbar: {e}"}
-            if 'error' in status:
-                p.div(f"Bluetooth-Adapter: {status['error']}", style='color: red')
-            else:
-                p.div("Bluetooth-Adapter: " + ', '.join(f"{k}: {v}" for k, v in status.items()))
-                if status.get('Powered') != 'yes':
-                    p.div("Adapter ist ausgeschaltet", style='color: red')
-            p(self.action_btn(dict(title="Bluetooth einschalten", type=self.type, op='bt_power')))
-            p.div("Drucker einschalten und nicht mit der Handy-App verbunden lassen, dann suchen (ca. 10 s).")
-            p(self.action_btn(dict(title="Suchen", type=self.type, op='bt_scan')))
-            if self.last_error:
-                p.div(f"Letzter Druckfehler: {self.last_error}", style='color: red')
-        with p.section(h="Geraete"):
-            try:
-                devices = self.bt_devices()
-            except OSError:
-                devices = []
-            if not devices:
-                p.div("Keine Geraete gefunden")
-            for address, name in devices:
-                label = f"{name} ({address})" + (" - Nimbot" if self.is_niimbot(name) else "")
-                p.div(label
-                      + self.action_btn(dict(title="Koppeln", type=self.type, op='bt_pair', address=address))
-                      + self.action_btn(dict(title="Verwenden", type=self.type, op='set_address', address=address))
-                      + self.action_btn(dict(title="Info", type=self.type, op='bt_device_info', address=address))
-                      + self.action_btn(dict(title="Trennen", type=self.type, op='bt_disconnect', address=address))
-                      + self.action_btn(dict(title="Entfernen", type=self.type, op='bt_remove', address=address)))
-        if self.last_bt_output:
-            with p.section(h="Letzte bluetoothctl-Ausgabe"):
-                import html
-                p.pre(html.escape(self.last_bt_output[-3000:]))
-        p.ul([w.a("Zurueck", self.link(self.part_index))])
-
     def part_index(self, p: base.Page, params={}):
         with p.section(h="Nimbot B1"):
             p.div(f"Adresse: {self.address} ({self.transport}), Etikett: {self.width_mm}x{self.height_mm}mm, Dichte: {self.density}")
-            if self.last_error:
-                p.div(f"Letzter Druckfehler: {self.last_error}", style='color: red')
+            self.part_last_error(p)
             p.ul([w.a("Drucker koppeln", self.link(self.part_install))])
             p.form_input("address", "Bluetooth-Adresse", id='address')
             p(self.action_btn_parametric("Adresse setzen", dict(type=self.type, op='set_address', address='#address')))
