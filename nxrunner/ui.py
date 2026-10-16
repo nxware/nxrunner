@@ -33,6 +33,12 @@ class NxRunner(r.AutoDispatcher):
             ]
         }
 
+    def query_jumplinks(self):
+        return [
+            web.a("UI (v2)", '/pysys/ui'),
+            *super().query_jumplinks()
+        ]
+
     def ui_runner_page(self, params):
         """
           ?type=promptdb&promptdb=stats -> execute({type: promptdb, page: stats, ...})
