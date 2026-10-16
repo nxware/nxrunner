@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NxRunner</title>
+<link rel="stylesheet" href="/static/js/nx/ui.css" />
+<script src="/static/js/nx/ui.js"></script>
+<script src="/static/jquery.js"></script>
+<script src="/static/js/base.js"></script>
+<script src="/static/components/base.js"></script>
 <style>
 :root {
   --header-bg: #2c2f31; --header-text: #ffffff; --header-muted: #b5bac1;
@@ -18,13 +23,13 @@
 }
 * { box-sizing: border-box; border-radius: 0; }
 input[type=search] { -webkit-appearance: none; appearance: none; }
-body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+body, body.light, body.dark { margin: 0; height: auto; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
 header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--header-bg); color: var(--header-text); position: sticky; top: 0; z-index: 1; }
 header h1 { font-size: 18px; margin: 0; }
 header .stats { color: var(--header-muted); font-size: 13px; }
 header nav { margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }
-header nav a { color: var(--header-muted); text-decoration: none; font-size: 13px; }
-header nav a:hover { color: var(--header-text); }
+#nav a { color: var(--header-muted); text-decoration: none; font-size: 13px; }
+#nav a:hover { color: var(--header-text); }
 main { display: grid; grid-template-columns: 280px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
 @media (max-width: 760px) { main { grid-template-columns: 1fr; padding: 16px; } }
 .card { background: var(--panel); border: 1px solid var(--border); padding: 16px; }
@@ -37,6 +42,13 @@ aside input[type=search] { width: 100%; padding: 8px 10px; border: 1px solid var
 .list h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 16px 10px 4px; }
 .badge { font-size: 11px; padding: 1px 6px; border: 1px solid currentColor; opacity: .8; }
 #content { overflow: auto; min-width: 0; }
+/* Inhalte der Runner (nwebclient-Parts) an das Layout anpassen */
+#content h1, #content h2 { padding: 0; margin: 0 0 12px; }
+#content .part_box, #content .page_section { background: var(--bg); border: 1px solid var(--border); padding: 8px; margin: 8px 0; }
+#content ul.nx_menu { gap: 6px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+#content .nx_menu li { min-width: 0; margin: 0; padding: 0; border: 1px solid var(--border); }
+#content .nx_menu a { display: block; padding: 4px 12px; text-decoration: none; color: var(--accent); }
+#content .nx_menu a:hover { background: var(--bg); }
 .muted { color: var(--muted); }
 .status.err { color: var(--err); font-weight: 600; margin-bottom: 6px; }
 button { padding: 8px 14px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
@@ -47,7 +59,8 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 </style>
 </head>
-<body>
+<body class="light">
+<script>if (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) document.body.className = 'dark';</script>
 <header>
   <h1>NxRunner</h1>
   <span class="stats" id="stats"></span>
@@ -56,7 +69,7 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 <main>
   <aside class="card">
     <input type="search" id="search" placeholder="Runner suchen&hellip;" autocomplete="off">
-    <ul class="list" id="list"></ul>
+    <ul class="list" id="runners"></ul>
   </aside>
   <section class="card" id="content"><div class="empty">Runner ausw&auml;hlen</div></section>
 </main>
@@ -66,13 +79,14 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 __JS__
 </script>
 <script>
+(() => {
 const DATA = __DATA__;
-const $ = s => document.querySelector(s);
+const qs = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let current = null;
 
 function renderStats() {
-  $('#stats').textContent = DATA.instances.length + ' Runner geladen, ' + DATA.classes.length + ' verfügbar';
+  qs('#stats').textContent = DATA.instances.length + ' Runner geladen, ' + DATA.classes.length + ' verfügbar';
 }
 
 // Runner wurde vom LazyDispatcher instanziiert -> zu den geladenen verschieben
@@ -85,10 +99,10 @@ function markLoaded(name) {
 }
 
 renderStats();
-$('#nav').innerHTML = DATA.links.map(l => '<a href="' + esc(l.url) + '">' + esc(l.title) + '</a>').join('');
+qs('#nav').innerHTML = DATA.links.map(l => '<a href="' + esc(l.url) + '">' + esc(l.title) + '</a>').join('');
 
 function renderList() {
-  const q = $('#search').value.toLowerCase();
+  const q = qs('#search').value.toLowerCase();
   const match = r => !q || r.name.toLowerCase().includes(q) || (r.cls || '').toLowerCase().includes(q);
   const item = (r, loaded) => '<li data-name="' + esc(r.name) + '" class="' + (current === r.name ? 'active' : '') + '">'
     + '<div><div>' + esc(r.name) + '</div><div class="cls">' + esc(r.cls) + '</div></div>'
@@ -96,11 +110,11 @@ function renderList() {
   const inst = DATA.instances.filter(match), cls = DATA.classes.filter(match);
   let html = inst.map(r => item(r, true)).join('');
   if (cls.length) html += '<h3>Nicht geladen</h3>' + cls.map(r => item(r, false)).join('');
-  $('#list').innerHTML = html || '<li class="muted">Keine Treffer</li>';
+  qs('#runners').innerHTML = html || '<li class="muted">Keine Treffer</li>';
 }
 
 function setContent(html) {
-  const out = $('#content');
+  const out = qs('#content');
   out.innerHTML = html;
   // per innerHTML eingefuegte Scripte werden nicht ausgefuehrt, daher neu erzeugen
   out.querySelectorAll('script').forEach(old => {
@@ -137,7 +151,7 @@ function select(name) {
   current = name;
   renderList();
   history.pushState(null, '', '?' + new URLSearchParams({[DATA.key]: name}));
-  $('#error').textContent = '';
+  qs('#error').textContent = '';
   setContent('<div class="muted">L&auml;dt&hellip;</div>');
   exec_job({[DATA.key]: name, page: 'index'}, result => {
     if (result.lazyload) markLoaded(name);
@@ -150,8 +164,8 @@ function select(name) {
   });
 }
 
-$('#search').addEventListener('input', renderList);
-$('#list').addEventListener('click', e => { const li = e.target.closest('li[data-name]'); if (li) select(li.dataset.name); });
+qs('#search').addEventListener('input', renderList);
+qs('#runners').addEventListener('click', e => { const li = e.target.closest('li[data-name]'); if (li) select(li.dataset.name); });
 window.addEventListener('popstate', () => location.reload());
 // serverseitig gerenderte Runner-Seite (?type=x&x=page)
 if (DATA.page) {
@@ -159,6 +173,7 @@ if (DATA.page) {
   if (DATA.page.error !== undefined) showError(DATA.page.error); else setRunnerContent(current, DATA.page.content);
 }
 renderList();
+})();
 </script>
 </body>
 </html>
