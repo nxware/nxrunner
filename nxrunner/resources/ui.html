@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NxRunner</title>
+<style>
+:root {
+  --header-bg: #2c2f31; --header-text: #ffffff; --header-muted: #b5bac1;
+  --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #6b7385; --border: #e2e5ea;
+  --accent: #3b6cf6; --accent-text: #ffffff; --ok: #1f9d55; --err: #d64545; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b2029; --text: #e4e7ec; --muted: #8b93a5; --border: #2a303c;
+    --accent: #5b86ff; --accent-text: #ffffff; --ok: #3ecf7a; --err: #ff6b6b; --code: #151920;
+  }
+}
+* { box-sizing: border-box; border-radius: 0; }
+input[type=search] { -webkit-appearance: none; appearance: none; }
+body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--header-bg); color: var(--header-text); position: sticky; top: 0; z-index: 1; }
+header h1 { font-size: 18px; margin: 0; }
+header .stats { color: var(--header-muted); font-size: 13px; }
+header nav { margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }
+header nav a { color: var(--header-muted); text-decoration: none; font-size: 13px; }
+header nav a:hover { color: var(--header-text); }
+main { display: grid; grid-template-columns: 280px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; padding: 16px; } }
+.card { background: var(--panel); border: 1px solid var(--border); padding: 16px; }
+aside input[type=search] { width: 100%; padding: 8px 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.list { list-style: none; margin: 12px 0 0; padding: 0; max-height: 70vh; overflow: auto; }
+.list li { padding: 8px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.list li:hover { background: var(--bg); }
+.list li.active { background: var(--accent); color: var(--accent-text); }
+.list li .cls { font-size: 11px; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 16px 10px 4px; }
+.badge { font-size: 11px; padding: 1px 6px; border: 1px solid currentColor; opacity: .8; }
+#content { overflow: auto; min-width: 0; }
+.muted { color: var(--muted); }
+.status.err { color: var(--err); font-weight: 600; margin-bottom: 6px; }
+button { padding: 8px 14px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
+button:hover { border-color: var(--accent); }
+pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; margin: 0; }
+#error { margin: 0 20px 20px; color: var(--err); }
+#error:empty { display: none; }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NxRunner</h1>
+  <span class="stats" id="stats"></span>
+  <nav id="nav"></nav>
+</header>
+<main>
+  <aside class="card">
+    <input type="search" id="search" placeholder="Runner suchen&hellip;" autocomplete="off">
+    <ul class="list" id="list"></ul>
+  </aside>
+  <section class="card" id="content"><div class="empty">Runner ausw&auml;hlen</div></section>
+</main>
+<pre id="error"></pre>
+<pre id="result" hidden></pre>
+<script>
+__JS__
+</script>
+<script>
+const DATA = __DATA__;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let current = null;
+
+function renderStats() {
+  $('#stats').textContent = DATA.instances.length + ' Runner geladen, ' + DATA.classes.length + ' verfügbar';
+}
+
+// Runner wurde vom LazyDispatcher instanziiert -> zu den geladenen verschieben
+function markLoaded(name) {
+  const i = DATA.classes.findIndex(c => c.name === name);
+  if (i < 0) return;
+  DATA.instances.push(DATA.classes.splice(i, 1)[0]);
+  renderStats();
+  renderList();
+}
+
+renderStats();
+$('#nav').innerHTML = DATA.links.map(l => '<a href="' + esc(l.url) + '">' + esc(l.title) + '</a>').join('');
+
+function renderList() {
+  const q = $('#search').value.toLowerCase();
+  const match = r => !q || r.name.toLowerCase().includes(q) || (r.cls || '').toLowerCase().includes(q);
+  const item = (r, loaded) => '<li data-name="' + esc(r.name) + '" class="' + (current === r.name ? 'active' : '') + '">'
+    + '<div><div>' + esc(r.name) + '</div><div class="cls">' + esc(r.cls) + '</div></div>'
+    + (loaded ? '' : '<span class="badge">laden</span>') + '</li>';
+  const inst = DATA.instances.filter(match), cls = DATA.classes.filter(match);
+  let html = inst.map(r => item(r, true)).join('');
+  if (cls.length) html += '<h3>Nicht geladen</h3>' + cls.map(r => item(r, false)).join('');
+  $('#list').innerHTML = html || '<li class="muted">Keine Treffer</li>';
+}
+
+function setContent(html) {
+  const out = $('#content');
+  out.innerHTML = html;
+  // per innerHTML eingefuegte Scripte werden nicht ausgefuehrt, daher neu erzeugen
+  out.querySelectorAll('script').forEach(old => {
+    const s = document.createElement('script');
+    [...old.attributes].forEach(a => s.setAttribute(a.name, a.value));
+    s.textContent = old.textContent;
+    old.replaceWith(s);
+  });
+}
+
+function showError(message) {
+  setContent('<div class="status err">Keine Seite verf&uuml;gbar</div><pre>' + esc(message) + '</pre>');
+}
+
+function select(name) {
+  current = name;
+  renderList();
+  history.pushState(null, '', '?' + new URLSearchParams({[DATA.key]: name}));
+  $('#error').textContent = '';
+  setContent('<div class="muted">L&auml;dt&hellip;</div>');
+  exec_job({[DATA.key]: name, page: 'index'}, result => {
+    if (result.lazyload) markLoaded(name);
+    if (current !== name) return;
+    if (result.success === false || result.content === undefined) {
+      showError(result.message || JSON.stringify(result, null, 2));
+    } else {
+      setContent(result.content);
+    }
+  });
+}
+
+$('#search').addEventListener('input', renderList);
+$('#list').addEventListener('click', e => { const li = e.target.closest('li[data-name]'); if (li) select(li.dataset.name); });
+window.addEventListener('popstate', () => location.reload());
+// serverseitig gerenderte Runner-Seite (?type=x&x=page)
+if (DATA.page) {
+  current = DATA.page.name;
+  if (DATA.page.error !== undefined) showError(DATA.page.error); else setContent(DATA.page.content);
+}
+renderList();
+</script>
+</body>
+</html>

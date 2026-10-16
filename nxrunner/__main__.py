@@ -103,9 +103,18 @@ def install_deps(pkg):
     print("Done.")
 
 
+def serv():
+    from nwebclient import runner as r
+    from nxrunner import ui
+    args = u.Args()
+    args.argv.append('--rest')
+    r.run(args, ui.NxRunner())
+
+
 def help():
     print("Usage:")
     print("")
+    print("  python -m nxrunner serv")
     print("  python -m nxrunner deps")
     print("  python -m nxrunner install pkg")
 
@@ -116,6 +125,8 @@ action = args.shift('run')
 match action:
     case "deps":
         deps_for_pkg("nxrunner")
+    case "serv":
+        serv()
     case 'install':
         install(args.shift('nxrunner'))
     case 'install_deps':
