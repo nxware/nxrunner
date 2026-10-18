@@ -19,6 +19,7 @@ class Wsl(r.BaseJobExecutor):
       op=umount mountpoint=/mnt/d
       op=mounts
       op=drives
+      op=volumes
       op=cmd cmd="dir C:\\"
     """
 
@@ -118,7 +119,10 @@ class Wsl(r.BaseJobExecutor):
         res = self.run(self.sudo(['mkdir', '-p', mountpoint]))
         if not res['success']:
             return res
-        res = self.run(self.sudo(['mount', '-t', 'drvfs', source, mountpoint]))
+        # wie das automatische Mounten der WSL (C:, D:): Dateien gehoeren dem Benutzer des Runners, nicht root.
+        # Sonst darf er z.B. Zeitstempel und Rechte von Dateien nicht setzen (EPERM).
+        options = f'uid={os.getuid()},gid={os.getgid()}'
+        res = self.run(self.sudo(['mount', '-t', 'drvfs', source, mountpoint, '-o', options]))
         res['mountpoint'] = mountpoint
         return res
 
@@ -145,6 +149,33 @@ class Wsl(r.BaseJobExecutor):
             res['value'] = [d.strip() + ':' for d in res['stdout'].splitlines() if d.strip() != '']
         return res
 
+    def volumes(self, timeout=120):
+        """
+          Windows-Laufwerke mit Namen, z.B. {'D': {'label': 'Daten', 'provider': ''}}
+          label ist das Volume-Label, provider bei Netzlaufwerken der Freigabepfad
+
+          Der erste Aufruf kann wegen Netzlaufwerken deutlich laenger dauern (Kaltstart ~1 min).
+        """
+        ps = self.windows_exe('powershell')
+        if ps is None:
+            raise RuntimeError('powershell.exe nicht gefunden')
+        script = 'Get-CimInstance Win32_LogicalDisk | ForEach-Object { $_.DeviceID + "|" + $_.VolumeName + "|" + $_.ProviderName }'
+        res = self.run([ps, '-NoProfile', '-Command', script], cwd=self.windows_cwd(), timeout=timeout)
+        if not res['success']:
+            raise RuntimeError(res['message'] + ' ' + res.get('stderr', ''))
+        volumes = {}
+        for line in res['stdout'].splitlines():
+            parts = line.strip().split('|', 2)
+            if len(parts) == 3 and self.DRIVE_RE.match(parts[0]):
+                volumes[parts[0][0].upper()] = dict(label=parts[1].strip(), provider=parts[2].strip())
+        return volumes
+
+    def execute_volumes(self, data):
+        try:
+            return self.success('ok', value=self.volumes())
+        except RuntimeError as e:
+            return self.fail(str(e))
+
     def execute_cmd(self, data):
         cmd = self.windows_exe('cmd')
         if cmd is None:
@@ -170,3 +201,8 @@ class Wsl(r.BaseJobExecutor):
             p.form_input("cmd", "Befehl", id='cmd', placeholder='dir C:\\')
             p(self.action_btn_parametric("Ausfuehren", dict(type=self.type, op='cmd', cmd='#cmd')))
         p.pre('', id='result')
+
+
+# am Ende, da nfile Wsl aus diesem Modul importiert
+from nxrunner.system.nfile import NFile  # noqa: E402
+from nxrunner.system.backup import Backup  # noqa: E402

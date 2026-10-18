@@ -1,3 +1,5 @@
+import shutil
+
 from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import util as u
@@ -33,5 +35,15 @@ class Smb(r.BaseJobExecutor):
         with self.client.open_file(self._build_path(path), mode="w") as fd:
             fd.write(contents)
 
-    def copy_to_remote(self, src_path="/", dst_path="/"):
-        pass
+    def makedirs(self, path="/"):
+        self.client.makedirs(self._build_path(path), exist_ok=True)
+
+    def copy_to_remote(self, src_path="/", dst_path="/", mtime=None):
+        """
+          Kopiert die lokale Datei src_path nach dst_path (/share/verzeichnis/datei).
+          Das Zielverzeichnis muss existieren (siehe makedirs).
+        """
+        with open(src_path, 'rb') as src, self.client.open_file(self._build_path(dst_path), mode='wb') as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+        if mtime is not None:
+            self.client.utime(self._build_path(dst_path), times=(mtime, mtime))

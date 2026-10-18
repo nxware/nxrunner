@@ -85,6 +85,17 @@ const qs = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let current = null;
 
+// Runner-Seiten registrieren Handler (z.B. web.button_js) per DOMContentLoaded. Wird ihr Inhalt
+// nachtraeglich eingefuegt, ist das Event schon vorbei, daher solche Handler sofort ausfuehren.
+const addEventListenerOrig = document.addEventListener;
+document.addEventListener = function(type, listener, options) {
+  if (type === 'DOMContentLoaded' && document.readyState !== 'loading') {
+    setTimeout(listener, 0);
+    return;
+  }
+  return addEventListenerOrig.call(this, type, listener, options);
+};
+
 function renderStats() {
   qs('#stats').textContent = DATA.instances.length + ' Runner geladen, ' + DATA.classes.length + ' verfügbar';
 }
