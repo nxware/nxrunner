@@ -108,6 +108,9 @@ def serv():
     from nxrunner import ui
     args = u.Args()
     args.argv.append('--rest')
+    if args.get('SERVER') is None:
+        # Produktionsserver, Flask-Entwicklungsserver mit --SERVER flask
+        args.argv.extend(['--SERVER', 'waitress'])
     r.run(args, ui.NxRunner())
 
 

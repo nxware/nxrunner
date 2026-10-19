@@ -2,7 +2,7 @@
 name = "nxrunner"
 description = ""
 version = "1.0.3"
-dependencies = ["nwebclient"]
+dependencies = ["nwebclient", "waitress"]
 
 [project.optional-dependencies]
 full = ["pymongo", "buenavista", "pihole6api", "pydub", "smbprotocol"]
