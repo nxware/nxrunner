@@ -29,6 +29,7 @@ wsl = "nxrunner.system:Wsl"
 nfile = "nxrunner.system:NFile"
 backup = "nxrunner.system:Backup"
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
+dashboard_cyd = "nxrunner.devices:DashboardCYD"
 
 [nx]
 pydeps="-xx nxrunner"
