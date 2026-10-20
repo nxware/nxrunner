@@ -1,5 +1,9 @@
+dist
 **__pycache__**
 **.pyc
 .idea
 .pytest_cache
 dependencies.svg
+
+
+upload.sh

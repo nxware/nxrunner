@@ -8,6 +8,11 @@ from nwebclient import dev as d
 
 
 class Smb(r.BaseJobExecutor):
+    """
+      Zugriff auf SMB-/Windows-Freigaben (smbprotocol), z.B. als Backup-Ziel.
+      Pfade sind /share/verzeichnis/datei, vorher connect(host, username, password) aufrufen.
+      Methoden: listdir, get_contents, put_contents, makedirs, copy_to_remote
+    """
 
     MODULES = ['smbprotocol']
 

@@ -5,6 +5,12 @@ from nwebclient import dev as d
 
 
 class JoystickM5(r.BaseJobExecutor):
+    """
+      M5Stack Joystick 2 (Unit, I2C-Adresse 0x63 an Bus 1): Achsen, Taster und RGB-LED.
+      op=read                        X/Y (8 und 16 Bit), Taster (0 = gedrueckt), Firmware, Adresse
+      op=rgb r g b                   Farbe der LED setzen
+      op=setaction jobdef x_var      alle 0,5 s einen Job mit dem X-Wert in x_var ausfuehren
+    """
 
     MODULES = ["smbus2"]
 

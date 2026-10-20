@@ -5,9 +5,11 @@ version = "1.0.3"
 dependencies = ["nwebclient", "waitress"]
 
 [project.optional-dependencies]
-full = ["pymongo", "buenavista", "pihole6api", "pydub", "smbprotocol"]
+full = ["pymongo", "buenavista", "pihole6api", "pydub", "smbprotocol", "paramiko", "docker"]
 mongo = ["pymongo"]
 smb = ["smbprotocol"]
+ssh = ["paramiko"]
+docker = ["docker"]
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"

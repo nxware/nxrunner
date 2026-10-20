@@ -6,6 +6,10 @@ from nwebclient import dev as d
 
 
 class Convert(r.BaseJobExecutor):
+    """
+      Konvertiert Audiodateien von WAV nach MP3 (pydub, benoetigt ffmpeg).
+      op=tomp3 infile=/pfad/in.wav outfile=/pfad/out.mp3
+    """
 
     MODULES = ['pydub']
 

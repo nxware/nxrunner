@@ -19,7 +19,8 @@ class Backup(r.BaseJobExecutor):
     """
       Backup-System aus Quellen und Zielen, gespeichert in der nweb-Persistence (Arg DB).
 
-      Quellen:  path (Verzeichnis mit Ausschlussmustern), file (einzelne Datei)
+      Quellen:  path (Verzeichnis mit Ausschlussmustern), file (einzelne Datei), ssh (Verzeichnis per SSH/SFTP,
+                paramiko); je Quelle optional pre_script/post_script (bei ssh auf dem entfernten Rechner)
       Ziele:    drive (Laufwerksname wie in nfile + Pfad auf dem Medium), drive_zip (wie drive, aber in eine
                 ZIP-Datei <Quelle>.zip, jeder Lauf schreibt sie neu, keep = Anzahl alter Versionen), smb (\\\\host\\share\\pfad)
 
@@ -52,7 +53,9 @@ class Backup(r.BaseJobExecutor):
 
     INTERVALS = {0: 'manuell', 3600: 'stündlich', 86400: 'täglich', 604800: 'wöchentlich'}
 
-    SOURCE_COLS = ['source_id', 'kind', 'name', 'path', 'exclude', 'interval_s',
+    # in der UI bearbeitbare Felder einer Quelle (Source.FIELDS waehlt daraus je Art aus)
+    SOURCE_EDIT_COLS = ['path', 'exclude', 'host', 'port', 'username', 'password', 'key_file', 'pre_script', 'post_script']
+    SOURCE_COLS = ['source_id', 'kind', 'name', *SOURCE_EDIT_COLS, 'interval_s',
                    'last_run', 'last_status', 'last_message', 'size', 'files']
     # in der UI bearbeitbare Felder eines Ziels (Destination.FIELDS waehlt daraus je Art aus)
     DESTINATION_EDIT_COLS = ['drive', 'path', 'host', 'share', 'username', 'password', 'keep']
@@ -135,6 +138,11 @@ class Backup(r.BaseJobExecutor):
             self.add_column(nw, 'backup_destination', column)
         # Groesse der Quelle (Bytes, Anzahl Dateien), ermittelt beim letzten vollstaendigen Durchlauf einer Sicherung
         for column in ['size INTEGER DEFAULT NULL', 'files INTEGER DEFAULT NULL']:
+            self.add_column(nw, 'backup_source', column)
+        # entfernte Quellen (SSH) und Pre-/Post-Script
+        for column in ['host varchar(255) DEFAULT NULL', 'port INTEGER DEFAULT NULL', 'username varchar(255) DEFAULT NULL',
+                       'password varchar(255) DEFAULT NULL', 'key_file varchar(1024) DEFAULT NULL',
+                       'pre_script text DEFAULT NULL', 'post_script text DEFAULT NULL']:
             self.add_column(nw, 'backup_source', column)
         # Ziele einer Quelle, mit letztem Lauf je Ziel
         nw.dml("""CREATE TABLE IF NOT EXISTS backup_source_destination (
@@ -280,7 +288,7 @@ class Backup(r.BaseJobExecutor):
     def execute_sources(self, data):
         nw = self.nweb()
         links = self.get_links(nw)
-        return self.success('ok', value=[{**s, 'destinations': [link for link in links if link['source_id'] == s['source_id']]}
+        return self.success('ok', value=[{**self.public_destination(s), 'destinations': [link for link in links if link['source_id'] == s['source_id']]}
                                          for s in self.get_sources(nw)])
 
     @staticmethod
@@ -294,13 +302,27 @@ class Backup(r.BaseJobExecutor):
 
     def execute_source_save(self, data):
         nw = self.nweb()
-        row = dict(kind=data.get('kind', ''), name=data.get('name', '').strip(), path=data.get('path', '').strip(),
-                   exclude=data.get('exclude', '').strip(), interval_s=int(data.get('interval_s') or 0))
+        kind = data.get('kind', '')
+        if kind not in SOURCES:
+            raise ValueError('Unbekannte Quelle: ' + kind)
+        fields = SOURCES[kind].FIELDS
+        row = dict(kind=kind, name=data.get('name', '').strip(), interval_s=int(data.get('interval_s') or 0))
+        for c in self.SOURCE_EDIT_COLS:
+            # nicht verwendete Felder leeren, Passwort und Scripte unveraendert (Leerzeichen/Zeilen sind gewollt)
+            value = data.get(c, '') if c in fields else None
+            row[c] = value.strip() if isinstance(value, str) and c not in ('password', 'pre_script', 'post_script') else value
+        if row['port'] is not None:
+            if str(row['port']).strip() not in ('',) and not str(row['port']).strip().isdigit():
+                raise ValueError('Port: Zahl erwartet')
+            row['port'] = int(row['port']) if str(row['port']).strip() != '' else None
+        source_id = data.get('source_id', '')
+        if source_id != '' and row.get('password') == '':
+            # leeres Passwort beim Bearbeiten: bisheriges behalten
+            row['password'] = self.get_source(nw, source_id)['password']
         create_source(row).validate()
         destination_ids = self.parse_ids(data.get('destination_ids'))
         for destination_id in destination_ids:
             self.get_destination(nw, destination_id)
-        source_id = data.get('source_id', '')
         same = [s for s in self.get_sources(nw) if s['name'] == row['name'] and str(s['source_id']) != str(source_id)]
         if same:
             raise ValueError('Name bereits vergeben: ' + row['name'])
@@ -411,8 +433,19 @@ class Backup(r.BaseJobExecutor):
         checked = {}
         jobs, offline = [], []
         for source in sources:
+            source_checked = None
             for link in [link for link in links if link['source_id'] == source['source_id']]:
                 if not filter_fn(source, link):
+                    continue
+                # entfernte Quelle (z.B. SSH) nicht erreichbar: wie ein offline-Ziel vermerken, bleibt faellig
+                if source_checked is None:
+                    try:
+                        source_checked = create_source(source).check()
+                    except Exception as e:
+                        source_checked = (False, str(e))
+                if not source_checked[0]:
+                    self.mark_offline(nw, link, source_checked[1])
+                    offline.append(source_checked[1])
                     continue
                 if link['destination_id'] not in checked:
                     checked[link['destination_id']] = self.check_destination(nw, link['destination_id'])
@@ -443,6 +476,8 @@ class Backup(r.BaseJobExecutor):
         if len(links) == 0:
             return self.fail('Quelle hat kein Ziel: ' + source['name'])
         jobs, offline = self.collect_jobs(nw, [source], links, lambda s, link: True)
+        # gleiche Meldung je Ziel (z.B. Quelle offline) nur einmal
+        offline = list(dict.fromkeys(offline))
         if not jobs:
             return self.fail('; '.join(offline))
         self.start(nw, jobs)
@@ -475,14 +510,72 @@ class Backup(r.BaseJobExecutor):
         return self.success('ok', value=self.get_runs(self.nweb(), data.get('source_id'), data.get('limit') or 50))
 
     def run_jobs(self, nw, jobs):
-        for source, dest_row in jobs:
+        """
+          jobs: [(Quelle, Ziel)]. Je Quelle wird einmal verbunden (open), das Pre-Script ausgefuehrt, in alle
+          ihre Ziele gesichert, danach das Post-Script ausgefuehrt (auch nach Fehlern) und geschlossen.
+        """
+        groups = []
+        for row, dest_row in jobs:
+            if groups and groups[-1][0]['source_id'] == row['source_id']:
+                groups[-1][1].append(dest_row)
+            else:
+                groups.append((row, [dest_row]))
+        for row, dest_rows in groups:
             if self.cancel_event.is_set():
-                self.info(f"Backup {source['name']} -> {dest_row['name']}: wegen Abbruch nicht ausgefuehrt")
+                self.info(f"Backup {row['name']}: wegen Abbruch nicht ausgefuehrt")
                 continue
             try:
-                self.run_source(nw, source, dest_row)
+                self.run_source_group(nw, row, dest_rows)
             except Exception as e:
-                self.error(f"Backup {source['name']} -> {dest_row['name']}: {e}")
+                self.error(f"Backup {row['name']}: {e}")
+
+    @staticmethod
+    def script_error(name, code, output):
+        return {'file': '', 'error': f'{name} fehlgeschlagen (Exit-Code {code})', 'trace': output[-10000:]}
+
+    def run_source_group(self, nw, row, dest_rows):
+        source = create_source(row)
+        try:
+            source.open()
+        except Exception as e:
+            error = {'file': '', 'error': f'{type(e).__name__}: {e}', 'trace': traceback.format_exc()}
+            for dest_row in dest_rows:
+                self.record_failure(nw, row, dest_row, f'Quelle nicht verfuegbar: {e}', error)
+            source.close()
+            return
+        try:
+            if source.pre_script:
+                code, output = source.run_script(source.pre_script)
+                if code != 0:
+                    error = self.script_error('Pre-Script', code, output)
+                    for dest_row in dest_rows:
+                        self.record_failure(nw, row, dest_row, f'Pre-Script fehlgeschlagen (Exit-Code {code}), nicht gesichert', error)
+                    return
+            for dest_row in dest_rows:
+                if self.cancel_event.is_set():
+                    self.info(f"Backup {row['name']} -> {dest_row['name']}: wegen Abbruch nicht ausgefuehrt")
+                    continue
+                self.run_source(nw, row, dest_row, source=source)
+        finally:
+            try:
+                if source.post_script:
+                    code, output = source.run_script(source.post_script)
+                    if code != 0:
+                        self.post_script_failed(nw, row, dest_rows, self.script_error('Post-Script', code, output), code)
+            except Exception as e:
+                self.post_script_failed(nw, row, dest_rows, {'file': '', 'error': f'Post-Script: {type(e).__name__}: {e}',
+                                                             'trace': traceback.format_exc()}, None)
+            source.close()
+
+    def post_script_failed(self, nw, row, dest_rows, error, code):
+        """ Post-Script fehlgeschlagen: an den Laeufen (Fehlerdetails) und an der Quelle vermerken """
+        for dest_row in dest_rows:
+            status = self.run_details.get((row['source_id'], dest_row['destination_id']))
+            if status is not None:
+                status['errors'] = (status['errors'] + [error])[-self.MAX_ERRORS:]
+        nw.dml("UPDATE backup_source SET last_status = ?, last_message = ? WHERE source_id = ?",
+               ['errors', f"Post-Script fehlgeschlagen (Exit-Code {code})", row['source_id']])
+        self.error(f"Backup {row['name']}: {error['error']}")
 
     def store_usage(self, nw, destination):
         """ Groesse/Belegung des Mediums speichern, wenn ermittelbar; sonst bleibt der letzte bekannte Stand """
@@ -515,7 +608,49 @@ class Backup(r.BaseJobExecutor):
         source_id = int(data['source_id'])
         return self.success('ok', value=[s for (sid, _), s in self.run_details.items() if sid == source_id])
 
-    def run_source(self, nw, row, dest_row, batch_size=200):
+    def new_status(self, row, dest_row, now):
+        sid, did = row['source_id'], dest_row['destination_id']
+        status = dict(state='running', source_id=sid, source=row['name'], destination_id=did, destination=dest_row['name'],
+                      start=now, count=0, size=0, copied=0, skipped=0, failed=0, bytes=0, current='', errors=[])
+        self.status = status
+        self.run_details[(sid, did)] = status
+        return status
+
+    def record_failure(self, nw, row, dest_row, message, error):
+        """ Lauf fuer ein Ziel gar nicht moeglich (z.B. Verbindung zur Quelle, Pre-Script): als error vermerken """
+        now = int(time.time())
+        status = self.new_status(row, dest_row, now)
+        status['errors'] = [error]
+        self.finish_run(nw, row, dest_row, status, 'error', message, now)
+
+    def finish_run(self, nw, row, dest_row, status, result, message, now, destination=None):
+        """ Lauf in backup_run, am Ziel der Quelle und an der Quelle vermerken """
+        sid, did = row['source_id'], dest_row['destination_id']
+        finished = int(time.time())
+        if result == 'interrupted':
+            nw.dml("UPDATE backup_source_destination SET last_status = ?, last_message = ? WHERE source_id = ? AND destination_id = ?",
+                   [result, message, sid, did])
+        else:
+            nw.dml("UPDATE backup_source_destination SET last_run = ?, last_status = ?, last_message = ? WHERE source_id = ? AND destination_id = ?",
+                   [now, result, message, sid, did])
+        # zuletzt ausgefuehrter Lauf an der Quelle
+        nw.dml("UPDATE backup_source SET last_run = ?, last_status = ?, last_message = ? WHERE source_id = ?",
+               [now, result, f"{dest_row['name']}: {message}", sid])
+        if result in ('ok', 'errors'):
+            # Quelle vollstaendig durchlaufen: Groesse aktualisieren
+            nw.dml("UPDATE backup_source SET size = ?, files = ? WHERE source_id = ?", [status['size'], status['count'], sid])
+        if destination is not None:
+            self.store_usage(nw, destination)
+        nw.dml("INSERT INTO backup_run (source_id, destination_id, started, finished, status, count, copied, skipped, failed, bytes, message) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               [sid, did, now, finished, result, status['count'], status['copied'],
+                status['skipped'], status['failed'], status['bytes'], message])
+        status.update(state={'error': 'error', 'interrupted': 'interrupted', 'cancelled': 'cancelled'}.get(result, 'done'),
+                      result=result, message=message, duration=finished - now, current='')
+        self.info(f"Backup {row['name']} -> {dest_row['name']}: {result} {message}")
+        return status
+
+    def run_source(self, nw, row, dest_row, batch_size=200, source=None):
         """
           Sichert eine Quelle in ein Ziel. Ergebnis (status):
             ok, errors (einzelne Dateien fehlgeschlagen), error (Lauf fehlgeschlagen),
@@ -527,14 +662,15 @@ class Backup(r.BaseJobExecutor):
         now = int(time.time())
         sid, did = row['source_id'], dest_row['destination_id']
         link = {'source_id': sid, 'destination_id': did}
-        status = dict(state='running', source_id=sid, source=row['name'], destination_id=did, destination=dest_row['name'],
-                      start=now, count=0, size=0, copied=0, skipped=0, failed=0, bytes=0, current='', errors=[])
-        self.status = status
-        self.run_details[(sid, did)] = status
+        status = self.new_status(row, dest_row, now)
         result, message = 'error', ''
         destination = None
+        # ohne uebergebene Quelle (direkter Aufruf) selbst oeffnen und schliessen, sonst macht das run_jobs
+        own_source = source is None
         try:
-            source = create_source(row)
+            if own_source:
+                source = create_source(row)
+                source.open()
             destination = create_destination(dest_row, self)
             available, check_message = destination.check()
             if not available:
@@ -573,8 +709,11 @@ class Backup(r.BaseJobExecutor):
                         status['skipped'] += 1
                         continue
                     status['current'] = rel
+                    local = None
                     try:
-                        destination.copy(rel, full, st)
+                        # entfernte Quellen laden die Datei hier in eine temporaere lokale Datei
+                        local = source.local_path(rel, full, st)
+                        destination.copy(rel, local, st)
                         pending.append((rel, *meta, int(time.time())))
                         status['copied'] += 1
                         status['bytes'] += st.st_size
@@ -586,6 +725,9 @@ class Backup(r.BaseJobExecutor):
                             break
                         status['failed'] += 1
                         self.add_error(status, rel, e)
+                    finally:
+                        if local is not None:
+                            source.release(rel, local)
                     if incremental and len(pending) >= batch_size:
                         flush()
             finally:
@@ -616,28 +758,9 @@ class Backup(r.BaseJobExecutor):
                     destination.close()
                 except Exception:
                     pass
-        finished = int(time.time())
-        if result == 'interrupted':
-            nw.dml("UPDATE backup_source_destination SET last_status = ?, last_message = ? WHERE source_id = ? AND destination_id = ?",
-                   [result, message, sid, did])
-        else:
-            nw.dml("UPDATE backup_source_destination SET last_run = ?, last_status = ?, last_message = ? WHERE source_id = ? AND destination_id = ?",
-                   [now, result, message, sid, did])
-        # zuletzt ausgefuehrter Lauf an der Quelle
-        nw.dml("UPDATE backup_source SET last_run = ?, last_status = ?, last_message = ? WHERE source_id = ?",
-               [now, result, f"{dest_row['name']}: {message}", sid])
-        if result in ('ok', 'errors'):
-            # Quelle vollstaendig durchlaufen: Groesse aktualisieren
-            nw.dml("UPDATE backup_source SET size = ?, files = ? WHERE source_id = ?", [status['size'], status['count'], sid])
-        if destination is not None:
-            self.store_usage(nw, destination)
-        nw.dml("INSERT INTO backup_run (source_id, destination_id, started, finished, status, count, copied, skipped, failed, bytes, message) "
-               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               [sid, did, now, finished, result, status['count'], status['copied'],
-                status['skipped'], status['failed'], status['bytes'], message])
-        status.update(state={'error': 'error', 'interrupted': 'interrupted', 'cancelled': 'cancelled'}.get(result, 'done'),
-                      result=result, message=message, duration=finished - now, current='')
-        self.info(f"Backup {row['name']} -> {dest_row['name']}: {result} {message}")
+            if own_source and source is not None:
+                source.close()
+        self.finish_run(nw, row, dest_row, status, result, message, now, destination)
         return status
 
     def execute_operation(self, data):
@@ -730,7 +853,7 @@ class Backup(r.BaseJobExecutor):
             for s in sources:
                 p(f"<tr><td>{w.a(html.escape(s['name']), self.link_source(s['source_id']))}</td>"
                   f"<td>{html.escape(SOURCES[s['kind']].TITLE if s['kind'] in SOURCES else s['kind'])}</td>"
-                  f"<td>{html.escape(s['path'] or '')}</td><td>{html.escape(s['exclude'] or '')}</td>"
+                  f"<td>{html.escape(self.source_description(s))}</td><td>{html.escape(s['exclude'] or '')}</td>"
                   f"<td>{html.escape(self.interval_title(s['interval_s']))}</td>"
                   f"<td>{self.html_source_size(s)}</td>"
                   f"<td>{self.html_source_targets(s, [link for link in links if link['source_id'] == s['source_id']], dest_names, stats)}</td>"
@@ -776,6 +899,13 @@ class Backup(r.BaseJobExecutor):
                 text += ' ' + w.a("Fehlerdetails", self.link_source(source['source_id']))
             items.append(f'<div>{text}</div>')
         return ''.join(items)
+
+    @staticmethod
+    def source_description(row):
+        try:
+            return create_source(row).describe()
+        except Exception:
+            return row.get('path') or ''
 
     @staticmethod
     def html_source_size(source):
@@ -848,10 +978,23 @@ class Backup(r.BaseJobExecutor):
         with p.section(h=title):
             p('<a id="bs_form"></a>')
             p.hidden('source_id', source.get('source_id', ''), id='bs_source_id')
-            p.form_select('kind', "Art", {k: c.TITLE for k, c in SOURCES.items()}, source.get('kind'), id='bs_kind')
+            p.form_select('kind', "Art", {k: c.TITLE for k, c in SOURCES.items()}, source.get('kind'), id='bs_kind',
+                          onchange='backup_source_fields()')
             p.form_input('name', "Name", id='bs_name', placeholder='Ordner im Ziel, z.B. dokumente', value=value('name'))
+            p.form_input('host', "Host", id='bs_host', placeholder='server.local', value=value('host'))
+            p.form_input('port', "Port", id='bs_port', type='number', placeholder='22', value=value('port'))
+            p.form_input('username', "Benutzer", id='bs_username', value=value('username'))
+            # Passwort nie ausgeben; leer lassen = bisheriges behalten
+            p.form_input('password', "Passwort", id='bs_password', type='password', autocomplete='new-password',
+                         placeholder='unverändert' if source.get('password') else 'leer = Schlüssel verwenden')
+            p.form_input('key_file', "Schlüsseldatei", id='bs_key_file', placeholder='leer = ~/.ssh bzw. ssh-agent',
+                         value=value('key_file'))
             p.form_input('path', "Pfad", id='bs_path', placeholder='/home/user/Dokumente oder Datei', value=value('path'))
             p.form_input('exclude', "Ausschluss", id='bs_exclude', placeholder='*.tmp, .git, cache/*', value=value('exclude'))
+            for key, label, hint in [('pre_script', 'Pre-Script', 'vor der Sicherung, z.B. Datenbank-Dump; Fehler = nicht sichern'),
+                                     ('post_script', 'Post-Script', 'nach der Sicherung, läuft auch nach Fehlern')]:
+                p.form_elem(w.textarea(html.escape(source.get(key) or ''), name=key, id='bs_' + key, rows='3', cols='50',
+                                       placeholder=hint), label)
             p.form_select('interval_s', "Häufigkeit", self.INTERVALS, source.get('interval_s', 86400), id='bs_interval')
             checks = ''.join(
                 f'<label title="{html.escape(self.destination_tooltip(d), quote=True)}">'
@@ -861,18 +1004,40 @@ class Backup(r.BaseJobExecutor):
             p.form_elem((checks or '(noch keine Ziele angelegt)') + '<input type="hidden" id="bs_destination_ids">', "Ziele")
             p(self.action_btn_parametric("Quelle speichern", dict(
                 type=self.type, op='source_save', source_id='#bs_source_id', kind='#bs_kind', name='#bs_name', path='#bs_path',
-                exclude='#bs_exclude', interval_s='#bs_interval', destination_ids='#bs_destination_ids')))
+                exclude='#bs_exclude', interval_s='#bs_interval', destination_ids='#bs_destination_ids',
+                host='#bs_host', port='#bs_port', username='#bs_username', password='#bs_password', key_file='#bs_key_file',
+                pre_script='#bs_pre_script', post_script='#bs_post_script')))
             p.div("Ausschluss: kommagetrennte Muster, geprüft gegen Datei-/Verzeichnisname und relativen Pfad. "
-                  "Bei der Art Datei wird der Ausschluss nicht verwendet. Ohne Ziel wird die Quelle nicht gesichert. "
-                  "Wird ein Ziel abgewählt, wird beim erneuten Zuordnen vollständig gesichert.")
-            p.script("""
+                  "Ohne Ziel wird die Quelle nicht gesichert. "
+                  "Wird ein Ziel abgewählt, wird beim erneuten Zuordnen vollständig gesichert. "
+                  "Bei SSH laufen Pre-/Post-Script auf dem entfernten Rechner, sonst lokal; "
+                  "der Host-Schlüssel muss in ~/.ssh/known_hosts stehen. Das Passwort wird im Klartext in der DB gespeichert.")
+            p.script(self.js_fields('backup_source_fields', 'bs_', {k: c.FIELDS for k, c in SOURCES.items()},
+                                    self.SOURCE_EDIT_COLS) + """
             function backup_source_dests() {
               var ids = [];
               document.querySelectorAll('.bs_dest').forEach(function(c) { if (c.checked) ids.push(c.value); });
               document.getElementById('bs_destination_ids').value = ids.join(',');
             }
             backup_source_dests();
+            backup_source_fields();
             """)
+
+    @staticmethod
+    def js_fields(function_name, prefix, fields, all_fields):
+        """ JS: blendet Formularfelder (Zeilen von form_input/form_elem) passend zur gewaehlten Art ein und aus """
+        return """
+        function %s() {
+          var fields = %s;
+          var kind = document.getElementById('%skind').value;
+          var visible = fields[kind] || [];
+          %s.forEach(function(f) {
+            var el = document.getElementById('%s' + f);
+            var row = el ? el.closest('.page_form_input') : null;
+            if (row) row.style.display = visible.indexOf(f) >= 0 ? '' : 'none';
+          });
+        }
+        """ % (function_name, json.dumps(fields), prefix, json.dumps(all_fields), prefix)
 
     # Felder des Ziel-Formulars, die je nach Art (Destination.FIELDS) ein- und ausgeblendet werden
     TARGET_FIELDS = ['drive', 'path', 'keep', 'host', 'share', 'username', 'password']

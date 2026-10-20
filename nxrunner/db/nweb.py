@@ -10,6 +10,10 @@ from nweb import DB
 
 
 class DbUi(r.BaseJobExecutor):
+    """
+      Oberflaeche fuer SQL-Abfragen auf einer nweb-Datenbank (DB).
+      op=sql sql="select ..."      liefert die Zeilen als rows
+    """
     def __init__(self, db: DB, type='db'):
         super().__init__(type)
         self.db: DB = db
