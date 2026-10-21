@@ -243,7 +243,8 @@ function regItem(e) {
     + (e.doc ? '<div class="doc">' + esc(e.doc) + '</div>' : '')
     + '<div class="reg-form"><label>Name (type)</label><input data-field="runner_type" value="' + esc(e.name) + '">' + params + '</div>'
     + '<div class="muted">Leere Felder = Standardwert. Werte wie 42, true, None, [1, 2] werden als Python-Werte übergeben.</div>'
-    + '<button data-act="load-params">Mit Parametern laden</button>'
+    + '<button data-act="load-params">Mit Parametern laden</button> '
+    + '<button data-act="install" title="Config-Datei schreiben, damit der Runner auch nach einem Neustart geladen wird">Installieren</button>'
     + (e.missing.length ? '<div class="reg-docker"' + (reg.docker.has(e.name) ? '' : ' hidden') + '>'
       + '<h3>In Docker laden</h3>'
       + '<div class="reg-form">'
@@ -348,8 +349,68 @@ qs('#content').addEventListener('click', ev => {
     block.hidden ? reg.docker.delete(name) : reg.docker.add(name);
   } else if (btn.dataset.act === 'docker') {
     regLoad(box, name, true, true);
+  } else if (btn.dataset.act === 'install') {
+    // eingegebene Werte auf die Seite zum Installieren mitnehmen
+    const q = new URLSearchParams({view: 'install', name: name, runner_type: box.querySelector('[data-field=runner_type]').value.trim()});
+    box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') q.set('arg_' + i.dataset.arg, i.value); });
+    location.href = '?' + q;
   }
 });
+
+// --- Installieren (?view=install&name=...): Config <Verzeichnis>/<type>.yml schreiben und Runner laden ---
+function renderInstall() {
+  const inst = DATA.install, e = inst.entry;
+  if (e.error_page) { showError(e.error_page); return; }
+  const v = inst.values || {};
+  const params = e.params.filter(p => p.name !== 'type').map(p =>
+    '<label for="inst_' + esc(p.name) + '">' + esc(p.name) + (p.required ? ' *' : '') + '</label>'
+    + '<input id="inst_' + esc(p.name) + '" data-arg="' + esc(p.name) + '" value="' + esc(v['arg_' + p.name] || '') + '" placeholder="'
+    + esc(p.required ? 'erforderlich' : 'Standard: ' + JSON.stringify(p.default)) + '">').join('');
+  setContent('<h2>Installieren: ' + esc(e.name) + '</h2>'
+    + '<div class="reg-item" id="inst_box">'
+    + '<div class="reg-head"><span class="name">' + esc(e.name) + '</span>'
+    + '<span class="cls" title="' + esc(e.value) + '">' + esc(e.cls) + '</span>'
+    + '<span class="pkg">' + esc(e.package) + (e.version ? ' ' + esc(e.version) : '') + '</span></div>'
+    + (e.summary ? '<div class="reg-summary">' + esc(e.summary) + '</div>' : '')
+    + (e.missing.length ? '<div class="reg-msg err">Fehlende Module: ' + esc(e.missing.join(', ')) + ' (der Runner lässt sich so nicht laden)</div>' : '')
+    + '<div class="reg-form">'
+    + '<label>Name (type)</label><input data-field="runner_type" value="' + esc(v.runner_type || e.name) + '">'
+    + '<label>Verzeichnis</label><input data-field="directory" value="' + esc(inst.config_d) + '">'
+    + params
+    + '<label>Überschreiben</label><input type="checkbox" data-field="overwrite" style="justify-self: start">'
+    + '</div>'
+    + '<div class="muted">Leere Felder = Standardwert. Werte wie 42, true, None, [1, 2] werden als Python-Werte übergeben.</div>'
+    + '<h3>Config</h3><div id="inst_warn"></div><div class="muted" id="inst_path"></div><pre id="inst_preview"></pre>'
+    + '<button data-act="do-install">Installieren</button> <a href="?view=registry">zurück zur Registry</a>'
+    + '<div class="reg-msg"></div></div>');
+  const box = qs('#inst_box');
+  const job = preview => {
+    const j = {op: 'registry_install', name: e.name, preview: preview ? 1 : 0};
+    box.querySelectorAll('[data-field]').forEach(i => { j[i.dataset.field] = i.type === 'checkbox' ? (i.checked ? 1 : 0) : i.value.trim(); });
+    box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') j['arg_' + i.dataset.arg] = i.value; });
+    return j;
+  };
+  let timer = null;
+  const preview = () => exec_job(job(true), r => {
+    qs('#inst_warn').innerHTML = r.warning || '';
+    if (r.success === false) { qs('#inst_path').textContent = ''; qs('#inst_preview').textContent = r.message; return; }
+    qs('#inst_path').textContent = r.path + (r.exists ? ' (existiert bereits)' : '') + (r.loaded ? ', Runner ' + r.runner_type + ' ist bereits geladen' : '');
+    qs('#inst_preview').textContent = r.content;
+  });
+  box.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(preview, 300); });
+  box.querySelector('[data-act=do-install]').addEventListener('click', () => {
+    regMessage(box, true, 'Installiert…');
+    exec_job(job(false), r => {
+      regMessage(box, r.success !== false, r.message || JSON.stringify(r), r.content);
+      if (r.success === false) return;
+      DATA.classes = DATA.classes.filter(c => c.name !== r.runner_type);
+      if (!DATA.instances.some(i => i.name === r.runner_type)) DATA.instances.push({name: r.runner_type, cls: r.cls});
+      renderStats(); renderList();
+      preview();
+    });
+  });
+  preview();
+}
 
 // serverseitig gerenderte Runner-Seite (?type=x&x=page)
 if (DATA.page) {
@@ -357,6 +418,8 @@ if (DATA.page) {
   if (DATA.page.error !== undefined) showError(DATA.page.error); else setRunnerContent(current, DATA.page.content);
 } else if (DATA.view === 'registry') {
   renderRegistry();
+} else if (DATA.view === 'install') {
+  renderInstall();
 }
 renderList();
 })();

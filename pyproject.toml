@@ -32,6 +32,7 @@ nfile = "nxrunner.system:NFile"
 backup = "nxrunner.system:Backup"
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
+nwebdir = "nxrunner.nweb:NWebDir"
 
 [nx]
 pydeps="-xx nxrunner"

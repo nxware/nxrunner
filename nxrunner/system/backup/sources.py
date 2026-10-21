@@ -129,6 +129,8 @@ class SshDirSource(Source):
     """
       Verzeichnis auf einem entfernten Rechner per SSH/SFTP (paramiko).
       Anmeldung: key_file, sonst password, sonst Schluessel aus ~/.ssh bzw. ssh-agent.
+      Host-Aliase aus ~/.ssh/config werden aufgeloest (HostName, Port, User, IdentityFile), Angaben in der
+      Quelle (port, username, key_file) haben Vorrang.
       Der Host-Schluessel muss bekannt sein (~/.ssh/known_hosts, z.B. einmal per ssh verbinden).
       Pre-/Post-Script laufen auf dem entfernten Rechner (z.B. Datenbank-Dump vorher, Aufraeumen danach).
     """
@@ -141,7 +143,8 @@ class SshDirSource(Source):
     def __init__(self, row: dict):
         super().__init__(row)
         self.host = (row.get('host') or '').strip()
-        self.port = int(row.get('port') or 22)
+        # leer = Port aus ~/.ssh/config bzw. 22
+        self.port = int(row['port']) if str(row.get('port') or '').strip() else None
         self.username = (row.get('username') or '').strip() or None
         self.password = row.get('password') or None
         self.key_file = (row.get('key_file') or '').strip() or None
@@ -159,11 +162,36 @@ class SshDirSource(Source):
     def describe(self):
         return f"{self.username + '@' if self.username else ''}{self.host}:{self.path}"
 
-    def check(self, timeout=3):
+    def ssh_config(self) -> dict:
+        """ Eintrag fuer self.host aus ~/.ssh/config (wie ssh), ohne Datei oder paramiko leer """
+        path = os.path.expanduser('~/.ssh/config')
+        if not os.path.isfile(path):
+            return {}
         try:
-            socket.create_connection((self.host, self.port), timeout=timeout).close()
+            import paramiko
+            return paramiko.SSHConfig.from_path(path).lookup(self.host)
+        except Exception:
+            return {}
+
+    def target(self) -> dict:
+        """ Verbindungsdaten: Angaben der Quelle, fehlende aus ~/.ssh/config {hostname, port, username, key_files} """
+        conf = self.ssh_config()
+        if self.key_file:
+            key_files = [os.path.expanduser(self.key_file)]
+        else:
+            key_files = [os.path.expanduser(f) for f in conf.get('identityfile', [])]
+        return {'hostname': conf.get('hostname') or self.host,
+                'port': self.port if self.port is not None else int(conf.get('port') or 22),
+                'username': self.username or conf.get('user'),
+                'key_files': key_files}
+
+    def check(self, timeout=3):
+        t = self.target()
+        try:
+            socket.create_connection((t['hostname'], t['port']), timeout=timeout).close()
         except OSError as e:
-            return False, f'SSH-Host nicht erreichbar: {self.host}:{self.port} ({e})'
+            alias = f' ({self.host})' if t['hostname'] != self.host else ''
+            return False, f"SSH-Host nicht erreichbar: {t['hostname']}:{t['port']}{alias} ({e})"
         return True, self.host
 
     def open(self):
@@ -172,13 +200,15 @@ class SshDirSource(Source):
         self.client.load_system_host_keys()
         # unbekannte Host-Schluessel ablehnen statt ungeprueft zu vertrauen
         self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        t = self.target()
         try:
-            self.client.connect(self.host, port=self.port, username=self.username, password=self.password,
-                                key_filename=os.path.expanduser(self.key_file) if self.key_file else None,
+            # ein key_file der Quelle wird allein verwendet, IdentityFile aus der Config wie bei ssh zusaetzlich zu Agent/~/.ssh
+            self.client.connect(t['hostname'], port=t['port'], username=t['username'], password=self.password,
+                                key_filename=t['key_files'] or None,
                                 look_for_keys=self.key_file is None, allow_agent=self.key_file is None, timeout=10)
         except paramiko.SSHException as e:
             if 'not found in known_hosts' in str(e):
-                raise RuntimeError(f'Host-Schluessel von {self.host} unbekannt, einmal per "ssh -p {self.port} '
+                raise RuntimeError(f'Host-Schluessel von {t["hostname"]} unbekannt, einmal per "ssh -p {t["port"]} '
                                    f'{self.host}" verbinden und bestaetigen ({e})')
             raise
         self.sftp = self.client.open_sftp()

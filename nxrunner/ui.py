@@ -1,5 +1,8 @@
 
+import html
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -8,6 +11,7 @@ from importlib import resources
 from nwebclient import runner as r
 from nwebclient import base
 from nwebclient import web
+from nwebclient import util as u
 
 from nxrunner import registry
 
@@ -21,6 +25,8 @@ class NxRunner(r.AutoDispatcher):
       Dispatcher von nxrunner mit der neuen Oberflaeche /pysys/ui (Runner-Seiten und Registry).
       op=registry [refresh]          installierte Runner (Entry-Points nweb_runner) mit Status
       op=registry_load name [runner_type] [arg_<param>=...]   Runner aus der Registry laden
+      op=registry_install name [runner_type] [directory] [overwrite] [preview] [arg_<param>=...]
+                                     Config <directory>/<runner_type>.yml schreiben und Runner laden
       op=registry_pip name           fehlende MODULES per pip installieren
       op=registry_docker name [runner_type] [packages] [mounts] [ports] [arg_<param>=...]
                                      Runner in einem Docker-Container laden (DockerProxy)
@@ -154,6 +160,72 @@ class NxRunner(r.AutoDispatcher):
             return res
         return self.success(f'{key} geladen', runner_type=key, cls=type(runner).__name__)
 
+    TYPE_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+    def install_plan(self, data):
+        """
+          Konfiguration fuer die Installation eines Registry-Runners: {name, runner_type, spec, path, content}
+          spec ist 'modul:Klasse' bzw. mit Parametern 'modul:Klasse(a=1, b='x')' (wie in runners einer Config)
+        """
+        name = str(data.get('name', '')).strip()
+        ep = registry.entry(name)
+        if ep is None:
+            raise ValueError('Runner nicht in der Registry: ' + name)
+        key = str(data.get('runner_type') or name).strip()
+        if not self.TYPE_RE.match(key):
+            raise ValueError('Name (type) darf nur Buchstaben, Ziffern, _ . - enthalten: ' + key)
+        ctor_args = {k[4:]: registry.parse_value(v) for k, v in data.items()
+                     if k.startswith('arg_') and str(v).strip() != ''}
+        spec = ep.value.strip()
+        if ctor_args:
+            if '(' in spec:
+                raise ValueError('Der Entry-Point enthaelt bereits Parameter: ' + spec)
+            spec += '(' + ', '.join(f'{k}={v!r}' for k, v in ctor_args.items()) + ')'
+        directory = str(data.get('directory') or u.Args.CONFIG_D).strip()
+        # JSON-Strings sind gueltiges YAML (Spec kann Anfuehrungszeichen, : und # enthalten)
+        content = f'# installiert ueber die Registry von nxrunner ({name})\nrunners:\n  {key}: {json.dumps(spec)}\n'
+        return {'name': name, 'runner_type': key, 'spec': spec, 'path': os.path.join(directory, key + '.yml'),
+                'content': content}
+
+    def execute_registry_install(self, data):
+        """
+          Runner installieren: Config <directory>/<runner_type>.yml (Standard: Args.CONFIG_D) schreiben und den Runner
+          sofort laden (ohne Neustart). preview=1: nur Pfad und Inhalt liefern, overwrite=1: bestehende Datei ersetzen.
+        """
+        try:
+            plan = self.install_plan(data)
+        except ValueError as e:
+            return self.fail(str(e))
+        exists = os.path.exists(plan['path'])
+        if str(data.get('preview', '')) in ('1', 'true'):
+            warning = web.alert_warn(f'{html.escape(plan["path"])} existiert bereits. Beim Installieren mit '
+                                     f'&bdquo;&Uuml;berschreiben&ldquo; wird die Datei vollst&auml;ndig ersetzt, '
+                                     f'weitere Eintr&auml;ge darin gehen verloren.') if exists else ''
+            return self.success('Vorschau', exists=exists, loaded=plan['runner_type'] in self.entries,
+                                warning=warning, **plan)
+        if plan['runner_type'] in self.entries:
+            return self.fail(f'Es gibt bereits einen Runner {plan["runner_type"]}, anderen Namen (type) waehlen', **plan)
+        if exists and str(data.get('overwrite', '')) not in ('1', 'true'):
+            return self.fail(f'{plan["path"]} existiert bereits (Ueberschreiben ankreuzen)', exists=True, **plan)
+        # zuerst erzeugen: schlaegt das fehl (z.B. Modul fehlt), wird keine Config geschrieben
+        try:
+            runner = self.create_class(plan['spec'])
+        except ModuleNotFoundError as e:
+            return self.fail(f'Modul fehlt: {e.name}, nichts installiert', **plan)
+        except Exception as e:
+            return self.fail(f'{type(e).__name__}: {e}, nichts installiert', **plan)
+        try:
+            os.makedirs(os.path.dirname(plan['path']) or '.', exist_ok=True)
+            with open(plan['path'], 'w', encoding='utf-8') as f:
+                f.write(plan['content'])
+        except OSError as e:
+            return self.fail(f'Config nicht geschrieben: {e}', **plan)
+        res = self.load_runner(plan['runner_type'], runner)
+        if not res.get('success'):
+            return self.fail(f'{plan["path"]} geschrieben, Laden fehlgeschlagen: {res.get("message")}', **plan)
+        return self.success(f'{plan["path"]} geschrieben und {plan["runner_type"]} geladen', cls=type(runner).__name__,
+                            **plan)
+
     def execute_registry_pip(self, data):
         """ fehlende MODULES eines Runners per pip installieren """
         entry = self.registry_entry(str(data.get('name', '')))
@@ -176,6 +248,14 @@ class NxRunner(r.AutoDispatcher):
         extra = {'view': view}
         if view == 'registry':
             extra['registry'] = self.registry_entries(refresh='refresh' in params)
+        elif view == 'install':
+            try:
+                entry = self.registry_entry(str(params.get('name', '')))
+            except ValueError as e:
+                entry = {'error_page': str(e)}
+            # Werte aus dem Formular der Registry (runner_type, arg_*) vorbelegen
+            extra['install'] = {'entry': entry, 'config_d': u.Args.CONFIG_D,
+                                'values': {k: v for k, v in params.items() if k == 'runner_type' or k.startswith('arg_')}}
         data = json.dumps({**self.ui_data(), 'page': page, **extra}, default=str).replace('</', '<\\/')
         js = r.js_functions().replace('</', '<\\/')
         return load_resource('ui.html').replace('__JS__', js).replace('__DATA__', data)
