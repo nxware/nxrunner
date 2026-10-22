@@ -24,6 +24,9 @@ class NWebDir(r.BaseJobExecutor):
     g: NWebGroup = None
 
     ID_RE = re.compile(r'^(.*)_id_(\d+)$')
+    # nur genau die Zaehler _00001_ und _00002_ (wie bei ComfyUI bild_00001_.png) sind beim Namensvergleich egal,
+    # andere Nummern bleiben verschieden (b_12345_ != b_12346_)
+    COUNTER_RE = re.compile(r'_0000[12]_')
 
     def __init__(self, path, group=None, instance=None):
         super().__init__('nwebdir')
@@ -88,9 +91,19 @@ class NWebDir(r.BaseJobExecutor):
         return (m.group(1), int(m.group(2))) if m else (stem, None)
 
     @classmethod
+    def normalize(cls, stem) -> str:
+        """ Zaehler _00001_/_00002_ entfernen: 'a_00001_' -> 'a', 'a_00002_b' -> 'a_b', 'a_12345_' bleibt """
+        # am Ende ganz weg, in der Mitte bleibt ein _ als Trenner
+        stem = re.sub(cls.COUNTER_RE.pattern + '$', '', stem)
+        return cls.COUNTER_RE.sub('_', stem)
+
+    @classmethod
     def name_key(cls, name) -> str:
-        """ Vergleichsschluessel ohne Dateiendung und _id_<id>: a.jpg, a.png, a_id_42.jpg und a sind gleich """
-        return cls.split_id(name)[0]
+        """
+          Vergleichsschluessel ohne Dateiendung, _id_<id> und Zaehler _00001_/_00002_:
+          a.jpg, a.png, a_id_42.jpg, a_00001_.png, a_00002_.jpg und a sind gleich, a_12345_ und a_12346_ nicht
+        """
+        return cls.normalize(cls.split_id(name)[0])
 
     def group_docs(self):
         """
@@ -111,7 +124,7 @@ class NWebDir(r.BaseJobExecutor):
         renamed, skipped = [], []
         for f in self.files():
             key, fid = self.split_id(f['name'])
-            doc = by_key.get(key)
+            doc = by_key.get(self.normalize(key))  # key selbst bleibt fuer den neuen Namen unveraendert
             if fid is not None or doc is None:
                 continue
             new = f"{key}_id_{doc.id()}{os.path.splitext(f['name'])[1]}"
@@ -173,7 +186,7 @@ class NWebDir(r.BaseJobExecutor):
                             doc = by_id.get(fid)
                             cells.append(w.a(f'ok ({fid})', doc.url()) if doc is not None else f'id {fid} nicht in Gruppe')
                         else:
-                            doc = by_key.get(key)
+                            doc = by_key.get(self.normalize(key))
                             cells.append(w.a('ja (' + str(doc.id()) + ')', doc.url()) if doc is not None else 'nein')
                     rows += w.tr(cells)
                 p(w.tag('table', head + rows))
