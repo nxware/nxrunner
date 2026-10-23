@@ -809,6 +809,92 @@ class Backup(r.BaseJobExecutor):
         p.pre('', id='result')
         p.script(self.js_progress() + ('backup_progress();' if self.is_running() else ''))
 
+    def link_due(self):
+        """ Seite der faelligen Sicherungen (part_due) """
+        return f'?type={self.type}&{self.type}=due'
+
+    def part_due(self, p: b.Page, params={}):
+        """ faellige Sicherungen (Quelle -> Ziel), am laengsten ueberfaellige zuerst, ohne automatische Aktualisierung """
+        p.h1("Backup: fällige Sicherungen")
+        p(w.button_js("Zurück zur Übersicht", f'location.href = {json.dumps(self.link_index())};'))
+        try:
+            nw = self.nweb()
+            sources = {s['source_id']: s for s in self.get_sources(nw)}
+            dest_names = {d['destination_id']: d['name'] for d in self.get_destinations(nw)}
+            links = self.get_links(nw)
+        except Exception as e:
+            p.div("Fehler: " + html.escape(str(e)))
+            return
+        now = int(time.time())
+        # je Quelle ein Eintrag mit ihren faelligen Zielen
+        due = {}
+        for link in links:
+            source = sources.get(link['source_id'])
+            if source is not None and self.is_due(source, link, now):
+                due.setdefault(source['source_id'], (source, []))[1].append(link)
+
+        def due_at(source, link):
+            """ Zeitpunkt der Faelligkeit, nie gesichert: None """
+            return None if link['last_run'] is None else int(link['last_run']) + int(source['interval_s'])
+
+        def first_due(entry):
+            source, due_links = entry
+            times = [due_at(source, link) for link in due_links]
+            return -1 if None in times else min(times)
+
+        # nie gesichert zuerst, dann am laengsten ueberfaellig
+        entries = sorted(due.values(), key=first_due)
+        if not entries:
+            p.div("Keine Sicherung fällig.")
+        else:
+            p('<table><tr><th>Quelle</th><th>Fällig</th><th>Häufigkeit</th><th>Fällige Ziele</th></tr>')
+            for source, due_links in entries:
+                first = first_due((source, due_links))
+                since = "noch nie gesichert" if first == -1 else                     f"<span title=\"{u.format_datetime(first)}\">{u.format_age(first, now)}</span>"
+                p(f"<tr><td>{w.a(html.escape(source['name']), self.link_source(source['source_id']))}</td>"
+                  f"<td>{since}</td><td>{html.escape(self.interval_title(source['interval_s']))}</td>"
+                  f"<td>{self.html_link_states(due_links, dest_names)}</td></tr>")
+            p('</table>')
+            p.div(f"{len(entries)} Quellen fällig. Gesichert wird automatisch, sobald Quelle und Ziel erreichbar sind.")
+            p(self.action_btn_parametric("Fällige jetzt sichern", dict(type=self.type, op='run_due')))
+        self.part_manual(p, sources, links, dest_names)
+        p.pre('', id='result')
+
+    def part_manual(self, p: b.Page, sources: dict, links, dest_names):
+        """ Quellen, die nur manuell gesichert werden, mit ihrer letzten Sicherung (zuletzt gesicherte zuerst) """
+        manual = [s for s in sources.values() if int(s['interval_s'] or 0) <= 0]
+        with p.section(h="Manuell"):
+            if not manual:
+                p.div("Keine Quellen, die nur manuell gesichert werden.")
+                return
+            entries = []
+            for source in manual:
+                source_links = [link for link in links if link['source_id'] == source['source_id']]
+                runs = [int(link['last_run']) for link in source_links if link['last_run'] is not None]
+                entries.append((max(runs) if runs else None, source, source_links))
+            entries.sort(key=lambda e: -(e[0] or 0))
+            p('<table><tr><th>Quelle</th><th>Letzte Sicherung</th><th>Ziele</th></tr>')
+            for last, source, source_links in entries:
+                last_text = "noch nie gesichert" if last is None else                     f"<span title=\"{u.format_datetime(last)}\">{u.format_age(last)}</span>"
+                p(f"<tr><td>{w.a(html.escape(source['name']), self.link_source(source['source_id']))}</td>"
+                  f"<td>{last_text}</td><td>{self.html_link_states(source_links, dest_names) if source_links else '–'}</td></tr>")
+            p('</table>')
+
+    @staticmethod
+    def html_link_states(links, dest_names):
+        """ je Ziel eine Zeile: Name, letzte Sicherung und ggf. letzter Status """
+        items = []
+        for link in links:
+            text = f"<b>{html.escape(dest_names.get(link['destination_id'], str(link['destination_id'])))}</b>: "
+            if link['last_run'] is None:
+                text += "noch nie gesichert"
+            else:
+                text += f"letzte Sicherung <span title=\"{u.format_datetime(link['last_run'])}\">{u.format_age(link['last_run'])}</span>"
+            if link['last_status']:
+                text += f", {html.escape(link['last_status'])}: {html.escape(link['last_message'] or '')}"
+            items.append(f'<div>{text}</div>')
+        return ''.join(items)
+
     def part_run_errors(self, p: b.Page, source_id):
         """ Fehlerdetails der letzten Laeufe einer Quelle seit dem Start des Servers (nur im Speicher) """
         runs = [s for (sid, _), s in self.run_details.items() if sid == source_id and s.get('errors')]
@@ -845,6 +931,7 @@ class Backup(r.BaseJobExecutor):
             p.div("Fehler: " + html.escape(str(e)))
             return
         dest_names = {d['destination_id']: d['name'] for d in destinations}
+        p.div(w.a("Fällige Sicherungen", self.link_due()))
         with p.section(h="Fortschritt"):
             p.div('', id='backup_progress')
         with p.section(h="Quellen"):

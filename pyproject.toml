@@ -2,15 +2,17 @@
 name = "nxrunner"
 description = ""
 version = "1.0.3"
-dependencies = ["nwebclient", "waitress"]
+dependencies = ["nwebclient", "waitress", "flask"]
 
 [project.optional-dependencies]
 full = ["pymongo", "buenavista", "pihole6api", "py-trello", "pydub", "smbprotocol", "paramiko", "docker",
-        "smbus2", "bleak", "pillow", "requests", "beautifulsoup4", "flask"]
+        "smbus2", "bleak", "pillow", "requests", "beautifulsoup4", "flask",
+        "google-api-python-client", "google-auth-oauthlib"]
 mongo = ["pymongo"]
 smb = ["smbprotocol"]
 ssh = ["paramiko"]
 docker = ["docker"]
+google = ["google-api-python-client", "google-auth-oauthlib"]
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"
@@ -35,6 +37,7 @@ backup = "nxrunner.system:Backup"
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
 nwebdir = "nxrunner.nweb:NWebDir"
+google_calendar = "nxrunner.apis.google:CalendarAPI"
 
 [nx]
 pydeps="-xx nxrunner"
