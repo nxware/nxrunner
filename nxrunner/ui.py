@@ -264,7 +264,7 @@ class NxRunner(r.AutoDispatcher):
         super().part_index(p, params)
         p.div(web.a("NxRunner UI", '/pysys/ui'))
 
-    def setupRestApp(self, app: "flask.Flask"):
+    def setupRestApp(self, app: "flask.Flask"):  # noqa: F821
         super().setupRestApp(app)
         try:
             app.add_url_rule('/pysys/ui', 'nxrunner_ui',
