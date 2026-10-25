@@ -803,7 +803,7 @@ class Backup(r.BaseJobExecutor):
                 p.div('', id='backup_progress')
             self.part_run_errors(p, sid)
             self.part_create_source(p, params)
-            self.part_runs(p, nw, {sid: source['name']}, dest_names, source_id=sid, title="Letzte Sicherungen")
+            self.part_runs(p, nw, {sid: source['name']}, dest_names, source_id=sid, title="Letzte Sicherungen", params=params)
         except Exception as e:
             p.div("Fehler: " + html.escape(str(e)))
         p.pre('', id='result')
@@ -847,38 +847,48 @@ class Backup(r.BaseJobExecutor):
         if not entries:
             p.div("Keine Sicherung fällig.")
         else:
-            p('<table><tr><th>Quelle</th><th>Fällig</th><th>Häufigkeit</th><th>Fällige Ziele</th></tr>')
-            for source, due_links in entries:
-                first = first_due((source, due_links))
-                since = "noch nie gesichert" if first == -1 else                     f"<span title=\"{u.format_datetime(first)}\">{u.format_age(first, now)}</span>"
-                p(f"<tr><td>{w.a(html.escape(source['name']), self.link_source(source['source_id']))}</td>"
-                  f"<td>{since}</td><td>{html.escape(self.interval_title(source['interval_s']))}</td>"
-                  f"<td>{self.html_link_states(due_links, dest_names)}</td></tr>")
-            p('</table>')
-            p.div(f"{len(entries)} Quellen fällig. Gesichert wird automatisch, sobald Quelle und Ziel erreichbar sind.")
+            rows = [{'name': source['name'], 'source_id': source['source_id'], 'interval_s': int(source['interval_s']),
+                     'due': first_due((source, due_links)), 'links': due_links} for source, due_links in entries]
+            p.grid(rows, [
+                self.col_source("Quelle"),
+                w.Grid.col('due', "Fällig", html=True, value=lambda e: self.html_age(None if e['due'] == -1 else e['due'], now)),
+                w.Grid.col('interval_s', "Häufigkeit", value=lambda e: self.interval_title(e['interval_s'])),
+                w.Grid.col('links', "Fällige Ziele", html=True, sortable=False,
+                           value=lambda e: self.html_link_states(e['links'], dest_names)),
+            ], params, count="{shown} Quellen fällig. Gesichert wird automatisch, sobald Quelle und Ziel erreichbar sind.")
             p(self.action_btn_parametric("Fällige jetzt sichern", dict(type=self.type, op='run_due')))
-        self.part_manual(p, sources, links, dest_names)
+        self.part_manual(p, sources, links, dest_names, params)
         p.pre('', id='result')
 
-    def part_manual(self, p: b.Page, sources: dict, links, dest_names):
+    def part_manual(self, p: b.Page, sources: dict, links, dest_names, params=None):
         """ Quellen, die nur manuell gesichert werden, mit ihrer letzten Sicherung (zuletzt gesicherte zuerst) """
         manual = [s for s in sources.values() if int(s['interval_s'] or 0) <= 0]
         with p.section(h="Manuell"):
-            if not manual:
-                p.div("Keine Quellen, die nur manuell gesichert werden.")
-                return
             entries = []
             for source in manual:
                 source_links = [link for link in links if link['source_id'] == source['source_id']]
                 runs = [int(link['last_run']) for link in source_links if link['last_run'] is not None]
-                entries.append((max(runs) if runs else None, source, source_links))
-            entries.sort(key=lambda e: -(e[0] or 0))
-            p('<table><tr><th>Quelle</th><th>Letzte Sicherung</th><th>Ziele</th></tr>')
-            for last, source, source_links in entries:
-                last_text = "noch nie gesichert" if last is None else                     f"<span title=\"{u.format_datetime(last)}\">{u.format_age(last)}</span>"
-                p(f"<tr><td>{w.a(html.escape(source['name']), self.link_source(source['source_id']))}</td>"
-                  f"<td>{last_text}</td><td>{self.html_link_states(source_links, dest_names) if source_links else '–'}</td></tr>")
-            p('</table>')
+                entries.append({'name': source['name'], 'source_id': source['source_id'],
+                                'last': max(runs) if runs else None, 'links': source_links})
+            entries.sort(key=lambda e: -(e['last'] or 0))
+            p.grid(entries, [
+                self.col_source("Quelle"),
+                w.Grid.col('last', "Letzte Sicherung", html=True, value=lambda e: self.html_age(e['last'])),
+                w.Grid.col('links', "Ziele", html=True, sortable=False,
+                           value=lambda e: self.html_link_states(e['links'], dest_names) if e['links'] else '–'),
+            ], params, empty="Keine Quellen, die nur manuell gesichert werden.", prefix='m_')
+
+    def col_source(self, title):
+        """ Spalte: Name der Quelle mit Link auf ihre Detailseite (Zeilen mit name und source_id) """
+        return w.Grid.col('name', title, html=True, sort=lambda row: row['name'].lower(),
+                          value=lambda row: w.a(html.escape(row['name']), self.link_source(row['source_id'])))
+
+    @staticmethod
+    def html_age(timestamp, now=None):
+        """ Alter mit Zeitpunkt im Tooltip, None: noch nie gesichert """
+        if timestamp is None:
+            return "noch nie gesichert"
+        return f"<span title=\"{u.format_datetime(timestamp)}\">{u.format_age(timestamp, now)}</span>"
 
     @staticmethod
     def html_link_states(links, dest_names):
@@ -935,38 +945,47 @@ class Backup(r.BaseJobExecutor):
         with p.section(h="Fortschritt"):
             p.div('', id='backup_progress')
         with p.section(h="Quellen"):
-            p('<table><tr><th>Name</th><th>Art</th><th>Pfad</th><th>Ausschluss</th><th>Häufigkeit</th>'
-              '<th>Größe</th><th>Ziele</th><th></th></tr>')
-            for s in sources:
-                p(f"<tr><td>{w.a(html.escape(s['name']), self.link_source(s['source_id']))}</td>"
-                  f"<td>{html.escape(SOURCES[s['kind']].TITLE if s['kind'] in SOURCES else s['kind'])}</td>"
-                  f"<td>{html.escape(self.source_description(s))}</td><td>{html.escape(s['exclude'] or '')}</td>"
-                  f"<td>{html.escape(self.interval_title(s['interval_s']))}</td>"
-                  f"<td>{self.html_source_size(s)}</td>"
-                  f"<td>{self.html_source_targets(s, [link for link in links if link['source_id'] == s['source_id']], dest_names, stats)}</td>"
-                  f"<td>{self.html_source_actions(s)}</td></tr>")
-            p('</table>')
+            p.grid(sources, [
+                self.col_source("Name"),
+                w.Grid.col('kind', "Art", value=lambda s: SOURCES[s['kind']].TITLE if s['kind'] in SOURCES else s['kind']),
+                w.Grid.col('path', "Pfad", value=self.source_description, sort=self.source_description),
+                w.Grid.col('exclude', "Ausschluss"),
+                w.Grid.col('interval_s', "Häufigkeit", value=lambda s: self.interval_title(s['interval_s']),
+                           sort=lambda s: int(s['interval_s'] or 0)),
+                w.Grid.col('size', "Größe", value=self.html_source_size),
+                w.Grid.col('targets', "Ziele", html=True, sortable=False, value=lambda s: self.html_source_targets(
+                    s, [link for link in links if link['source_id'] == s['source_id']], dest_names, stats)),
+                w.Grid.col('actions', '', value=self.html_source_actions, html=True, sortable=False),
+            ], params, empty="Noch keine Quellen.", prefix='s_')
         self.part_create_source(p, {})
         with p.section(h="Ziele"):
-            p('<table><tr><th>Name</th><th>Art</th><th>Ziel</th><th>Status</th><th>Belegt</th><th></th></tr>')
-            for d in destinations:
-                dest = create_destination(d, self)
-                available, message = dest.check(timeout=1)
-                state = 'erreichbar' if available else 'nicht erreichbar'
-                if available:
-                    # erreichbar: Belegung neu messen und speichern, sonst den zuletzt gespeicherten Stand zeigen
-                    usage = self.store_usage(nw, dest)
-                    if usage is not None:
-                        d = {**d, 'disk_total': usage[0], 'disk_used': usage[1], 'disk_checked': int(time.time())}
-                delete = self.confirm_btn("Löschen", f"Ziel {d['name']} löschen?", dict(type=self.type, op='destination_delete', destination_id=d['destination_id']))
-                p(f"<tr><td>{html.escape(d['name'])}</td><td>{html.escape(dest.TITLE)}</td>"
-                  f"<td>{html.escape(dest.describe())}</td><td title=\"{html.escape(message)}\">{state}</td>"
-                  f"<td>{self.html_disk_usage(d)}</td><td>{delete}</td></tr>")
-            p('</table>')
+            p.grid([self.destination_row(nw, d) for d in destinations], [
+                w.Grid.col('name', "Name"),
+                w.Grid.col('kind_title', "Art"),
+                w.Grid.col('describe', "Ziel"),
+                w.Grid.col('available', "Status", value=lambda d: 'erreichbar' if d['available'] else 'nicht erreichbar',
+                           td={'title': lambda d: d['message']}),
+                w.Grid.col('disk_used', "Belegt", value=self.html_disk_usage, html=True),
+                w.Grid.col('delete', '', html=True, sortable=False, value=lambda d: self.confirm_btn(
+                    "Löschen", f"Ziel {d['name']} löschen?", dict(type=self.type, op='destination_delete', destination_id=d['destination_id']))),
+            ], params, empty="Noch keine Ziele.", prefix='d_')
         self.part_create_target(p, params)
-        self.part_runs(p, nw, {s['source_id']: s['name'] for s in sources}, dest_names)
+        self.part_runs(p, nw, {s['source_id']: s['name'] for s in sources}, dest_names, params=params)
         p.pre('', id='result')
         p.script(self.js_progress() + ('backup_progress();' if self.is_running() else ''))
+
+    def destination_row(self, nw, d):
+        """
+          Ziel mit Art (kind_title), Beschreibung (describe) und Erreichbarkeit (available, message).
+          Erreichbar: Belegung neu messen und speichern, sonst den zuletzt gespeicherten Stand zeigen
+        """
+        dest = create_destination(d, self)
+        available, message = dest.check(timeout=1)
+        if available:
+            usage = self.store_usage(nw, dest)
+            if usage is not None:
+                d = {**d, 'disk_total': usage[0], 'disk_used': usage[1], 'disk_checked': int(time.time())}
+        return {**d, 'kind_title': dest.TITLE, 'describe': dest.describe(), 'available': available, 'message': message}
 
     def html_source_targets(self, source, links, dest_names, stats):
         """ Ziele einer Quelle mit Stand der Sicherung und letztem Lauf """
@@ -1021,22 +1040,29 @@ class Backup(r.BaseJobExecutor):
             + ' ' + w.button_js("Details", f'location.href = {json.dumps(self.link_source(sid))};') \
             + ' ' + self.confirm_btn("Löschen", f"Quelle {source['name']} löschen?", dict(type=self.type, op='source_delete', source_id=sid))
 
-    def part_runs(self, p: b.Page, nw, source_names, dest_names, limit=20, source_id=None, title="Letzte Läufe"):
+    def part_runs(self, p: b.Page, nw, source_names, dest_names, limit=20, source_id=None, title="Letzte Läufe", params=None):
         runs = self.get_runs(nw, source_id, limit=limit)
+
+        def duration(run):
+            return (run['finished'] or run['started']) - run['started']
+
+        def source_name(run):
+            return source_names.get(run['source_id'], str(run['source_id']))
+
+        def dest_name(run):
+            return dest_names.get(run['destination_id'], str(run['destination_id']))
         with p.section(h=title):
-            if len(runs) == 0:
-                p.div("Noch keine Sicherungen.")
-                return
-            p('<table><tr><th>Start</th><th>Dauer</th><th>Quelle</th><th>Ziel</th><th>Status</th><th>Dateien</th>'
-              '<th>Kopiert</th><th>Meldung</th></tr>')
-            for run in runs:
-                p(f"<tr><td title=\"{u.format_datetime(run['started'])}\">{u.format_age(run['started'])}</td>"
-                  f"<td>{(run['finished'] or run['started']) - run['started']} s</td>"
-                  f"<td>{html.escape(source_names.get(run['source_id'], str(run['source_id'])))}</td>"
-                  f"<td>{html.escape(dest_names.get(run['destination_id'], str(run['destination_id'])))}</td>"
-                  f"<td>{html.escape(run['status'] or '')}</td><td>{run['count']}</td>"
-                  f"<td>{run['copied']} ({u.format_size(run['bytes'] or 0)})</td><td>{html.escape(run['message'] or '')}</td></tr>")
-            p('</table>')
+            p.grid(runs, [
+                w.Grid.col('started', "Start", value=lambda run: u.format_age(run['started']),
+                           td={'title': lambda run: u.format_datetime(run['started'])}),
+                w.Grid.col('duration', "Dauer", value=lambda run: f"{duration(run)} s", sort=duration),
+                w.Grid.col('source_id', "Quelle", value=source_name, sort=source_name),
+                w.Grid.col('destination_id', "Ziel", value=dest_name, sort=dest_name),
+                w.Grid.col('status', "Status"),
+                w.Grid.col('count', "Dateien"),
+                w.Grid.col('copied', "Kopiert", value=lambda run: f"{run['copied']} ({u.format_size(run['bytes'] or 0)})"),
+                w.Grid.col('message', "Meldung"),
+            ], params, empty="Noch keine Sicherungen.", prefix='r_')
 
     def confirm_btn(self, title, question, job):
         return w.button_js(title, f'if (confirm({json.dumps(question)})) {{ exec_job({json.dumps(job)}); }}')

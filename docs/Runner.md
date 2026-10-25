@@ -25,6 +25,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `mongo` | `nxrunner.db.mongo:MongoDB` | MongoDB: einfügen, suchen, Dateien sammeln | `pymongo` |
 | `nwebdir` | `nxrunner.nweb:NWebDir` | Verzeichnis mit nweb-Gruppe abgleichen | |
 | `dashboard_cyd` | `nxrunner.devices:DashboardCYD` | Dashboard, das zusätzlich an ein CYD-Display sendet | `requests` |
+| `m5_multi` | `nxrunner.devices.esp_m5:EspM5` | M5StickS3 mit Firmware esp_m5_multi (Werte und Aktionen) | `requests` |
 | `nimbot_b1` | `nxrunner.devices.nimbot:NimbotB1` | Etikettendrucker Niimbot B1 per Bluetooth | `pillow`, `bleak` |
 | `joystick` | `nxrunner.hw.i2c:JoystickM5` | M5Stack Joystick 2 per I2C | `smbus2` |
 | `elrs_display` | `nxrunner.hw.elrs:ElrsDisplay` | Kanalwerte eines ExpressLRS-Empfängers, Bindings auf Jobs | |
@@ -231,6 +232,37 @@ IP automatisch übernommen.
 | `op=get_values` | aktuelle Werte aller Einträge |
 
 Variablen: `host`, `last_push`, `last_error`
+
+### EspM5
+
+`nxrunner.devices.esp_m5:EspM5(type='m5_multi', host=None, timeout=3)`, benötigt `requests`
+
+M5StickS3 mit der Firmware [esp_m5_multi](../../esp_m5_multi/README.md). Es ist immer genau ein Modul aktiv
+(Wage, IR Sniffer, Tail RS485, Joystick2, Button, AS5600). Die Seite zeigt die Werte des aktiven Moduls mit seinen
+Aktionen, die Modulwahl und die Systemwerte (Akku, WLAN, Laufzeit). Ohne `host` wird `<type>.local` verwendet,
+der Standard-Name der Firmware ist `m5_multi`.
+
+```
+m5_multi: nxrunner.devices.esp_m5:EspM5()
+m5_multi: nxrunner.devices.esp_m5:EspM5(host="192.168.1.42")
+```
+
+| Job | Beschreibung |
+|---|---|
+| `op=get_status` | `/api/status`: System und unter `data` die Werte des aktiven Moduls |
+| `op=get_rotation` | AS5600: `rpm`, `angle`, `revolutions`, `magnet`, ... |
+| `op=get_weight` | Wage: `weight` in g |
+| `op=get_joystick` | Joystick2: `x`, `y`, `button` |
+| `op=get_log` | IR Sniffer / Tail RS485: empfangene Zeilen |
+| `op=run_action a=... [text=...]` | Aktion des aktiven Moduls, z.B. `reset`, `tare`, `send` |
+| `op=set_module id=...` | Modul wechseln (`scale`, `ir`, `rs485`, `joy`, `btn`, `as5600`), das Gerät startet neu |
+| `op=restart_device` | Neustart |
+| `op=i2c_scan` | I2C-Scan am Port A |
+| `op=connect ip=...` | Adresse setzen |
+
+Die `get_*`-Jobs für ein Modul schlagen fehl, wenn gerade ein anderes Modul aktiv ist.
+
+Variablen: `host`
 
 ### NimbotB1
 

@@ -113,7 +113,8 @@ class NWebDir(r.BaseJobExecutor):
       op=name_ids                    an Dateien mit passendem Dokument in self.g _id_<id> anhaengen (a.jpg -> a_id_42.jpg)
       Ist eine Gruppe festgelegt, zeigt die Dateiliste, ob es dort ein Dokument mit dem Dateinamen gibt
       (ohne Endung, siehe name_key). Dateien mit _id_<id> werden ueber die id zugeordnet (ok).
-      Die Dateiliste zeigt die neuesten Dateien zuerst, PAGE_SIZE je Seite (Parameter pg), Bilder als Vorschau.
+      Die Dateiliste (p.grid) zeigt die neuesten Dateien zuerst, sortierbar, mit Suche im Namen, PAGE_SIZE je Seite
+      (Parameter pg), Bilder als Vorschau.
       Vorschaubilder ueber page=thumb (/pysys/runner?type=<type>&<type>=thumb&name=<datei>, mit Pillow verkleinert,
       sonst das Original). Klick auf ein Vorschaubild oeffnet es in einer Lightbox (Original ueber page=file,
       Pfeiltasten blaettern, Esc schliesst), der Dateiname ist ein file://-Link (unter der WSL auf den Windows-Pfad).
@@ -272,45 +273,45 @@ class NWebDir(r.BaseJobExecutor):
                 docs = None
                 if self.g is not None:
                     try:
-                        by_key, by_id = docs = self.group_docs()
+                        docs = self.group_docs()
                     except Exception as e:
                         p.alert_error("Dokumente der Gruppe nicht abrufbar: " + w.s(e))
-                pages = max(1, -(-len(files) // self.PAGE_SIZE))
-                try:
-                    pg = min(max(1, int(params.get('pg', 1))), pages)
-                except (TypeError, ValueError):
-                    pg = 1
-                nav = self.html_pagination(pg, pages)
-                p(nav)
-                titles = ['', 'Name', 'Größe', 'Alter'] + (['In Gruppe ' + w.s(self.g.title())] if docs is not None else [])
-                head = w.tr(''.join(w.tag('th', t) for t in titles))
-                rows = ''
-                for f in files[(pg - 1) * self.PAGE_SIZE:pg * self.PAGE_SIZE]:
-                    url = w.s(file_url(os.path.join(self.path, f['name'])))
-                    preview = ''
-                    if f['name'].lower().endswith(IMAGE_EXTENSIONS):
-                        thumb = w.s(self.thumb_url(f['name']))
-                        full = w.s(self.file_route(f['name']))
-                        preview = (f'<a href="{full}" class="nwd-lb" data-name="{w.s(f["name"])}" data-file="{url}">'
-                                   f'<img src="{thumb}" loading="lazy" alt="" '
-                                   f'style="max-width: {self.THUMB_SIZE}px; max-height: {self.THUMB_SIZE}px;"></a>')
-                    cells = [preview, f'<a href="{url}">{w.s(f["name"])}</a>', u.format_size(f['size']),
-                             u.format_age(f['mtime'])]
-                    if docs is not None:
-                        key, fid = self.split_id(f['name'])
-                        if fid is not None:
-                            # per Name IDs zugeordnet
-                            doc = by_id.get(fid)
-                            cells.append(w.a(f'ok ({fid})', doc.url()) if doc is not None else f'id {fid} nicht in Gruppe')
-                        else:
-                            doc = by_key.get(self.normalize(key))
-                            cells.append(w.a('ja (' + str(doc.id()) + ')', doc.url()) if doc is not None else 'nein')
-                    rows += w.tr(cells)
-                p(w.tag('table', head + rows))
-                p(nav)
-                p.div(f"{len(files)} Dateien")
+                cols = [w.Grid.col('preview', '', value=self.html_preview, html=True, sortable=False),
+                        w.Grid.col('name', "Name", value=self.html_file_link, html=True),
+                        w.Grid.col('size', "Größe", value=lambda f: u.format_size(f['size'])),
+                        w.Grid.col('mtime', "Alter", value=lambda f: u.format_age(f['mtime']))]
+                if docs is not None:
+                    cols.append(w.Grid.col('group', 'In Gruppe ' + w.s(self.g.title()), html=True, sortable=False,
+                                           value=lambda f: self.html_group_state(f, docs)))
+                p.grid(files, cols, params, page_size=self.PAGE_SIZE, search=lambda f: f['name'],
+                       count="{shown} / {total} Dateien")
                 p(w.tag('style', LIGHTBOX_CSS))
                 p.script(LIGHTBOX_JS)
+
+    def html_file_link(self, f) -> str:
+        """ Dateiname als file://-Link """
+        return w.a(w.s(f['name']), w.s(file_url(os.path.join(self.path, f['name']))))
+
+    def html_preview(self, f) -> str:
+        """ Vorschaubild mit Link fuer die Lightbox, '' fuer andere Dateien """
+        if not f['name'].lower().endswith(IMAGE_EXTENSIONS):
+            return ''
+        url = w.s(file_url(os.path.join(self.path, f['name'])))
+        thumb = w.s(self.thumb_url(f['name']))
+        full = w.s(self.file_route(f['name']))
+        return (f'<a href="{full}" class="nwd-lb" data-name="{w.s(f["name"])}" data-file="{url}">'
+                f'<img src="{thumb}" loading="lazy" alt="" '
+                f'style="max-width: {self.THUMB_SIZE}px; max-height: {self.THUMB_SIZE}px;"></a>')
+
+    def html_group_state(self, f, docs) -> str:
+        """ Dokument der Gruppe zur Datei: per Name IDs zugeordnet (ok), per Name gefunden (ja) oder nein """
+        by_key, by_id = docs
+        key, fid = self.split_id(f['name'])
+        if fid is not None:
+            doc = by_id.get(fid)
+            return w.a(f'ok ({fid})', doc.url()) if doc is not None else f'id {fid} nicht in Gruppe'
+        doc = by_key.get(self.normalize(key))
+        return w.a('ja (' + str(doc.id()) + ')', doc.url()) if doc is not None else 'nein'
 
     def thumb_url(self, name) -> str:
         return '/pysys/runner?' + urllib.parse.urlencode({'type': self.type, self.type: 'thumb', 'name': name})
@@ -363,12 +364,3 @@ class NWebDir(r.BaseJobExecutor):
             # ohne Pillow bzw. nicht lesbar: Original ausliefern, der Browser verkleinert per CSS
             return flask.send_from_directory(os.path.abspath(self.path), name, max_age=3600)
         return flask.Response(data, mimetype='image/jpeg', headers={'Cache-Control': 'max-age=3600'})
-
-    def html_pagination(self, pg, pages) -> str:
-        """ Links ?type=..&<type>=index&pg=n (funktionieren in /pysys/runner und /pysys/ui) """
-        def link(title, n):
-            q = urllib.parse.urlencode({'type': self.type, self.type: 'index', 'pg': n})
-            return w.a(title, '?' + q)
-        parts = [link('« Zurück', pg - 1) if pg > 1 else '« Zurück', f'Seite {pg} von {pages}',
-                 link('Weiter »', pg + 1) if pg < pages else 'Weiter »']
-        return w.tag('div', ' | '.join(parts), style='margin: 6px 0;')

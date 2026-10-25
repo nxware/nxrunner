@@ -36,6 +36,7 @@ nfile = "nxrunner.system:NFile"
 backup = "nxrunner.system:Backup"
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
+m5_multi = "nxrunner.devices.esp_m5:EspM5"
 nwebdir = "nxrunner.nweb:NWebDir"
 google_calendar = "nxrunner.apis.google:CalendarAPI"
 
