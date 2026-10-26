@@ -2,6 +2,7 @@ from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import util as u
 from nwebclient import dev as d
+from nwebclient import web as w
 
 
 class JoystickM5(r.BaseJobExecutor):
@@ -184,8 +185,8 @@ class JoystickM5(r.BaseJobExecutor):
         ])
 
         p.ul([
-            p.a("Aktualisieren", self.link(self.part_index)),
-            p.a("Bind", self.link(self.part_bind))
+            w.a("Aktualisieren", self.link(self.part_index)),
+            w.a("Bind", self.link(self.part_bind))
         ])
 
     def tick(self):
@@ -361,8 +362,8 @@ class AS5600(r.BaseJobExecutor):
         p(self.action_btn(dict(title="Nullpunkt setzen", type=self.type, op='setzero')))
 
         p.ul([
-            p.a("Aktualisieren", self.link(self.part_index)),
-            p.a("Bind", self.link(self.part_bind))
+            w.a("Aktualisieren", self.link(self.part_index)),
+            w.a("Bind", self.link(self.part_bind))
         ])
 
     def tick(self):
