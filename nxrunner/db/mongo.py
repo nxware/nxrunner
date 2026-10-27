@@ -3,6 +3,7 @@ import json
 import glob
 import os
 import base64
+import time
 
 from nwebclient import runner as r
 from nwebclient import base as b
@@ -18,6 +19,15 @@ class MongoDB(r.BaseJobExecutor):
      Jobs in nweb.jobs, Ergebnisse in nweb.results.
      Verschluesselte Jobs (mit CryptRunner crypt) liegen ebenfalls in nweb.jobs als {type: crypt, c: base64},
      ihre Ergebnisse verschluesselt in nweb.results als {c: base64, job_id}.
+
+     Klartext-Felder am Job (auch bei verschluesselten Jobs):
+       guid    wird ins Ergebnis uebernommen, Abfrage mit op=cresult guid=...
+       target  Name der Instanz (nwebclient.nx.get_name()), die den Job ausfuehren soll; andere ignorieren ihn
+       ts      Zeitpunkt des Einstellens, Jobs werden in dieser Reihenfolge ausgefuehrt
+
+     Job-Speicher-Vertrag (z.B. fuer RemoteTerminal, andere Speicher bieten dieselben Ops an):
+       op=cenqueue jobdef={...} [guid] [target]   -> result (id)
+       op=cresult guid [delete=1]                 -> pending=True | pending=False, result={...}
     """
     MODULES = ['pymongo']
 
@@ -35,7 +45,8 @@ class MongoDB(r.BaseJobExecutor):
         self.define_sig(d.PStr('op', 'stop_ticker'))
         self.define_sig(d.PStr('op', 'done_writer'), d.PStr('emitter', ''))
         self.define_sig(d.PStr('op', 'enqueue'), d.PStr('jobdef'))
-        self.define_sig(d.PStr('op', 'cenqueue'), d.PStr('jobdef'))
+        self.define_sig(d.PStr('op', 'cenqueue'), d.PStr('jobdef'), d.PStr('guid', ''), d.PStr('target', ''))
+        self.define_sig(d.PStr('op', 'cresult'), d.PStr('guid'), d.PInt('delete', 1))
         self.define_sig(d.PStr('op', 'delete_doc'), d.PStr('db'), d.PStr('collection'), d.PStr('id'))
         if args is None:
             args = u.Args()
@@ -43,9 +54,12 @@ class MongoDB(r.BaseJobExecutor):
             connection_url = args.get('mongo_url', "mongodb://localhost:27017/")
         import pymongo
         from bson import json_util
+        from nwebclient import nx
         self.json_util = json_util
         self.client = pymongo.MongoClient(connection_url)
         self.args = args
+        self.instance_name = nx.get_name()
+        self.result_index = False  # Index auf nweb.results.guid angelegt
         self.ticker_interval = int(args.get('mongo_job_cron', self.ticker_interval))
         if 'mongo_job_cron' in args:
             self.ticker = self.periodic(self.ticker_interval, self.tick)
@@ -90,6 +104,8 @@ class MongoDB(r.BaseJobExecutor):
     def find(self, db, collection_name, q={}, **kwargs):
         mdb = self.client[db]
         res = mdb.get_collection(collection_name).find(q)
+        if 'sort' in kwargs:
+            res = res.sort(kwargs['sort'], 1)
         if 'limit' in kwargs:
             res = res.limit(kwargs['limit'])
         return res
@@ -163,7 +179,7 @@ class MongoDB(r.BaseJobExecutor):
 
     def execute_jobs(self, data=dict()):
         count = 0
-        for job in self.find('nweb', 'jobs'):
+        for job in self.find('nweb', 'jobs', sort='ts'):
             if self.process_job(job):
                 count += 1
         return self.success(count=count, ui_reload=True)
@@ -200,9 +216,13 @@ class MongoDB(r.BaseJobExecutor):
         """
           Verschluesselte Jobs {type: crypt, c: ...} fuehrt der CryptRunner aus, ihr Ergebnis wird verschluesselt
           gespeichert. Ohne CryptRunner bleiben sie in nweb.jobs liegen.
+          Jobs mit target einer anderen Instanz bleiben ebenfalls liegen.
         """
+        target = job.get('target')
+        if target and target != self.instance_name:
+            return False
         executor: r.BaseJobExecutor = self.getRoot().jobexecutor
-        job_data = {k: v for k, v in job.items() if k != '_id'}
+        job_data = {k: v for k, v in job.items() if k not in ('_id', 'target', 'ts')}
         crypted = job_data.get('type') == 'crypt'
         if executor.canExecute(job_data):
             result = executor.execute(job_data)
@@ -214,6 +234,9 @@ class MongoDB(r.BaseJobExecutor):
             if crypted:
                 result = dict(c=self.encrypt(json.dumps(result, default=self.json_util.default)))
             result['job_id'] = job['_id']
+            if 'guid' in job:
+                # im Klartext, damit der Auftraggeber sein Ergebnis ohne Entschluesseln findet
+                result['guid'] = job['guid']
             self.insert_one('nweb', 'results', result)
             return True
         return False
@@ -372,6 +395,7 @@ class MongoDB(r.BaseJobExecutor):
         job, error = self.parse_jobdef(data)
         if error is not None:
             return self.fail(error)
+        job = {**job, 'ts': time.time()}
         return self.success(result=str(self.insert_one('nweb', 'jobs', job).inserted_id))
 
     def execute_cenqueue(self, data: dict):
@@ -381,8 +405,37 @@ class MongoDB(r.BaseJobExecutor):
         job, error = self.parse_jobdef(data)
         if error is not None:
             return self.fail(error)
-        cjob = dict(type='crypt', c=self.encrypt(json.dumps(job)))
+        cjob = dict(type='crypt', c=self.encrypt(json.dumps(job)), ts=time.time())
+        for key in ('guid', 'target'):
+            if data.get(key):
+                cjob[key] = str(data[key])
         return self.success(result=str(self.insert_one('nweb', 'jobs', cjob).inserted_id))
+
+    def execute_cresult(self, data: dict):
+        """
+          Ergebnis eines Jobs anhand seiner guid (entschluesselt, falls verschluesselt).
+          Ergebnisse anderer Jobs bleiben unberuehrt, delete=1 entfernt nur dieses Ergebnis.
+        """
+        guid = str(data.get('guid', '')).strip()
+        if guid == '':
+            return self.fail('guid fehlt')
+        col = self.client['nweb']['results']
+        if not self.result_index:
+            col.create_index('guid')
+            self.result_index = True
+        doc = col.find_one({'guid': guid})
+        if doc is None:
+            return self.success('pending', pending=True)
+        if 'c' in doc:
+            try:
+                result = json.loads(self.decrypt(doc['c']), object_hook=self.json_util.object_hook)
+            except Exception as e:
+                return self.fail(f'Ergebnis {guid} nicht entschluesselbar: {e}')
+        else:
+            result = {k: v for k, v in doc.items() if k not in ('_id', 'job_id', 'guid')}
+        if str(data.get('delete', '1')) not in ('0', 'false', 'False'):
+            col.delete_one({'_id': doc['_id']})
+        return self.success('ok', pending=False, result=self.bson_safe(result))
 
     def execute_delete_doc(self, data: dict):
         from bson import ObjectId

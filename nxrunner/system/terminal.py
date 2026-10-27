@@ -16,8 +16,8 @@ Terminal ist ein Eingabefeld fuer Textbefehle.
         {"type": "terminal", "op": "screen"}                           Bildschirminhalt
         {"type": "terminal", "op": "screen", "version": 12}            nur bei Aenderung, sonst unchanged=True
         {"type": "terminal", "op": "restart"}
-        {"type": "terminal", "op": "get_terminal"}                     Bildschirm als Text
-        {"type": "terminal", "op": "exec", "cmd": "ls", "wait_time": 1}   Befehl senden, warten, Bildschirm als Text
+        {"type": "terminal", "op": "get_terminal", "wait_time": 0}     Bildschirm als Text (value) mit cursor
+        {"type": "terminal", "op": "exec", "cmd": "ls", "wait_time": 1}   Befehl senden, warten, Bildschirm als Text mit cursor
 """
 import codecs
 import json
@@ -247,18 +247,27 @@ class Terminal(r.BaseJobExecutor):
             return self.fail('Shell konnte nicht gestartet werden: ' + self.error)
         return self.success('Shell gestartet: ' + self.shell + ' (' + self.mode + ')')
 
-    def screen_text(self):
-        return '\n'.join(line.rstrip() for line in self.screen_dict()['lines']).rstrip('\n')
+    def screen_text(self, screen=None):
+        screen = screen or self.screen_dict()
+        return '\n'.join(line.rstrip() for line in screen['lines']).rstrip('\n')
 
-    @op("Bildschirminhalt des Terminals als Text", result={'success': 'bool', 'message': 'str', 'value': 'str'})
-    def get_terminal(self):
+    def screen_result(self):
+        """ Bildschirm als Text mit Cursor (Ergebnis von exec und get_terminal) """
+        screen = self.screen_dict()
+        return self.success('ok', value=self.screen_text(screen), cursor=screen['cursor'], running=self.running)
+
+    @op("Bildschirminhalt des Terminals als Text, optional nach wait_time Sekunden",
+        result={'success': 'bool', 'message': 'str', 'value': 'str', 'cursor': 'dict'})
+    def get_terminal(self, wait_time: float = 0):
         if not self.running and self.screen is None:
             self.start()
-        return self.success('ok', value=self.screen_text(), running=self.running)
+        if float(wait_time) > 0:
+            time.sleep(float(wait_time))
+        return self.screen_result()
 
     # exec ist eine eingebaute Funktion, daher abweichender Methodenname
     @op("Schreibt einen Befehl ins Terminal, wartet wait_time Sekunden und liefert den Bildschirm",
-        result={'success': 'bool', 'message': 'str', 'value': 'str'}, name='exec')
+        result={'success': 'bool', 'message': 'str', 'value': 'str', 'cursor': 'dict'}, name='exec')
     def exec_command(self, cmd: str = None, wait_time: float = 1):
         # cmd=None: kein Button auf der buttons-Seite (is_direct_callable), da ein Befehl erwartet wird
         if cmd is None:
@@ -268,25 +277,34 @@ class Terminal(r.BaseJobExecutor):
         except (OSError, RuntimeError) as e:
             return self.fail(str(e))
         time.sleep(float(wait_time))
-        return self.success('ok', value=self.screen_text(), running=self.running)
+        return self.screen_result()
 
     # --- Seite ----------------------------------------------------------------------------------
 
     def part_index(self, p: b.Page, params={}):
         if not self.running and self.screen is None:
             self.start()
-        with p.section(h='Terminal'):
-            if self.error:
-                p.alert_error('Shell konnte nicht gestartet werden: ' + self.error)
-            p.div('', id='term_status')
-            p('<pre id="term_screen" style="background: #111; color: #ddd; padding: 6px; margin: 0; line-height: 1.2; '
-              'font-family: monospace; overflow-x: auto; white-space: pre"></pre>')
-            p('<div style="display: flex; gap: 4px; margin-top: 4px">'
-              '<input id="term_input" style="flex: 1; font-family: monospace" autocomplete="off" '
-              'placeholder="Befehl, Enter sendet; Pfeil hoch/runter: Verlauf">'
-              '<button type="button" id="term_send">Senden</button></div>')
-            keys = ''.join(f'<button type="button" class="term_key" data-key="{k}">{t}</button> '
-                           for k, t in [('ctrl_c', 'Strg+C'), ('ctrl_d', 'Strg+D'), ('tab', 'Tab'), ('esc', 'Esc'),
-                                        ('up', '&uarr;'), ('down', '&darr;'), ('enter', 'Enter')])
-            p.div(keys + '<button type="button" id="term_restart">Neu starten</button>', style='margin-top: 4px')
-        p.script(resource('terminal.js').replace('__TYPE__', json.dumps(self.type)))
+        error = 'Shell konnte nicht gestartet werden: ' + self.error if self.error else ''
+        terminal_page(p, self.type, error)
+
+
+def terminal_page(p: b.Page, runner_type: str, error='', title='Terminal', buttons=''):
+    """
+      Terminal-Oberflaeche (Bildschirm, Eingabe, Tasten) fuer einen Runner mit den Ops screen, input, key, restart
+      :param buttons: weitere Buttons hinter "Neu starten" (z.B. term_refresh)
+    """
+    with p.section(h=title):
+        if error:
+            p.alert_error(error)
+        p.div('', id='term_status')
+        p('<pre id="term_screen" style="background: #111; color: #ddd; padding: 6px; margin: 0; line-height: 1.2; '
+          'font-family: monospace; overflow-x: auto; white-space: pre"></pre>')
+        p('<div style="display: flex; gap: 4px; margin-top: 4px">'
+          '<input id="term_input" style="flex: 1; font-family: monospace" autocomplete="off" '
+          'placeholder="Befehl, Enter sendet; Pfeil hoch/runter: Verlauf">'
+          '<button type="button" id="term_send">Senden</button></div>')
+        keys = ''.join(f'<button type="button" class="term_key" data-key="{k}">{t}</button> '
+                       for k, t in [('ctrl_c', 'Strg+C'), ('ctrl_d', 'Strg+D'), ('tab', 'Tab'), ('esc', 'Esc'),
+                                    ('up', '&uarr;'), ('down', '&darr;'), ('enter', 'Enter')])
+        p.div(keys + '<button type="button" id="term_restart">Neu starten</button> ' + buttons, style='margin-top: 4px')
+    p.script(resource('terminal.js').replace('__TYPE__', json.dumps(runner_type)))

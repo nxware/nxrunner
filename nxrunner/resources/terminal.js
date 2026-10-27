@@ -100,6 +100,7 @@
         btn.onclick = function () { send({op: 'key', key: btn.dataset.key}); $('term_input').focus(); };
     });
     $('term_restart').onclick = function () { send({op: 'restart'}); };
+    if ($('term_refresh')) $('term_refresh').onclick = function () { send({op: 'refresh'}); };
     $('term_input').focus();
     poll();
 })();

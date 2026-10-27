@@ -69,6 +69,7 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 .reg-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .reg-head .name { font-weight: 600; font-size: 15px; }
 .reg-head .cls, .reg-head .pkg { font-size: 12px; color: var(--muted); }
+.reg-head .cls { font-family: monospace; word-break: break-all; }
 .reg-head .actions { margin-left: auto; display: flex; gap: 6px; }
 .reg-head .actions button { padding: 4px 10px; }
 .reg-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
@@ -232,7 +233,7 @@ function regItem(e) {
   const open = reg.open.has(e.name);
   return '<div class="reg-item" data-name="' + esc(e.name) + '">'
     + '<div class="reg-head"><span class="name">' + esc(e.name) + '</span>'
-    + '<span class="cls" title="' + esc(e.value) + '">' + esc(e.cls) + '</span>'
+    + '<span class="cls">' + esc(e.value) + '</span>'
     + '<span class="pkg">' + esc(e.package) + (e.version ? ' ' + esc(e.version) : '') + '</span>'
     + '<span class="actions">'
     + (e.missing.length ? '<button data-act="pip" title="pip install ' + esc(e.missing.join(' ')) + '">pip install</button>'
@@ -370,7 +371,7 @@ function renderInstall() {
   setContent('<h2>Installieren: ' + esc(e.name) + '</h2>'
     + '<div class="reg-item" id="inst_box">'
     + '<div class="reg-head"><span class="name">' + esc(e.name) + '</span>'
-    + '<span class="cls" title="' + esc(e.value) + '">' + esc(e.cls) + '</span>'
+    + '<span class="cls">' + esc(e.value) + '</span>'
     + '<span class="pkg">' + esc(e.package) + (e.version ? ' ' + esc(e.version) : '') + '</span></div>'
     + (e.summary ? '<div class="reg-summary">' + esc(e.summary) + '</div>' : '')
     + (e.missing.length ? '<div class="reg-msg err">Fehlende Module: ' + esc(e.missing.join(', ')) + ' (der Runner lässt sich so nicht laden)</div>' : '')

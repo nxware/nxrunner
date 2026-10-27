@@ -143,9 +143,18 @@ class CryptRunner(r.BaseJobExecutor, CryptMixin):
         return self.success(result=result)
 
     def part_index(self, p: b.Page, params={}):
-        p("Führt verschlüsselte Jobs aus.")
-        p("Struktur {c:base64_encoded_crypt_json}")
-        # TODO Form vor createtio
-        with p.section(h="Decrypt"):
-            p.form_input('c', "Base64 encodes", id='c')
-            p(self.action_btn_parametric("Decrypt", dict(type=self.type, op='decrypt', c='#c')))
+        p.div("Ver- und entschlüsselt Texte mit Fernet und führt verschlüsselte Jobs aus. "
+              f"Schlüsseldatei: <code>{self.key_file}</code>")
+        with p.section(h="Verschlüsseln (Klartext → Chiffretext)"):
+            p.form_input('value', "Klartext", id='crypt_value')
+            p(self.action_btn_parametric("Verschlüsseln", dict(type=self.type, op='encrypt', value='#crypt_value')))
+            p.div("Ergebnis: Base64-kodierter Chiffretext")
+        with p.section(h="Entschlüsseln (Chiffretext → Klartext)"):
+            p.form_input('c', "Chiffretext (Base64)", id='crypt_c')
+            p(self.action_btn_parametric("Entschlüsseln", dict(type=self.type, op='decrypt', c='#crypt_c')))
+            p.div("Ergebnis: Klartext (UTF-8)")
+        with p.section(h="Verschlüsselten Job ausführen"):
+            p.div(f"Job-Aufbau: <code>{{type: {self.type}, c: &lt;Base64-Chiffretext eines Job-JSON&gt;}}</code>, "
+                  "der entschlüsselte Job läuft auf dem Root-Dispatcher.")
+            p.form_input('c', "Verschlüsselter Job (Base64)", id='crypt_job')
+            p(self.action_btn_parametric("Entschlüsseln und ausführen", dict(type=self.type, c='#crypt_job')))
