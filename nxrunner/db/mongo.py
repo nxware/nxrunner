@@ -14,6 +14,10 @@ from nwebclient import dev as d
 class MongoDB(r.BaseJobExecutor):
     """
      cfg mongo_url
+
+     Jobs in nweb.jobs, Ergebnisse in nweb.results.
+     Verschluesselte Jobs (mit CryptRunner crypt) liegen ebenfalls in nweb.jobs als {type: crypt, c: base64},
+     ihre Ergebnisse verschluesselt in nweb.results als {c: base64, job_id}.
     """
     MODULES = ['pymongo']
 
@@ -31,6 +35,7 @@ class MongoDB(r.BaseJobExecutor):
         self.define_sig(d.PStr('op', 'stop_ticker'))
         self.define_sig(d.PStr('op', 'done_writer'), d.PStr('emitter', ''))
         self.define_sig(d.PStr('op', 'enqueue'), d.PStr('jobdef'))
+        self.define_sig(d.PStr('op', 'cenqueue'), d.PStr('jobdef'))
         self.define_sig(d.PStr('op', 'delete_doc'), d.PStr('db'), d.PStr('collection'), d.PStr('id'))
         if args is None:
             args = u.Args()
@@ -61,6 +66,21 @@ class MongoDB(r.BaseJobExecutor):
         self.tick_count += 1
         self.execute_jobs()
 
+    def has_crypt(self) -> bool:
+        return 'crypt' in self.getRoot().jobexecutor
+
+    def encrypt(self, value: str) -> str:
+        res = self.getRoot().jobexecutor.execute(dict(type='crypt', op='encrypt', value=value))
+        if not res.get('success', False):
+            raise Exception(res.get('message', 'encrypt failed'))
+        return res['value']
+
+    def decrypt(self, c: str) -> str:
+        res = self.getRoot().jobexecutor.execute(dict(type='crypt', op='decrypt', c=c))
+        if not res.get('success', False):
+            raise Exception(res.get('message', 'decrypt failed'))
+        return res['value']
+
     def list_database_names(self):
         return self.client.list_database_names()
 
@@ -88,6 +108,7 @@ class MongoDB(r.BaseJobExecutor):
             p.ul(map(lambda x: w.a(str(x), self.link(self.part_db, db=str(x))), self.list_database_names()))
         with p.section(h="nweb"):
             p(w.a("Jobs", self.link(self.part_npy)))
+            p(w.a("Crypted Jobs", self.link(self.part_npy_crypt)))
             p.prop("Ticker Active", self.ticker is not None)
             p(self.action_btn(dict(type=self.type, op='jobs', title="Fetch Jobs & Execute")))
 
@@ -176,14 +197,22 @@ class MongoDB(r.BaseJobExecutor):
         return True
 
     def process_job(self, job: dict):
+        """
+          Verschluesselte Jobs {type: crypt, c: ...} fuehrt der CryptRunner aus, ihr Ergebnis wird verschluesselt
+          gespeichert. Ohne CryptRunner bleiben sie in nweb.jobs liegen.
+        """
         executor: r.BaseJobExecutor = self.getRoot().jobexecutor
-        if executor.canExecute(job):
-            result = executor.execute(job)
+        job_data = {k: v for k, v in job.items() if k != '_id'}
+        crypted = job_data.get('type') == 'crypt'
+        if executor.canExecute(job_data):
+            result = executor.execute(job_data)
             self.delete_one('nweb', 'jobs', dict(_id=job['_id']))
             if not isinstance(result, dict):
                 result = dict(result=result)
             result = self.bson_safe(result)
             result.pop('_id', None)
+            if crypted:
+                result = dict(c=self.encrypt(json.dumps(result, default=self.json_util.default)))
             result['job_id'] = job['_id']
             self.insert_one('nweb', 'results', result)
             return True
@@ -244,8 +273,12 @@ class MongoDB(r.BaseJobExecutor):
                     keys.append(k)
         return [w.Grid.col(k, sortable=True) for k in keys]
 
-    def show_collection_grid(self, p: b.Page, db: str, collection: str, limit=100):
-        rows = self.grid_rows(self.find(db, collection, {}, limit=limit))
+    def show_collection_grid(self, p: b.Page, db: str, collection: str, limit=100, map_row=None, q={}):
+        """ :param map_row: fn(doc) -> doc, z.B. zum Entschluesseln """
+        docs = self.find(db, collection, q, limit=limit)
+        if map_row is not None:
+            docs = map(map_row, docs)
+        rows = self.grid_rows(docs)
         if len(rows) == 0:
             p.div("No Data")
         else:
@@ -257,55 +290,99 @@ class MongoDB(r.BaseJobExecutor):
                                    tmpl=f"<button onclick='exec_job({job})'>Delete</button>"))
             p.grid(rows, cols)
 
-    def show_open_jobs(self, p: b.Page):
-        with p.section(h="Open Jobs"):
-            self.show_collection_grid(p, 'nweb', 'jobs')
-
-    def show_results(self, p: b.Page):
-        with p.section(h="Results"):
-            self.show_collection_grid(p, 'nweb', 'results')
+    def decrypt_row(self, doc: dict) -> dict:
+        """ Fuer die Anzeige: c entschluesseln, bei Fehlern die Meldung anzeigen """
+        res = {k: v for k, v in doc.items() if k not in ('c', 'type')}
+        try:
+            res['job'] = json.loads(self.decrypt(doc.get('c', '')))
+        except Exception as e:
+            res['error'] = str(e)
+        return res
 
     def part_npy(self, p: b.Page, params={}):
-        with p.section(h="npy"):
-            p.div("Query Npy Jobs")
+        self.show_npy(p, crypted=False)
+
+    def part_npy_crypt(self, p: b.Page, params={}):
+        """ Wie part_npy, zeigt die verschluesselten Jobs in nweb.jobs """
+        if not self.has_crypt():
+            with p.section(h="npy crypt"):
+                p.div("Error: CryptRunner crypt is not available. "
+                      "Encrypted jobs can neither be queued nor executed.", _class='error')
+            return
+        self.show_npy(p, crypted=True)
+
+    def show_npy(self, p: b.Page, crypted: bool):
+        # verschluesselte und unverschluesselte Jobs liegen beide in nweb.jobs / nweb.results
+        if crypted:
+            jobs_q, results_q = {'type': 'crypt'}, {'c': {'$exists': True}}
+        else:
+            jobs_q, results_q = {'type': {'$ne': 'crypt'}}, {'c': {'$exists': False}}
+        with p.section(h="npy crypt" if crypted else "npy"):
+            p.div("Query Npy Jobs (nweb.jobs)")
+            p(self.action_btn(dict(title="Execute Jobs now", type=self.type, op='jobs')))
             if self.ticker is None:
-                p(self.action_btn(dict(title="Execute Jobs now", type=self.type, op='jobs')))
                 p(self.action_btn(dict(title="Create Periodic Job Processor", type=self.type, op='create_ticker')))
             else:
                 p.prop("Ticker", "active")
                 p.prop("Interval (s)", self.ticker_interval)
                 p.prop("Tick Count", self.tick_count)
                 p(self.action_btn(dict(title="Stop", type=self.type, op='stop_ticker')))
-        self.show_open_jobs(p)
-        self.show_results(p)
+        map_row = self.decrypt_row if crypted else None
+        with p.section(h="Open Jobs"):
+            self.show_collection_grid(p, 'nweb', 'jobs', map_row=map_row, q=jobs_q)
+        with p.section(h="Results"):
+            self.show_collection_grid(p, 'nweb', 'results', map_row=map_row, q=results_q)
         with p.section(h="Queue Jobs"):
             for seconds in [30, 300, 3852]:
                 job = dict(type=self.type, op='set_ticker', value=seconds)
-                p(self.action_btn(dict(title=f"Queue Set Ticker {seconds}s", type=self.type, op='insert_one',
-                                       db='nweb', collection='jobs', row=job)))
-            p.ul([w.a("Queue custom Job", self.link(self.part_npy_queue))])
+                p(self.action_btn(dict(title=f"Queue Set Ticker {seconds}s", type=self.type,
+                                       op='cenqueue' if crypted else 'enqueue', jobdef=job)))
+            p.ul([w.a("Queue custom Job", self.link(self.part_npy_queue, crypted=1 if crypted else 0))])
         with p.section(h="Result"):
             p.pre('', id='result')
 
     def part_npy_queue(self, p: b.Page, params={}):
         """
-            Schreib einen Job in MongoDB
+            Schreib einen Job in MongoDB, mit crypted=1 verschluesselt
         """
-        with p.section(h="Queue custom Job"):
+        crypted = str(params.get('crypted', '0')) == '1'
+        if crypted and not self.has_crypt():
+            p.div("Error: CryptRunner crypt is not available.", _class='error')
+            return
+        with p.section(h="Queue custom crypted Job" if crypted else "Queue custom Job"):
             p(self.ui_form_job('jobdef', False))
-            p.div(self.action_btn_parametric("Enqueue Job into MongoDB", dict(type=self.type, op='enqueue', jobdef='#jobdef')),
+            title = "Enqueue crypted Job into MongoDB" if crypted else "Enqueue Job into MongoDB"
+            op = 'cenqueue' if crypted else 'enqueue'
+            p.div(self.action_btn_parametric(title, dict(type=self.type, op=op, jobdef='#jobdef')),
                   _class='ui_form_job_actions')
 
-    def execute_enqueue(self, data: dict):
-        """ Schreibt den Job aus jobdef (JSON) nach nweb.jobs """
+    def parse_jobdef(self, data: dict):
+        """ :return: (job, None) oder (None, fehlermeldung) """
         job = data.get('jobdef')
         if isinstance(job, str):
             if job.strip() == '':
-                return self.fail('jobdef is empty')
+                return None, 'jobdef is empty'
             job = json.loads(job)
         if not isinstance(job, dict) or 'type' not in job:
-            return self.fail('jobdef must be a job object with type')
+            return None, 'jobdef must be a job object with type'
+        return job, None
+
+    def execute_enqueue(self, data: dict):
+        """ Schreibt den Job aus jobdef (JSON) nach nweb.jobs """
+        job, error = self.parse_jobdef(data)
+        if error is not None:
+            return self.fail(error)
         return self.success(result=str(self.insert_one('nweb', 'jobs', job).inserted_id))
+
+    def execute_cenqueue(self, data: dict):
+        """ Schreibt den Job aus jobdef (JSON) verschluesselt nach nweb.jobs """
+        if not self.has_crypt():
+            return self.fail("CryptRunner crypt not available")
+        job, error = self.parse_jobdef(data)
+        if error is not None:
+            return self.fail(error)
+        cjob = dict(type='crypt', c=self.encrypt(json.dumps(job)))
+        return self.success(result=str(self.insert_one('nweb', 'jobs', cjob).inserted_id))
 
     def execute_delete_doc(self, data: dict):
         from bson import ObjectId
