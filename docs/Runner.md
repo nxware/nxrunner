@@ -21,6 +21,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `wsl` | `nxrunner.system:Wsl` | Laufwerke in der WSL mounten, Windows-Befehle | |
 | `nfile` | `nxrunner.system:NFile` | Dateien von Laufwerken indexieren und durchsuchen | |
 | `backup` | `nxrunner.system:Backup` | Inkrementelle Backups aus Quellen in Ziele | (`paramiko`, `smbprotocol`) |
+| `crypt` | `nxrunner.system:CryptRunner` | Verschlüsselte Jobs (Fernet) entschlüsseln und ausführen | `cryptography` |
 | `smb` | `nxrunner.fs:Smb` | Zugriff auf SMB-/Windows-Freigaben | `smbprotocol` |
 | `mongo` | `nxrunner.db.mongo:MongoDB` | MongoDB: einfügen, suchen, Dateien sammeln | `pymongo` |
 | `nwebdir` | `nxrunner.nweb:NWebDir` | Verzeichnis mit nweb-Gruppe abgleichen | |
@@ -32,6 +33,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `audio_convert` | `nxrunner.audio:Convert` | WAV nach MP3 konvertieren | `pydub` (+ ffmpeg) |
 | `pihole_api` | `nxrunner.apis:PiHoleApi` | Statistik eines Pi-hole 6 | `pihole6api` |
 | `trello` | `nxrunner.apis:Trello` | Boards eines Trello-Kontos | `py-trello` |
+| `website` | `nxrunner.web:WebsiteController` | Webseite im Browser per Userscript steuern, CSS-Selektoren, Daten auslesen/ändern | `flask` |
 
 Fehlende Module lassen sich in der Registry mit `op=registry_pip name=<entry>` installieren, oder der Runner wird
 mit `op=registry_docker` in einem Container gestartet (siehe [NxRunner](#nxrunner-dispatcher)).
@@ -130,6 +132,24 @@ inkrementell: Größe und Änderungszeit jeder gesicherten Datei werden je Ziel 
 | `op=status` | Status der Quellen und des laufenden Backups |
 | `op=runs [source_id]` | Historie der Backups |
 | `op=errors source_id` | Fehlerdetails der letzten Läufe (nur im Speicher, seit dem Start) |
+
+### CryptRunner
+
+`nxrunner.system:CryptRunner(key_file='rr.txt')`, Tags `system`, `crypt`, benötigt `cryptography`
+
+Ver- und entschlüsselt Werte und Jobs mit Fernet. Der Schlüssel liegt in `key_file` (erzeugen z.B. mit
+`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > rr.txt`).
+Ein verschlüsselter Job `{"type": "crypt", "c": "<base64>"}` wird entschlüsselt und auf dem Root-Dispatcher
+ausgeführt.
+
+| Job | Beschreibung |
+|---|---|
+| `c=<base64>` (ohne `op`) | Job entschlüsseln und ausführen |
+| `op=encrypt value=text` | Text verschlüsseln, Ergebnis in `value` |
+| `op=decrypt c=<base64>` | entschlüsseln, Klartext in `value` |
+| `op=encrypt_job data={...} cjob={...} cjob_key=c` | `data` (oder Felder `data_*`) verschlüsseln, als `cjob[cjob_key]` einsetzen und `cjob` ausführen |
+
+**Achtung:** `op=encrypt` und `op=decrypt` sind für jeden nutzbar, der die API erreicht.
 
 ### Smb
 
@@ -370,6 +390,47 @@ Zeigt die Statistik eines Pi-hole 6 auf der Seite des Runners an
 `nxrunner.apis:Trello(api_key, token, args={})`, benötigt `py-trello`
 
 Zeigt die Boards eines Trello-Kontos auf der Seite des Runners an. Keine Jobs.
+
+### WebsiteController
+
+`nxrunner.web:WebsiteController(type='website', port=7011, host='127.0.0.1', timeout=10)`, benötigt `flask`
+
+Steuert eine Webseite im Browser. Der Runner startet einen eigenen Webserver auf `port`, unter
+`http://<host>:7011/website.user.js` liegt ein Userscript für Tampermonkey/Violentmonkey. Es läuft in jedem Tab,
+meldet sich per Long-Polling beim Server und führt dessen Befehle in der Seite aus. Ohne Angabe von `client` geht ein
+Befehl an den zuletzt aktiven Tab.
+
+Die Seite des Runners hat zwei Bereiche:
+
+- **CSS-Selektor**: Treffer mit Tag, Attributen und Text anzeigen, in der Seite markieren
+- **Strukturierte Daten**: Basis-Selektor (je Treffer eine Zeile) und Felder (Name, Selektor relativ zum
+  Basis-Element, Attribut). Die Werte erscheinen als editierbare Tabelle, geänderte Zellen werden zurück in die Seite
+  geschrieben (bei Eingabefeldern mit `input`/`change`-Events).
+- **Tab öffnen**: Seite für den ausgewählten Tab (`part_tab`) mit einem Eingabefeld für JavaScript. Der Code läuft
+  im Tab, angezeigt wird der Wert der letzten Anweisung (Elemente wie bei `query`, Promises werden abgewartet).
+
+| Job | Beschreibung |
+|---|---|
+| `op=clients` | verbundene Tabs |
+| `op=query selector=... [client=...] [limit=200]` | Elemente zum CSS-Selektor |
+| `op=highlight selector=...` | Elemente markieren, leer = Markierung entfernen |
+| `op=extract base=... fields=[...]` | `columns` und `rows`, je Basis-Element eine Zeile |
+| `op=apply base=... fields=[...] changes=[...]` | Werte in die Seite schreiben |
+| `op=eval_js code=...` | JavaScript im Tab ausführen, `value` = Ergebnis der letzten Anweisung |
+| `op=click selector=... [index=0]` | Element klicken |
+| `op=restart_server` | Webserver neu starten |
+
+`fields`: `[{"name": "preis", "selector": ".price", "attr": ""}]`, `selector` leer = Basis-Element, sonst der erste
+Treffer im Basis-Element. Mit Index am Ende wird der n-te Treffer gewählt: `input[1]` = zweites `input`, `input[-1]` =
+letztes, `[0]` = erstes Kind. `attr` leer =
+Text bzw. `value` bei Eingabefeldern, sonst `html`, `text` oder ein Attribut wie `href`.
+`changes`: `[{"row": 0, "field": "preis", "value": "1.50"}]`
+
+Der Server ist standardmäßig nur lokal erreichbar (`host='127.0.0.1'`). Für Zugriff aus dem Netz oder aus einem
+Docker-Container heraus `host="0.0.0.0"` setzen; der Server hat keine Anmeldung und kann JavaScript in den
+verbundenen Tabs ausführen.
+
+Variablen: `port`, `host`, `timeout`
 
 ---
 
