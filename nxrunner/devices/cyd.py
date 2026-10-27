@@ -33,6 +33,7 @@ from nwebclient import base
 from nwebclient import web as w
 from nwebclient import util as u
 from nwebclient.base import PeriodedThread
+from nwebclient.runner import op
 from nwebclient.runner.dashboard import Dashboard
 
 
@@ -176,16 +177,20 @@ class DashboardCYD(Dashboard):
 
     # --- Jobs ---------------------------------------------------------------------------------
 
-    def execute_push(self, data):
+    # push(force) wird vom Thread benutzt, info() ist das Logging von base.Base, daher abweichende Methodennamen
+
+    @op("Sendet jetzt alle Kennzahlen an das CYD", result={'success': 'bool', 'message': 'str'}, name='push')
+    def push_now(self):
         try:
             self.push(force=True)
         except Exception as e:
             return self.fail(self.last_error or str(e))
         return self.success(f'{len(self.last_payload)} Kennzahlen an {self.address()} gesendet')
 
-    def execute_connect(self, data):
-        """ Broadcast des CYD nach dem WLAN-Connect bzw. Adresse von Hand setzen """
-        ip = str(data.get('ip') or data.get('host') or '').strip()
+    @op("Setzt die Adresse des CYD (ip oder host) und sendet, wird auch vom UDP-Broadcast des CYD aufgerufen",
+        result={'success': 'bool', 'message': 'str'})
+    def connect(self, ip: str = None, host: str = None):
+        ip = str(ip or host or '').strip()
         if ip == '':
             return self.fail('ip fehlt')
         self.host = ip
@@ -196,7 +201,8 @@ class DashboardCYD(Dashboard):
             return self.fail(f'{ip} gesetzt, Senden fehlgeschlagen: {self.last_error or e}')
         return self.success(f'{ip} gesetzt, {len(self.last_payload)} Kennzahlen gesendet', ui_reload=True)
 
-    def execute_info(self, data):
+    @op("Liefert /api/info des CYD", result={'success': 'bool', 'message': 'str', 'value': 'dict'}, name='info')
+    def device_info(self):
         try:
             return self.success('ok', value=self.request('GET', '/api/info'))
         except Exception as e:

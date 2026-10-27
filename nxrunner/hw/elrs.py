@@ -75,6 +75,17 @@ class Binding:
 
 
 class ElrsDisplay(r.BaseJobExecutor):
+    """
+      Zeigt die Kanalwerte (1-11) eines ExpressLRS-Empfaengers an und loest ueber Bindings Jobs aus.
+      Bindings (Arg elrs_bindings): Kanal + Modus (PWM_H, PWM_L, PWM_F, DIR_H, DIR_L) -> Wert value_name in job_data
+      op=fetch ip=...                Kanalwerte einmal vom ESP (http://ip/val) lesen
+      op=auto_fetch ip=...           Kanalwerte periodisch lesen
+      op=bind_esp_motor ip=... [channel=2]   Kanal periodisch auf einen Motor des ESP uebertragen
+      op=binding channel mode value_name job_data   Binding anlegen
+      op=process_line value=channel1=...   Kanalwerte aus einem Query-String setzen
+      op=stop_thread thread_name=...
+      page=stream                    Kanalwerte als Server-Sent-Events
+    """
 
     def __init__(self, args: u.Args = {}):
         super().__init__('elrs_display')

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NxRunner</title>
 <link rel="stylesheet" href="/static/js/nx/ui.css" />
+<link rel="stylesheet" href="/static/css/grid.css" />
 <script src="/static/js/nx/ui.js"></script>
 <script src="/static/jquery.js"></script>
 <script src="/static/js/base.js"></script>
@@ -57,6 +58,35 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 #error { margin: 0 20px 20px; color: var(--err); }
 #error:empty { display: none; }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+/* Registry */
+.reg-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.reg-tools input[type=search] { flex: 1; min-width: 200px; padding: 8px 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.reg-tools a { color: var(--accent); }
+.reg-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.chip { font-size: 12px; padding: 2px 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; }
+.chip.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.reg-item { border: 1px solid var(--border); padding: 10px 12px; margin: 8px 0; background: var(--bg); }
+.reg-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.reg-head .name { font-weight: 600; font-size: 15px; }
+.reg-head .cls, .reg-head .pkg { font-size: 12px; color: var(--muted); }
+.reg-head .actions { margin-left: auto; display: flex; gap: 6px; }
+.reg-head .actions button { padding: 4px 10px; }
+.reg-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.badge.tag { color: var(--accent); }
+.badge.ok { color: var(--ok); }
+.badge.warn { color: var(--err); }
+.reg-summary { margin-top: 4px; color: var(--muted); }
+.reg-details { margin-top: 8px; }
+.reg-details .doc { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--border); padding: 8px; max-height: 300px; overflow: auto; }
+.reg-form { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 8px 0; align-items: center; }
+.reg-docker { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.reg-docker h3 { margin: 0 0 4px; font-size: 13px; }
+.reg-form textarea { padding: 4px 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); min-width: 0; font: inherit; }
+.reg-form input { padding: 4px 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); min-width: 0; }
+.reg-msg { margin-top: 6px; }
+.reg-msg.ok { color: var(--ok); }
+.reg-msg.err { color: var(--err); }
+.reg-msg pre { margin-top: 4px; max-height: 200px; }
 </style>
 </head>
 <body class="light">
@@ -178,10 +208,219 @@ function select(name) {
 qs('#search').addEventListener('input', renderList);
 qs('#runners').addEventListener('click', e => { const li = e.target.closest('li[data-name]'); if (li) select(li.dataset.name); });
 window.addEventListener('popstate', () => location.reload());
+// --- Registry (?view=registry): installierte Runner anzeigen und laden ---
+const reg = {q: '', tags: new Set(), open: new Set(), docker: new Set()};
+
+function regMatches(e) {
+  const q = reg.q.toLowerCase();
+  const text = [e.name, e.cls, e.value, e.package, e.summary, ...e.tags].join(' ').toLowerCase();
+  return (!q || text.includes(q)) && [...reg.tags].every(t => t === '!missing' ? e.missing.length : e.tags.includes(t));
+}
+
+function regItem(e) {
+  const badges = [
+    ...e.tags.map(t => '<span class="badge tag">' + esc(t) + '</span>'),
+    e.state ? '<span class="badge ok">' + esc(e.state) + '</span>' : '',
+    e.missing.length ? '<span class="badge warn" title="nicht installiert">fehlt: ' + esc(e.missing.join(', ')) + '</span>' : '',
+    e.error ? '<span class="badge warn" title="' + esc(e.error) + '">nicht auswertbar</span>' : ''
+  ].join('');
+  // type setzt der Dispatcher beim Laden auf den Namen, daher nur das Feld "Name (type)"
+  const params = e.params.filter(p => p.name !== 'type').map(p =>
+    '<label for="reg_' + esc(e.name) + '_' + esc(p.name) + '">' + esc(p.name) + (p.required ? ' *' : '') + '</label>'
+    + '<input id="reg_' + esc(e.name) + '_' + esc(p.name) + '" data-arg="' + esc(p.name) + '" placeholder="'
+    + esc(p.required ? 'erforderlich' : 'Standard: ' + JSON.stringify(p.default)) + '">').join('');
+  const open = reg.open.has(e.name);
+  return '<div class="reg-item" data-name="' + esc(e.name) + '">'
+    + '<div class="reg-head"><span class="name">' + esc(e.name) + '</span>'
+    + '<span class="cls" title="' + esc(e.value) + '">' + esc(e.cls) + '</span>'
+    + '<span class="pkg">' + esc(e.package) + (e.version ? ' ' + esc(e.version) : '') + '</span>'
+    + '<span class="actions">'
+    + (e.missing.length ? '<button data-act="pip" title="pip install ' + esc(e.missing.join(' ')) + '">pip install</button>'
+      + '<button data-act="docker-open" title="In einem Docker-Container mit den fehlenden Modulen starten">In Docker laden</button>' : '')
+    + '<button data-act="load">Laden</button><button data-act="details">' + (open ? 'Schließen' : 'Details') + '</button></span></div>'
+    + '<div class="reg-badges">' + badges + '</div>'
+    + (e.summary ? '<div class="reg-summary">' + esc(e.summary) + '</div>' : '')
+    + '<div class="reg-details"' + (open ? '' : ' hidden') + '>'
+    + (e.doc ? '<div class="doc">' + esc(e.doc) + '</div>' : '')
+    + '<div class="reg-form"><label>Name (type)</label><input data-field="runner_type" value="' + esc(e.name) + '">' + params + '</div>'
+    + '<div class="muted">Leere Felder = Standardwert. Werte wie 42, true, None, [1, 2] werden als Python-Werte übergeben.</div>'
+    + '<button data-act="load-params">Mit Parametern laden</button> '
+    + '<button data-act="install" title="Config-Datei schreiben, damit der Runner auch nach einem Neustart geladen wird">Installieren</button>'
+    + (e.missing.length ? '<div class="reg-docker"' + (reg.docker.has(e.name) ? '' : ' hidden') + '>'
+      + '<h3>In Docker laden</h3>'
+      + '<div class="reg-form">'
+      + '<label>pip-Pakete</label><textarea data-docker="packages" rows="3">' + esc(e.docker_packages.join('\n')) + '</textarea>'
+      + '<label>Mounts</label><textarea data-docker="mounts" rows="2" placeholder="/host/pfad:/container/pfad[:ro], eine Zeile je Mount"></textarea>'
+      + '<label>Ports</label><textarea data-docker="ports" rows="2" placeholder="Host:Container, z.B. 8188:8188 (Port 7070 wird automatisch weitergeleitet)"></textarea>'
+      + '</div><div class="muted">Image nxrunner-' + esc(e.name) + ' wird beim ersten Start gebaut (python:3.12-slim + pip-Pakete). '
+      + 'Name und Parameter von oben werden übernommen. Der Container läuft, bis nxrunner beendet wird.</div>'
+      + '<button data-act="docker">In Docker starten</button></div>' : '')
+    + '</div><div class="reg-msg"></div></div>';
+}
+
+function renderRegistry() {
+  const items = DATA.registry || [];
+  const tags = [...new Set(items.flatMap(e => e.tags))].sort();
+  const missing = items.filter(e => e.missing.length).length;
+  const shown = items.filter(regMatches);
+  const chip = (value, title) => '<button class="chip' + (reg.tags.has(value) ? ' active' : '') + '" data-tag="' + esc(value) + '">' + esc(title) + '</button>';
+  setContent('<h2>Registry</h2>'
+    + '<div class="reg-tools"><input type="search" id="reg_search" placeholder="Name, Klasse, Paket, Tag suchen&hellip;" value="' + esc(reg.q) + '">'
+    + '<span class="muted"><span id="reg_count">' + shown.length + '</span> von ' + items.length + ' Runnern</span>'
+    + '<a href="?view=registry&refresh=1">neu einlesen</a></div>'
+    + '<div class="reg-tags">' + tags.map(t => chip(t, t)).join('') + (missing ? chip('!missing', 'Module fehlen (' + missing + ')') : '') + '</div>'
+    + '<div id="reg_list">' + (shown.map(regItem).join('') || '<div class="empty">Keine Treffer</div>') + '</div>');
+  const search = qs('#reg_search');
+  search.addEventListener('input', () => { reg.q = search.value; renderRegistryList(); });
+}
+
+function renderRegistryList() {
+  const shown = (DATA.registry || []).filter(regMatches);
+  qs('#reg_list').innerHTML = shown.map(regItem).join('') || '<div class="empty">Keine Treffer</div>';
+  qs('#reg_count').textContent = shown.length;
+}
+
+function regMessage(box, ok, text, output) {
+  const msg = box.querySelector('.reg-msg');
+  msg.className = 'reg-msg ' + (ok ? 'ok' : 'err');
+  msg.textContent = text;
+  if (output) { const pre = document.createElement('pre'); pre.textContent = output; msg.appendChild(pre); }
+}
+
+function regLoad(box, name, withParams, docker) {
+  const job = {op: docker ? 'registry_docker' : 'registry_load', name: name};
+  if (docker) {
+    box.querySelectorAll('[data-docker]').forEach(i => { job[i.dataset.docker] = i.value; });
+  }
+  if (withParams) {
+    job.runner_type = box.querySelector('[data-field=runner_type]').value.trim();
+    box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') job['arg_' + i.dataset.arg] = i.value; });
+  }
+  regMessage(box, true, 'Lädt…');
+  exec_job(job, r => {
+    regMessage(box, r.success !== false, r.message || JSON.stringify(r));
+    if (r.success === false) return;
+    const e = DATA.registry.find(x => x.name === name);
+    if (e && r.runner_type === name) e.state = 'geladen';
+    // in der Runner-Liste links anzeigen
+    DATA.classes = DATA.classes.filter(c => c.name !== r.runner_type);
+    if (!DATA.instances.some(i => i.name === r.runner_type)) DATA.instances.push({name: r.runner_type, cls: r.cls});
+    renderStats(); renderList();
+  });
+}
+
+function regPip(box, name) {
+  const e = DATA.registry.find(x => x.name === name);
+  if (!confirm('pip install ' + e.missing.join(' ') + ' auf dem Server ausführen?')) return;
+  regMessage(box, true, 'Installiert… (kann dauern)');
+  exec_job({op: 'registry_pip', name: name}, r => {
+    regMessage(box, r.success !== false, r.message || '', r.output);
+    if (r.success !== false) e.missing = [];
+  });
+}
+
+qs('#content').addEventListener('click', ev => {
+  const chip = ev.target.closest('.reg-tags .chip[data-tag]');
+  if (chip) {
+    const t = chip.dataset.tag;
+    reg.tags.has(t) ? reg.tags.delete(t) : reg.tags.add(t);
+    chip.classList.toggle('active');
+    renderRegistryList();
+    return;
+  }
+  const btn = ev.target.closest('#reg_list .reg-item button[data-act]');
+  if (!btn) return;
+  const box = btn.closest('.reg-item'), name = box.dataset.name;
+  if (btn.dataset.act === 'details') {
+    const details = box.querySelector('.reg-details');
+    details.hidden = !details.hidden;
+    details.hidden ? reg.open.delete(name) : reg.open.add(name);
+    btn.textContent = details.hidden ? 'Details' : 'Schließen';
+  } else if (btn.dataset.act === 'load') {
+    regLoad(box, name, false);
+  } else if (btn.dataset.act === 'load-params') {
+    regLoad(box, name, true);
+  } else if (btn.dataset.act === 'pip') {
+    regPip(box, name);
+  } else if (btn.dataset.act === 'docker-open') {
+    const details = box.querySelector('.reg-details'), block = box.querySelector('.reg-docker');
+    details.hidden = false; reg.open.add(name);
+    box.querySelector('button[data-act="details"]').textContent = 'Schließen';
+    block.hidden = !block.hidden;
+    block.hidden ? reg.docker.delete(name) : reg.docker.add(name);
+  } else if (btn.dataset.act === 'docker') {
+    regLoad(box, name, true, true);
+  } else if (btn.dataset.act === 'install') {
+    // eingegebene Werte auf die Seite zum Installieren mitnehmen
+    const q = new URLSearchParams({view: 'install', name: name, runner_type: box.querySelector('[data-field=runner_type]').value.trim()});
+    box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') q.set('arg_' + i.dataset.arg, i.value); });
+    location.href = '?' + q;
+  }
+});
+
+// --- Installieren (?view=install&name=...): Config <Verzeichnis>/<type>.yml schreiben und Runner laden ---
+function renderInstall() {
+  const inst = DATA.install, e = inst.entry;
+  if (e.error_page) { showError(e.error_page); return; }
+  const v = inst.values || {};
+  const params = e.params.filter(p => p.name !== 'type').map(p =>
+    '<label for="inst_' + esc(p.name) + '">' + esc(p.name) + (p.required ? ' *' : '') + '</label>'
+    + '<input id="inst_' + esc(p.name) + '" data-arg="' + esc(p.name) + '" value="' + esc(v['arg_' + p.name] || '') + '" placeholder="'
+    + esc(p.required ? 'erforderlich' : 'Standard: ' + JSON.stringify(p.default)) + '">').join('');
+  setContent('<h2>Installieren: ' + esc(e.name) + '</h2>'
+    + '<div class="reg-item" id="inst_box">'
+    + '<div class="reg-head"><span class="name">' + esc(e.name) + '</span>'
+    + '<span class="cls" title="' + esc(e.value) + '">' + esc(e.cls) + '</span>'
+    + '<span class="pkg">' + esc(e.package) + (e.version ? ' ' + esc(e.version) : '') + '</span></div>'
+    + (e.summary ? '<div class="reg-summary">' + esc(e.summary) + '</div>' : '')
+    + (e.missing.length ? '<div class="reg-msg err">Fehlende Module: ' + esc(e.missing.join(', ')) + ' (der Runner lässt sich so nicht laden)</div>' : '')
+    + '<div class="reg-form">'
+    + '<label>Name (type)</label><input data-field="runner_type" value="' + esc(v.runner_type || e.name) + '">'
+    + '<label>Verzeichnis</label><input data-field="directory" value="' + esc(inst.config_d) + '">'
+    + params
+    + '<label>Überschreiben</label><input type="checkbox" data-field="overwrite" style="justify-self: start">'
+    + '</div>'
+    + '<div class="muted">Leere Felder = Standardwert. Werte wie 42, true, None, [1, 2] werden als Python-Werte übergeben.</div>'
+    + '<h3>Config</h3><div id="inst_warn"></div><div class="muted" id="inst_path"></div><pre id="inst_preview"></pre>'
+    + '<button data-act="do-install">Installieren</button> <a href="?view=registry">zurück zur Registry</a>'
+    + '<div class="reg-msg"></div></div>');
+  const box = qs('#inst_box');
+  const job = preview => {
+    const j = {op: 'registry_install', name: e.name, preview: preview ? 1 : 0};
+    box.querySelectorAll('[data-field]').forEach(i => { j[i.dataset.field] = i.type === 'checkbox' ? (i.checked ? 1 : 0) : i.value.trim(); });
+    box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') j['arg_' + i.dataset.arg] = i.value; });
+    return j;
+  };
+  let timer = null;
+  const preview = () => exec_job(job(true), r => {
+    qs('#inst_warn').innerHTML = r.warning || '';
+    if (r.success === false) { qs('#inst_path').textContent = ''; qs('#inst_preview').textContent = r.message; return; }
+    qs('#inst_path').textContent = r.path + (r.exists ? ' (existiert bereits)' : '') + (r.loaded ? ', Runner ' + r.runner_type + ' ist bereits geladen' : '');
+    qs('#inst_preview').textContent = r.content;
+  });
+  box.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(preview, 300); });
+  box.querySelector('[data-act=do-install]').addEventListener('click', () => {
+    regMessage(box, true, 'Installiert…');
+    exec_job(job(false), r => {
+      regMessage(box, r.success !== false, r.message || JSON.stringify(r), r.content);
+      if (r.success === false) return;
+      DATA.classes = DATA.classes.filter(c => c.name !== r.runner_type);
+      if (!DATA.instances.some(i => i.name === r.runner_type)) DATA.instances.push({name: r.runner_type, cls: r.cls});
+      renderStats(); renderList();
+      preview();
+    });
+  });
+  preview();
+}
+
 // serverseitig gerenderte Runner-Seite (?type=x&x=page)
 if (DATA.page) {
   current = DATA.page.name;
   if (DATA.page.error !== undefined) showError(DATA.page.error); else setRunnerContent(current, DATA.page.content);
+} else if (DATA.view === 'registry') {
+  renderRegistry();
+} else if (DATA.view === 'install') {
+  renderInstall();
 }
 renderList();
 })();
