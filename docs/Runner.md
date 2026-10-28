@@ -255,7 +255,7 @@ Variablen: `host`, `last_push`, `last_error`
 
 ### EspM5
 
-`nxrunner.devices.esp_m5:EspM5(type='m5_multi', host=None, timeout=3)`, benötigt `requests`
+`nxrunner.devices.esp_m5:EspM5(type='m5_multi', host=None, timeout=3, update_interval=None)`, benötigt `requests`
 
 M5StickS3 mit der Firmware [esp_m5_multi](../../esp_m5_multi/README.md). Es ist immer genau ein Modul aktiv
 (Wage, IR Sniffer, Tail RS485, Joystick2, Button, AS5600). Die Seite zeigt die Werte des aktiven Moduls mit seinen
@@ -265,10 +265,14 @@ der Standard-Name der Firmware ist `m5_multi`.
 ```
 m5_multi: nxrunner.devices.esp_m5:EspM5()
 m5_multi: nxrunner.devices.esp_m5:EspM5(host="192.168.1.42")
+m5_multi: nxrunner.devices.esp_m5:EspM5(update_interval=2)
 ```
 
 | Job | Beschreibung |
 |---|---|
+| `op=update` | Variablen einmalig aus `/api/status` aktualisieren |
+| `op=start_updates [interval=...]` | periodische Aktualisierung der Variablen starten (Sekunden, Standard 5) |
+| `op=stop_updates` | periodische Aktualisierung stoppen |
 | `op=get_status` | `/api/status`: System und unter `data` die Werte des aktiven Moduls |
 | `op=get_rotation` | AS5600: `rpm`, `angle`, `revolutions`, `magnet`, ... |
 | `op=get_weight` | Wage: `weight` in g |
@@ -282,7 +286,12 @@ m5_multi: nxrunner.devices.esp_m5:EspM5(host="192.168.1.42")
 
 Die `get_*`-Jobs für ein Modul schlagen fehl, wenn gerade ein anderes Modul aktiv ist.
 
-Variablen: `host`
+Variablen: `host`, `module`, `battery`, `rpm`, `angle`, `revolutions`, `magnet` (AS5600), `weight_g` (Wage),
+`joy_x`, `joy_y`, `joy_button` (Joystick2), `btn_count` (Button), `ir_count` (IR Sniffer), `last_update`,
+`last_error`, `update_interval`. Aktualisiert werden sie von `op=update`, `op=get_status`, beim Aufruf der Seite
+und, wenn eingeschaltet (`update_interval` im Konstruktor oder `op=start_updates`), periodisch in einem Thread.
+Werte inaktiver Module sind `None`, Änderungen lösen `change_<var>`-Events aus. `setvar update_interval` ändert
+das Intervall eines laufenden Threads.
 
 ### NimbotB1
 

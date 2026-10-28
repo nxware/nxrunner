@@ -140,4 +140,5 @@ Mehr unter [https://gitlab.com/bsalgert/nwebclient/-/blob/master/docs/Page.md](h
 
 ## See also
  - nwebclient
+   - nwebclient docs/Typing.md (für define_sig(...)...)
  - nxml

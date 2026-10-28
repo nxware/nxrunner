@@ -12,8 +12,16 @@ API des Geraets: esp_m5_multi/README.md (HTTP auf Port 80, immer genau ein Modul
     Config (runners):
         m5_multi: nxrunner.devices.esp_m5:EspM5()                        -> m5_multi.local (Standard-NXNAME)
         m5_multi: nxrunner.devices.esp_m5:EspM5(host="192.168.1.42")
+        m5_multi: nxrunner.devices.esp_m5:EspM5(update_interval=2)      Variablen alle 2 s aktualisieren
+
+    Variablen: module, battery, rpm, angle, revolutions, magnet (AS5600), weight_g (Wage), joy_x, joy_y,
+    joy_button (Joystick2), btn_count (Button), ir_count (IR), last_update, last_error, update_interval.
+    Werte inaktiver Module sind None.
 
     Jobs:
+        {"type": "m5_multi", "op": "update"}                        Variablen einmalig aktualisieren
+        {"type": "m5_multi", "op": "start_updates", "interval": 2}  periodische Aktualisierung starten
+        {"type": "m5_multi", "op": "stop_updates"}                  periodische Aktualisierung stoppen
         {"type": "m5_multi", "op": "get_status"}                    /api/status
         {"type": "m5_multi", "op": "get_rotation"}                  AS5600: rpm, angle, revolutions, ...
         {"type": "m5_multi", "op": "get_weight"}                    Wage: weight in g
@@ -25,6 +33,7 @@ API des Geraets: esp_m5_multi/README.md (HTTP auf Port 80, immer genau ein Modul
         {"type": "m5_multi", "op": "i2c_scan"}                      I2C-Scan am Port A
 """
 import html
+import time
 
 from nwebclient import base
 from nwebclient import runner as r
@@ -60,15 +69,37 @@ class EspM5(r.BaseJobExecutor):
         'heap': ("Freier Heap", lambda v: u.format_size(v)),
     }
 
-    def __init__(self, type='m5_multi', host=None, timeout=3):
+    # Werte der Module als Variablen des Runners: Modul -> {Schluessel in data: Variable}
+    # (keine Namen mit get_<name>-Op, get_var wuerde sonst den Job ausfuehren)
+    VALUE_VARS = {
+        'as5600': {'rpm': 'rpm', 'angle': 'angle', 'revolutions': 'revolutions', 'magnet': 'magnet'},
+        'scale': {'weight': 'weight_g'},
+        'joy': {'x': 'joy_x', 'y': 'joy_y', 'button': 'joy_button'},
+        'btn': {'count': 'btn_count'},
+        'ir': {'count': 'ir_count'},
+    }
+
+    def __init__(self, type='m5_multi', host=None, timeout=3, update_interval=None):
         """
         :param host: IP oder Name des Geraets, ohne Angabe <type>.local (mDNS-Name = Name des Runners)
         :param timeout: Sekunden je HTTP-Anfrage
+        :param update_interval: Sekunden zwischen den Aktualisierungen der Variablen, ohne Angabe aus
         """
         super().__init__(type)
         self.host = host
         self.timeout = float(timeout)
-        self.define_vars('host')
+        self.updater = None
+        self.update_interval = 5.0
+        self.module = None
+        self.battery = None
+        self.last_update = None
+        self.last_error = ''
+        self.value_vars = [v for names in self.VALUE_VARS.values() for v in names.values()]
+        for name in self.value_vars:
+            setattr(self, name, None)
+        self.define_vars('host', 'module', 'battery', *self.value_vars, 'last_update', 'last_error', 'update_interval')
+        if update_interval is not None:
+            self.start_updater(update_interval)
 
     def address(self) -> str:
         return self.host or f'{self.type}.local'
@@ -104,6 +135,49 @@ class EspM5(r.BaseJobExecutor):
     def module_name(self, module_id) -> str:
         return self.DEVICE_MODULES.get(module_id, (str(module_id), {}))[0]
 
+    # --- Variablen ----------------------------------------------------------------------------
+
+    def set_value(self, name, value):
+        if getattr(self, name, None) != value:
+            self.emit_var_change(name, value)
+            setattr(self, name, value)
+
+    def apply_status(self, status: dict):
+        """ Variablen aus /api/status setzen, Werte inaktiver Module werden None """
+        module = status.get('module')
+        data = status.get('data', {})
+        self.set_value('module', module)
+        self.set_value('battery', status.get('battery'))
+        for mid, names in self.VALUE_VARS.items():
+            for key, name in names.items():
+                self.set_value(name, data.get(key) if mid == module else None)
+        self.last_update = time.strftime('%Y-%m-%d %H:%M:%S')
+        self.set_value('last_error', '')
+
+    def update_values(self):
+        try:
+            self.apply_status(self.device_status())
+        except Exception as e:
+            self.set_value('last_error', f'{type(e).__name__}: {e}')
+
+    def start_updater(self, interval=None):
+        if interval is not None:
+            self.set_update_interval(interval)
+        if self.updater is None:
+            self.updater = self.periodic(self.update_interval, self.update_values)
+
+    def stop_updater(self):
+        if self.updater is not None:
+            self.updater.stop()
+            self.updater = None
+
+    def set_update_interval(self, value):
+        """ auch fuer setvar, ein laufender Thread uebernimmt das Intervall """
+        self.emit_var_change('update_interval', value)
+        self.update_interval = max(0.5, float(value))
+        if self.updater is not None:
+            self.updater.time_s = self.update_interval
+
     def call(self, fn, message='ok'):
         """ Job-Ergebnis: success mit value = fn(), bei Fehlern fail """
         try:
@@ -124,7 +198,29 @@ class EspM5(r.BaseJobExecutor):
     @op("Liefert /api/status: System und unter data die Werte des aktiven Moduls",
         result={'success': 'bool', 'message': 'str', 'value': 'dict'})
     def get_status(self):
-        return self.call(self.device_status)
+        def status():
+            res = self.device_status()
+            self.apply_status(res)
+            return res
+        return self.call(status)
+
+    @op("Aktualisiert die Variablen (rpm, weight_g, joy_x, ...) einmalig", result={'success': 'bool', 'message': 'str'})
+    def update(self):
+        self.update_values()
+        if self.last_error:
+            return self.fail(self.last_error)
+        return self.success(f'Modul {self.module_name(self.module)}', ui_reload=True)
+
+    @op("Startet die periodische Aktualisierung der Variablen (interval in s)",
+        result={'success': 'bool', 'message': 'str'})
+    def start_updates(self, interval: float = None):
+        self.start_updater(interval)
+        return self.success(f'Aktualisierung alle {self.update_interval:g} s', ui_reload=True)
+
+    @op("Stoppt die periodische Aktualisierung der Variablen", result={'success': 'bool', 'message': 'str'})
+    def stop_updates(self):
+        self.stop_updater()
+        return self.success('Aktualisierung gestoppt', ui_reload=True)
 
     @op("AS5600: Drehzahl (rpm), Winkel (angle in Grad), Umdrehungen (revolutions) und Magnetstatus",
         result={'success': 'bool', 'message': 'str', 'value': 'dict'})
@@ -201,8 +297,10 @@ class EspM5(r.BaseJobExecutor):
         except Exception as e:
             p.alert_error(f'Gerät nicht erreichbar: {html.escape(type(e).__name__)}: {html.escape(str(e))}')
         else:
+            self.apply_status(status)
             self.part_module(p, status, params)
             self.part_system(p, status, params)
+        self.part_updater(p, params)
         p.pre('', id='result')
         super().part_index(p, params)
 
@@ -227,6 +325,20 @@ class EspM5(r.BaseJobExecutor):
             p.div('Modul wechseln (Gerät startet neu): ' + ' '.join(
                 self.action_btn({'title': title, 'type': self.type, 'op': 'set_module', 'id': mid})
                 for mid, (title, _) in self.DEVICE_MODULES.items() if mid != module))
+
+    def part_updater(self, p: base.Page, params={}):
+        with p.section(h='Aktualisierung der Variablen'):
+            if self.updater is None:
+                p.div('Aus')
+                p.form_input('interval', 'Intervall (s)', id='m5_interval', value=f'{self.update_interval:g}')
+                p(self.action_btn_parametric('Starten', {'type': self.type, 'op': 'start_updates',
+                                                         'interval': '#m5_interval'}))
+            else:
+                p.div(f'Aktiv, alle {self.update_interval:g} s')
+                p(self.action_btn({'title': 'Stoppen', 'type': self.type, 'op': 'stop_updates'}))
+            p.div(f'Letzte Aktualisierung: {html.escape(str(self.last_update or "–"))}')
+            if self.last_error:
+                p.alert_error(html.escape(self.last_error))
 
     def part_system(self, p: base.Page, status: dict, params={}):
         with p.section(h='System'):

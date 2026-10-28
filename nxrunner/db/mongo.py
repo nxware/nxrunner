@@ -11,8 +11,10 @@ from nwebclient import util as u
 from nwebclient import web as w
 from nwebclient import dev as d
 
+from nxrunner.jobstore import JobStoreMixin
 
-class MongoDB(r.BaseJobExecutor):
+
+class MongoDB(r.BaseJobExecutor, JobStoreMixin):
     """
      cfg mongo_url
 
@@ -25,9 +27,7 @@ class MongoDB(r.BaseJobExecutor):
        target  Name der Instanz (nwebclient.nx.get_name()), die den Job ausfuehren soll; andere ignorieren ihn
        ts      Zeitpunkt des Einstellens, Jobs werden in dieser Reihenfolge ausgefuehrt
 
-     Job-Speicher-Vertrag (z.B. fuer RemoteTerminal, andere Speicher bieten dieselben Ops an):
-       op=cenqueue jobdef={...} [guid] [target]   -> result (id)
-       op=cresult guid [delete=1]                 -> pending=True | pending=False, result={...}
+     Job-Speicher (op=cenqueue, op=cresult) siehe nxrunner.jobstore:JobStoreMixin
     """
     MODULES = ['pymongo']
 
@@ -45,8 +45,7 @@ class MongoDB(r.BaseJobExecutor):
         self.define_sig(d.PStr('op', 'stop_ticker'))
         self.define_sig(d.PStr('op', 'done_writer'), d.PStr('emitter', ''))
         self.define_sig(d.PStr('op', 'enqueue'), d.PStr('jobdef'))
-        self.define_sig(d.PStr('op', 'cenqueue'), d.PStr('jobdef'), d.PStr('guid', ''), d.PStr('target', ''))
-        self.define_sig(d.PStr('op', 'cresult'), d.PStr('guid'), d.PInt('delete', 1))
+        self.define_job_store_sigs()
         self.define_sig(d.PStr('op', 'delete_doc'), d.PStr('db'), d.PStr('collection'), d.PStr('id'))
         if args is None:
             args = u.Args()
@@ -306,6 +305,11 @@ class MongoDB(r.BaseJobExecutor):
             p.div("No Data")
         else:
             cols = self.grid_cols(rows)
+            for col in cols:
+                if col['field'] == 'target':
+                    # Jobs fuer diese Instanz gruen
+                    col['td'] = {'style': lambda row: 'background: #2e7d32; color: #fff'
+                                 if row.get('target') == self.instance_name else ''}
             # tmpl wird mit str.format_map gefuellt: JSON-Klammern verdoppeln, nur {_id} bleibt Platzhalter
             job = json.dumps(dict(type=self.type, op='delete_doc', db=db, collection=collection, id='_ID_'))
             job = job.replace('{', '{{').replace('}', '}}').replace('_ID_', '{_id}')
@@ -342,6 +346,7 @@ class MongoDB(r.BaseJobExecutor):
             jobs_q, results_q = {'type': {'$ne': 'crypt'}}, {'c': {'$exists': False}}
         with p.section(h="npy crypt" if crypted else "npy"):
             p.div("Query Npy Jobs (nweb.jobs)")
+            p.prop("Instanz (target)", self.instance_name)
             p(self.action_btn(dict(title="Execute Jobs now", type=self.type, op='jobs')))
             if self.ticker is None:
                 p(self.action_btn(dict(title="Create Periodic Job Processor", type=self.type, op='create_ticker')))
@@ -379,17 +384,6 @@ class MongoDB(r.BaseJobExecutor):
             p.div(self.action_btn_parametric(title, dict(type=self.type, op=op, jobdef='#jobdef')),
                   _class='ui_form_job_actions')
 
-    def parse_jobdef(self, data: dict):
-        """ :return: (job, None) oder (None, fehlermeldung) """
-        job = data.get('jobdef')
-        if isinstance(job, str):
-            if job.strip() == '':
-                return None, 'jobdef is empty'
-            job = json.loads(job)
-        if not isinstance(job, dict) or 'type' not in job:
-            return None, 'jobdef must be a job object with type'
-        return job, None
-
     def execute_enqueue(self, data: dict):
         """ Schreibt den Job aus jobdef (JSON) nach nweb.jobs """
         job, error = self.parse_jobdef(data)
@@ -398,44 +392,35 @@ class MongoDB(r.BaseJobExecutor):
         job = {**job, 'ts': time.time()}
         return self.success(result=str(self.insert_one('nweb', 'jobs', job).inserted_id))
 
-    def execute_cenqueue(self, data: dict):
-        """ Schreibt den Job aus jobdef (JSON) verschluesselt nach nweb.jobs """
-        if not self.has_crypt():
-            return self.fail("CryptRunner crypt not available")
-        job, error = self.parse_jobdef(data)
-        if error is not None:
-            return self.fail(error)
-        cjob = dict(type='crypt', c=self.encrypt(json.dumps(job)), ts=time.time())
-        for key in ('guid', 'target'):
-            if data.get(key):
-                cjob[key] = str(data[key])
-        return self.success(result=str(self.insert_one('nweb', 'jobs', cjob).inserted_id))
+    # --- Job-Speicher (JobStoreMixin) -------------------------------------------------------------
 
-    def execute_cresult(self, data: dict):
-        """
-          Ergebnis eines Jobs anhand seiner guid (entschluesselt, falls verschluesselt).
-          Ergebnisse anderer Jobs bleiben unberuehrt, delete=1 entfernt nur dieses Ergebnis.
-        """
-        guid = str(data.get('guid', '')).strip()
-        if guid == '':
-            return self.fail('guid fehlt')
+    def store_enqueue(self, job: dict, guid: str = None, target: str = None) -> str:
+        """ verschluesselt nach nweb.jobs, guid, target und ts im Klartext """
+        if not self.has_crypt():
+            raise RuntimeError("CryptRunner crypt not available")
+        cjob = dict(type='crypt', c=self.encrypt(json.dumps(job)), ts=time.time())
+        if guid:
+            cjob['guid'] = guid
+        if target:
+            cjob['target'] = target
+        return str(self.insert_one('nweb', 'jobs', cjob).inserted_id)
+
+    def store_result(self, guid: str, delete: bool = True):
+        """ aus nweb.results anhand der guid im Klartext (Index auf guid), c wird entschluesselt """
         col = self.client['nweb']['results']
         if not self.result_index:
             col.create_index('guid')
             self.result_index = True
         doc = col.find_one({'guid': guid})
         if doc is None:
-            return self.success('pending', pending=True)
+            return None
         if 'c' in doc:
-            try:
-                result = json.loads(self.decrypt(doc['c']), object_hook=self.json_util.object_hook)
-            except Exception as e:
-                return self.fail(f'Ergebnis {guid} nicht entschluesselbar: {e}')
+            result = json.loads(self.decrypt(doc['c']), object_hook=self.json_util.object_hook)
         else:
             result = {k: v for k, v in doc.items() if k not in ('_id', 'job_id', 'guid')}
-        if str(data.get('delete', '1')) not in ('0', 'false', 'False'):
+        if delete:
             col.delete_one({'_id': doc['_id']})
-        return self.success('ok', pending=False, result=self.bson_safe(result))
+        return self.bson_safe(result)
 
     def execute_delete_doc(self, data: dict):
         from bson import ObjectId
