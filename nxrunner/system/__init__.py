@@ -21,6 +21,7 @@ class Wsl(r.BaseJobExecutor):
       op=drives
       op=volumes
       op=cmd cmd="dir C:\\"
+      op=list_deleted_files path=/mnt/d/dev/nxrunner [recursive=1]
     """
 
     TAGS = ['system', 'wsl']
@@ -175,6 +176,71 @@ class Wsl(r.BaseJobExecutor):
             return self.success('ok', value=self.volumes())
         except RuntimeError as e:
             return self.fail(str(e))
+
+    @staticmethod
+    def recycle_bin_original(file):
+        """
+          Originalpfad (Windows) aus einer $I-Datei des Papierkorbs
+          Version 1 (Vista/7): Pfad mit fester Laenge ab Byte 24, Version 2 (ab Win 10): Laenge ab Byte 24, Pfad ab Byte 28
+        """
+        with open(file, 'rb') as f:
+            data = f.read()
+        version = int.from_bytes(data[0:8], 'little')
+        if version == 1:
+            raw = data[24:24 + 520]
+        elif version == 2:
+            length = int.from_bytes(data[24:28], 'little')
+            raw = data[28:28 + length * 2]
+        else:
+            return None
+        return raw.decode('utf-16-le', errors='replace').split('\0', 1)[0]
+
+    def windows_path(self, path):
+        res = self.run(['wslpath', '-w', path])
+        if not res['success']:
+            raise ValueError('kein Windows-Pfad: ' + path)
+        return res['stdout'].strip()
+
+    @r.op("Im Windows-Papierkorb befindliche Elemente, die aus path geloescht wurden (recursive auch aus Unterordnern)",
+          result={'success': 'bool', 'message': 'str', 'items': 'list'})
+    def list_deleted_files(self, path: str = '.', recursive: bool = False):
+        path = os.path.abspath(path)
+        root = path
+        while not os.path.ismount(root) and root != '/':
+            root = os.path.dirname(root)
+        bin_dir = os.path.join(root, '$Recycle.Bin')
+        self.info(f"list_deleted_files: path={path}, mount={root}, papierkorb={bin_dir}")
+        if not os.path.isdir(bin_dir):
+            return self.fail('kein Papierkorb: ' + bin_dir)
+        try:
+            prefix = self.windows_path(path).rstrip('\\').lower() + '\\'
+        except ValueError as e:
+            self.info(f"list_deleted_files: wslpath fehlgeschlagen: {e}")
+            return self.fail(str(e))
+        self.info(f"list_deleted_files: Windows-Praefix {prefix}")
+        items = []
+        for sid in os.listdir(bin_dir):
+            sid_dir = os.path.join(bin_dir, sid)
+            try:
+                names = os.listdir(sid_dir)
+            except OSError as e:
+                self.info(f"list_deleted_files: {sid} nicht lesbar: {e}")
+                continue  # Papierkorb eines anderen Benutzers
+            self.info(f"list_deleted_files: {sid}: {sum(1 for n in names if n.startswith('$I'))} $I-Dateien")
+            for name in names:
+                if not name.startswith('$I'):
+                    continue
+                try:
+                    original = self.recycle_bin_original(os.path.join(sid_dir, name))
+                except OSError:
+                    continue
+                if original is None or not original.lower().startswith(prefix):
+                    continue
+                rel = original[len(prefix):]
+                if recursive or '\\' not in rel:
+                    items.append(rel.replace('\\', '/'))
+        self.info(f"list_deleted_files: {len(items)} Elemente aus {path}")
+        return self.success('ok', items=sorted(items))
 
     def execute_cmd(self, data):
         cmd = self.windows_exe('cmd')

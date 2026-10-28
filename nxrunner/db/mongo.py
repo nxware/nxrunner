@@ -37,7 +37,7 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
         self.ticker = None
         self.ticker_interval = 623
         self.define_vars('tick_count', 'ticker_interval')
-        self.define_sig(d.PStr('op', 'insert_one'), d.PStr('db', 'main'), d.PStr('collection', 'log'))
+        self.define_sig(d.PStr('op', 'insert_one'), d.PStr('db', 'main'), d.PStr('collection', 'log'), d.Param('row', 'dict'))
         self.define_sig(d.PStr('op', 'find'), d.Param('db', 'str'), d.Param('collection', 'str'), d.Param('q', 'dict'))
         self.define_sig(d.PStr('op', 'jobs'))
         self.define_sig(d.PStr('op', 'collect_files'))
@@ -148,11 +148,12 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
         return self.create_done_writer(data.get('emitter'))
 
     def execute_insert_one(self, data):
-        if 'row' in data:
-            row = data['row']
-        elif u.contains_like(data.keys(), r"row\_%"):
-            row = u.dict_extract_by_prefix(data, 'row_')
-        else:
+        """
+          row als dict/JSON (optional, leer = nicht gesetzt) und/oder row_<feld>=wert,
+          z.B. row_name=xy row_key=ds -> {name: xy, key: ds}; row_* ergaenzt bzw. ueberschreibt row
+        """
+        row = {**u.load_to_dict(data.get('row')), **u.dict_extract_by_prefix(data, 'row_')}
+        if not row:
             row = data
             row['debug_info'] = 'execute_insert_one from data'
         return self.success(result=str(self.insert_one(data['db'], data['collection'], row)))

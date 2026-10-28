@@ -13,6 +13,8 @@ from nwebclient import dev as d
 from nwebclient import NWebClient
 from nwebclient import NWebGroup
 
+from nxrunner.system import Wsl
+
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')
 
@@ -111,6 +113,8 @@ class NWebDir(r.BaseJobExecutor):
       op=image_executors             geladene ImageExecutoren des Dispatchers (type, cls)
       op=set_group group_id=...      Gruppe festlegen (self.g), leer = keine Gruppe
       op=name_ids                    an Dateien mit passendem Dokument in self.g _id_<id> anhaengen (a.jpg -> a_id_42.jpg)
+      op=sync_deleted                Dokumenten in self.g zu Dateien im Windows-Papierkorb (ueber den Wsl-Runner)
+                                     "[DEL] " vor den Titel setzen, Zuordnung wie bei name_ids
       Ist eine Gruppe festgelegt, zeigt die Dateiliste, ob es dort ein Dokument mit dem Dateinamen gibt
       (ohne Endung, siehe name_key). Dateien mit _id_<id> werden ueber die id zugeordnet (ok).
       Die Dateiliste (p.grid) zeigt die neuesten Dateien zuerst, sortierbar, mit Suche im Namen, PAGE_SIZE je Seite
@@ -129,13 +133,16 @@ class NWebDir(r.BaseJobExecutor):
     # andere Nummern bleiben verschieden (b_12345_ != b_12346_)
     COUNTER_RE = re.compile(r'_0000[12]_')
 
-    def __init__(self, path, group=None, instance=None):
-        super().__init__('nwebdir')
+    def __init__(self, path, type='nwebdir', group=None, instance=None, show_del):
+        super().__init__(type)
         self.define_vars('file_count')
         self.define_sig(d.PStr('op', 'files')).r(success='bool', message='str', value='list')
         self.define_sig(d.PStr('op', 'image_executors')).r(success='bool', message='str', value='list')
         self.define_sig(d.PStr('op', 'set_group'), d.PInt('group_id')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'name_ids')).r(success='bool', message='str', renamed='list', skipped='list')
+        self.define_sig(d.PStr('op', 'sync_deleted')).r(success='bool', message='str', marked='list',
+                                                         unmatched='list', skipped='list')
+        self.show_del = show_del
         self.c = NWebClient(instance)
         if group is not None:
             self.g = self.c.group(group)
@@ -247,6 +254,79 @@ class NWebDir(r.BaseJobExecutor):
         msg = f"{len(res['renamed'])} Dateien umbenannt" + (f", {len(res['skipped'])} uebersprungen" if res['skipped'] else '')
         return self.success(msg, ui_reload=True, **res)
 
+    DEL_PREFIX = '[DEL] '
+
+    def wsl(self) -> Wsl:
+        """ Wsl-Runner des Dispatchers (Tag wsl), sonst eine eigene Instanz """
+        disp = self.getParentClass(r.LazyDispatcher)
+        if disp is not None:
+            runners = disp.byTag('wsl')
+            if len(runners) > 0:
+                return runners[0]
+            runner = disp.get_runner('wsl')
+            if isinstance(runner, Wsl):
+                return runner
+        return Wsl()
+
+    def sync_deleted(self):
+        """
+          Dokumenten in self.g zu Dateien, die aus self.path in den Windows-Papierkorb geloescht wurden, DEL_PREFIX
+          vor den Titel setzen: {marked: [(datei, id)], unmatched: [...], skipped: [...]}
+          Zuordnung wie bei name_ids: ueber _id_<id>, sonst ueber name_key. Gibt es die Datei wieder, wird sie uebersprungen.
+        """
+        wsl = self.wsl()
+        self.info(f"sync_deleted: path={self.path}, Wsl-Runner {type(wsl).__name__} ({getattr(wsl, 'type', None)})")
+        res = wsl.list_deleted_files(self.path)
+        self.info(f"sync_deleted: list_deleted_files -> success={res.get('success')}, message={res.get('message')}, "
+                  f"{len(res.get('items', []))} Elemente: {res.get('items', [])[:20]}")
+        if not res['success']:
+            raise RuntimeError(res['message'])
+        _, by_id = self.group_docs()
+        # alle Dokumente je Schluessel (group_docs merkt sich nur das erste)
+        by_key = {}
+        for doc in by_id.values():
+            keys = {self.name_key(k) for k in (doc.get('name', None), doc.get('title', None)) if k}
+            for key in keys:
+                by_key.setdefault(key, []).append(doc)
+        self.info(f"sync_deleted: Gruppe {self.g.title()}: {len(by_id)} Dokumente, {len(by_key)} Schluessel: "
+                  f"{list(by_key)[:20]}")
+        marked, unmatched, skipped = [], [], []
+        for name in res['items']:
+            if os.path.exists(os.path.join(self.path, name)):
+                self.info(f"sync_deleted: {name}: existiert wieder")
+                skipped.append(f'{name}: existiert wieder')
+                continue
+            key, fid = self.split_id(name)
+            key = self.normalize(key)
+            # ueber die id, sonst (auch wenn die id nicht in der Gruppe ist) alle Dokumente mit dem normalisierten Namen
+            docs = [by_id[fid]] if fid in by_id else by_key.get(key, [])
+            self.info(f"sync_deleted: {name}: key={key}, id={fid}, docs={[doc.id() for doc in docs]}")
+            if not docs:
+                unmatched.append(name)
+                continue
+            for doc in docs:
+                title = str(doc.title() or '')
+                if title.startswith(self.DEL_PREFIX.strip()):
+                    self.info(f"sync_deleted: {name}: Dokument {doc.id()} bereits markiert ({title})")
+                    skipped.append(f'{name}: Dokument {doc.id()} bereits markiert')
+                    continue
+                self.info(f"sync_deleted: {name}: setTitle({self.DEL_PREFIX + title}) fuer Dokument {doc.id()}")
+                doc.setTitle(self.DEL_PREFIX + title)
+                marked.append((name, doc.id()))
+        self.info(f"sync_deleted: {len(marked)} markiert, {len(unmatched)} ohne Dokument, {len(skipped)} uebersprungen")
+        return {'marked': marked, 'unmatched': unmatched, 'skipped': skipped}
+
+    def execute_sync_deleted(self, data):
+        if self.g is None:
+            return self.fail('Keine Gruppe festgelegt')
+        try:
+            res = self.sync_deleted()
+        except Exception as e:
+            self.info(f"sync_deleted: Fehler {type(e).__name__}: {e}")
+            return self.fail(f'{type(e).__name__}: {e}')
+        msg = f"{len(res['marked'])} Dokumente markiert, {len(res['unmatched'])} ohne Dokument"
+        return self.success(msg, ui_reload=True, **res)
+
     def part_index(self, p: base.Page, params={}):
         with p.section(h="Auswahl"):
             try:
@@ -256,6 +336,7 @@ class NWebDir(r.BaseJobExecutor):
                                                                   'group_id': '#group_id'}))
                 if self.g is not None:
                     p(self.action_btn_parametric("Name IDs", {'type': self.type, 'op': 'name_ids'}))
+                    if (self.show_del)p(self.action_btn_parametric("Sync Deleted", {'type': self.type, 'op': 'sync_deleted'}))
             except Exception as e:
                 p.alert_error("Gruppen nicht abrufbar: " + w.s(e))
             executors = self.image_executors()
