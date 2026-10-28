@@ -336,7 +336,8 @@ class NWebDir(r.BaseJobExecutor):
                                                                   'group_id': '#group_id'}))
                 if self.g is not None:
                     p(self.action_btn_parametric("Name IDs", {'type': self.type, 'op': 'name_ids'}))
-                    if (self.show_del)p(self.action_btn_parametric("Sync Deleted", {'type': self.type, 'op': 'sync_deleted'}))
+                    if self.show_del:
+                        p(self.action_btn_parametric("Sync Deleted", {'type': self.type, 'op': 'sync_deleted'}))
             except Exception as e:
                 p.alert_error("Gruppen nicht abrufbar: " + w.s(e))
             executors = self.image_executors()
