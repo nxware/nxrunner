@@ -133,7 +133,7 @@ class NWebDir(r.BaseJobExecutor):
     # andere Nummern bleiben verschieden (b_12345_ != b_12346_)
     COUNTER_RE = re.compile(r'_0000[12]_')
 
-    def __init__(self, path, type='nwebdir', group=None, instance=None, show_del):
+    def __init__(self, path, type='nwebdir', group=None, instance=None, show_del=True):
         super().__init__(type)
         self.define_vars('file_count')
         self.define_sig(d.PStr('op', 'files')).r(success='bool', message='str', value='list')
