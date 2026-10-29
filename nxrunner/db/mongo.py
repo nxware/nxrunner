@@ -79,21 +79,6 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
         self.tick_count += 1
         self.execute_jobs()
 
-    def has_crypt(self) -> bool:
-        return 'crypt' in self.getRoot().jobexecutor
-
-    def encrypt(self, value: str) -> str:
-        res = self.getRoot().jobexecutor.execute(dict(type='crypt', op='encrypt', value=value))
-        if not res.get('success', False):
-            raise Exception(res.get('message', 'encrypt failed'))
-        return res['value']
-
-    def decrypt(self, c: str) -> str:
-        res = self.getRoot().jobexecutor.execute(dict(type='crypt', op='decrypt', c=c))
-        if not res.get('success', False):
-            raise Exception(res.get('message', 'decrypt failed'))
-        return res['value']
-
     def list_database_names(self):
         return self.client.list_database_names()
 
