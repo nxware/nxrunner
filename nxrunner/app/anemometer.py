@@ -4,11 +4,14 @@ Kalibrierung eines Heizdraht-Anemometers.
 Benoetigte Runner:
     m5        EspM5 (nxrunner.devices.esp_m5) mit AS5600, misst die Drehzahl der Scheibe
     esphome   EspHomeDevice
-    ads       ADC mit der Methode read_a(channel), liest die Spannung des Anemometers
+    ads       ADC mit 3 analogen Signalen (Kanal channel bis channel+2), erkannt an der Signatur
+              {"read_a": 1, "channel": n} -> {"value": ...}, z.B. nxbot.i2c.ADS oder ein EspHomeDevice
+              mit den Entities analog_a0, analog_a1 und analog_a2
 
     Config (runners):
         anemometer: nxrunner.app.anemometer:AnemometerKalibrierung()
         anemometer: nxrunner.app.anemometer:AnemometerKalibrierung(m5="m5_multi", esphome="esphome", ads="ads", channel=0)
+        anemometer: nxrunner.app.anemometer:AnemometerKalibrierung(ads="esp-anemometer")   EspHomeDevice als ADC
 
     Ohne Angabe wird der erste passende (bereits geladene) Runner verwendet, auf der Seite kann ein anderer gewaehlt
     werden. Sind alle drei vorhanden, fuehrt der Button Kalibrierung auf page=calibration.
@@ -36,8 +39,12 @@ class AnemometerKalibrierung(r.BaseJobExecutor):
     ROLES = {
         'm5': ("EspM5 (Drehzahl der Scheibe)", lambda x: isinstance(x, EspM5)),
         'esphome': ("EspHomeDevice", lambda x: any(c.__name__ == 'EspHomeDevice' for c in type(x).__mro__)),
-        'ads': ("ADS (read_a)", lambda x: callable(getattr(x, 'read_a', None))),
+        'ads': ("ADC, 3 analoge Signale (read_a)",
+                lambda x: any('read_a' in s and 'channel' in s for s in getattr(x, 'signatures', []))),
     }
+
+    """ Anzahl der analogen Signale des Anemometers """
+    CHANNELS = 3
 
     """ Abstand des Sensors zur Drehachse (Radius) in cm """
     distance = 15
@@ -46,8 +53,8 @@ class AnemometerKalibrierung(r.BaseJobExecutor):
         """
         :param m5: Name des EspM5-Runners, ohne Angabe der erste passende
         :param esphome: Name des EspHomeDevice-Runners, ohne Angabe der erste passende
-        :param ads: Name des Runners mit read_a(channel), ohne Angabe der erste passende
-        :param channel: Kanal des ADS fuer das Anemometer
+        :param ads: Name des Runners mit der Signatur read_a, ohne Angabe der erste passende
+        :param channel: erster der 3 Kanaele des ADC fuer das Anemometer
         """
         super().__init__(type)
         self.m5 = m5
@@ -101,6 +108,16 @@ class AnemometerKalibrierung(r.BaseJobExecutor):
 
     # --- Messung ------------------------------------------------------------------------------
 
+    def channels(self) -> list:
+        return [self.channel + i for i in range(self.CHANNELS)]
+
+    def read_analog(self, ads, channel):
+        """ Liest einen Kanal ueber den Job read_a (Signatur), damit funktionieren ADS und EspHomeDevice gleich """
+        res = ads.execute({'type': ads.type, 'read_a': 1, 'channel': channel})
+        if not res.get('success', False):
+            raise ValueError(res.get('message', 'read_a fehlgeschlagen'))
+        return res['value']
+
     def get_speed(self, rpm):
         """ Geschwindigkeit in m/s des Sensors auf der Scheibe, Umfang bei distance (cm) mal Umdrehungen je Sekunde """
         return 2 * math.pi * float(self.distance) / 100 * float(rpm) / 60
@@ -139,12 +156,17 @@ class AnemometerKalibrierung(r.BaseJobExecutor):
         m5, esphome, ads = self.runner('m5'), self.runner('esphome'), self.runner('ads')
         with p.section(h='Kalibrierung'):
             p.div(f'EspM5: {html.escape(m5.type)}, EspHomeDevice: {html.escape(esphome.type)}, '
-                  f'ADS: {html.escape(ads.type)} Kanal {self.channel}')
+                  f'ADC: {html.escape(ads.type)} Kanal {self.channel}-{self.channel + self.CHANNELS - 1}')
             p.div(f'Drehzahl: {html.escape(str(m5.rpm))} rpm')
             if m5.rpm is not None:
                 p.div(f'Geschwindigkeit: {self.get_speed(m5.rpm):.2f} m/s (Abstand {self.distance:g} cm)')
-            try:
-                p.div(f'ADS: {html.escape(str(ads.read_a(channel=self.channel)))}')
-            except Exception as e:
-                p.alert_error(f'ADS: {html.escape(type(e).__name__)}: {html.escape(str(e))}')
+            for channel in self.channels():
+                try:
+                    p.div(f'A{channel}: {html.escape(str(self.read_analog(ads, channel)))}')
+                except Exception as e:
+                    p.alert_error(f'A{channel}: {html.escape(type(e).__name__)}: {html.escape(str(e))}')
             p(w.a('Zurück', self.link(self.part_index)))
+            # TODO Start Button -> RPM Langsam erhöhen RPM Channel 0..2 in einem Graph darstellen und speichern
+            # TODO einstellung für Start um werte langsam zu steigern
+            # TODO auswertung aus channel 0..2 soll abgeleitet werden wie schnell sich das Messgerät bewegt bzw. die Wind geschwindigkeit
+            # TODO fehlerquote berechnen
