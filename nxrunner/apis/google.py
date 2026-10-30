@@ -65,13 +65,16 @@ class CalendarAPI(r.BaseJobExecutor):
         self.flow = None  # laufende OAuth-Anmeldung
         self.auth_link = None
         self.define_vars('calendar_id', 'days')
-        self.define_sig(d.PStr('op', 'calendars')).r(success='bool', value='list')
-        self.define_sig(d.PStr('op', 'colors')).r(success='bool', value='dict')
-        self.define_sig(d.PStr('op', 'events'), d.PStr('calendar_id', calendar_id), d.PInt('days', self.days)).r(success='bool', value='list')
+        self.define_sig(d.PStr('op', 'calendars')).r(success='bool', message='str', value='list')
+        self.define_sig(d.PStr('op', 'colors')).r(success='bool', message='str', value='dict')
+        self.define_sig(d.PStr('op', 'events'), d.PStr('calendar_id', calendar_id), d.PInt('days', self.days),
+                        d.PStr('q', ''), d.PInt('max', 50)).r(success='bool', message='str', value='list')
         self.define_sig(d.PStr('op', 'create'), d.PStr('summary', ''), d.PStr('start', ''), d.PStr('end', ''),
-                        d.PStr('color_id', '')).r(success='bool', message='str', value='dict')
-        self.define_sig(d.PStr('op', 'set_color'), d.PStr('event_id', ''), d.PStr('color_id', '')).r(success='bool', message='str')
-        self.define_sig(d.PStr('op', 'delete'), d.PStr('event_id', '')).r(success='bool', message='str')
+                        d.PStr('color_id', ''), d.PStr('description', ''), d.PStr('location', ''),
+                        d.PStr('calendar_id', '')).r(success='bool', message='str', value='dict')
+        self.define_sig(d.PStr('op', 'set_color'), d.PStr('event_id', ''), d.PStr('color_id', ''),
+                        d.PStr('calendar_id', '')).r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'delete'), d.PStr('event_id', ''), d.PStr('calendar_id', '')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'set_calendar'), d.PStr('calendar_id', '')).r(success='bool', message='str')
 
     # --- Anmeldung ----------------------------------------------------------------------------

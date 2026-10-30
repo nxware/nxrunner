@@ -23,6 +23,8 @@ class Backup(r.BaseJobExecutor):
                 paramiko); je Quelle optional pre_script/post_script (bei ssh auf dem entfernten Rechner)
       Ziele:    drive (Laufwerksname wie in nfile + Pfad auf dem Medium), drive_zip (wie drive, aber in eine
                 ZIP-Datei <Quelle>.zip, jeder Lauf schreibt sie neu, keep = Anzahl alter Versionen), smb (\\\\host\\share\\pfad)
+                drive_zip_crypt, smb_zip_crypt: ZIP lokal erzeugen, mit dem CryptRunner crypt verschluesseln
+                (encrypt_stream_file) und als <Quelle>.zip.nxc ins Ziel schieben, lokale Zwischendateien werden geloescht
 
       Eine Quelle kann mehrere Ziele haben (Tabelle backup_source_destination) und hat eine Haeufigkeit
       (interval_s, 0 = nur manuell). Faellig ist jedes Ziel einer Quelle fuer sich, letzter Lauf und Status

@@ -111,7 +111,11 @@ Backup-System aus Quellen und Zielen, gespeichert in der nweb-Persistence (Arg `
   Rechner).
 - **Ziele:** `drive` (Laufwerksname wie in NFile + Pfad auf dem Medium), `drive_zip` (wie `drive`, aber als ZIP
   `<Quelle>.zip`, jeder Lauf schreibt sie neu, `keep` = Anzahl alter Versionen), `smb` (`\\host\share\pfad`,
-  benötigt `smbprotocol`).
+  benötigt `smbprotocol`), `drive_zip_crypt` und `smb_zip_crypt` (ZIP wird lokal erzeugt, mit dem CryptRunner
+  `crypt` per `encrypt_stream_file` verschlüsselt und als `<Quelle>.zip.nxc` ins Ziel geschoben; lokale
+  Zwischendateien werden gelöscht, `drive_zip_crypt` unterstützt `keep`). Ohne geladenen `crypt`-Runner schlägt der
+  Lauf mit einer Fehlermeldung fehl. Entschlüsseln mit `op=decrypt_stream_file` oder dem Upload-Formular des
+  CryptRunners.
 
 Eine Quelle kann mehrere Ziele haben und hat eine Häufigkeit (`interval_s`, `0` = nur manuell). Fällig ist jedes
 Ziel einer Quelle für sich. Die Dateien landen unter `<Ziel>/<Name der Quelle>/<relativer Pfad>`. Gesichert wird
@@ -147,9 +151,28 @@ ausgeführt.
 | `c=<base64>` (ohne `op`) | Job entschlüsseln und ausführen |
 | `op=encrypt value=text` | Text verschlüsseln, Ergebnis in `value` |
 | `op=decrypt c=<base64>` | entschlüsseln, Klartext in `value` |
+| `op=encrypt_file data=<base64> filename=x` | Dateiinhalt verschlüsseln, Fernet-Token Base64-kodiert in `value`, `filename=x.enc` |
+| `op=decrypt_file data=<base64> filename=x.enc` | Datei (Fernet-Token) entschlüsseln, Inhalt Base64-kodiert in `value`, `filename=x` |
+| `op=encrypt_stream_file infile=x [outfile=x.nxc] [overwrite=1]` | Datei auf dem Server streamend verschlüsseln (AES-256-GCM, 1-MiB-Blöcke), Ergebnis `outfile`, `size` |
+| `op=decrypt_stream_file infile=x.nxc [outfile=x] [overwrite=1]` | mit `encrypt_stream_file` verschlüsselte Datei entschlüsseln |
 | `op=encrypt_job data={...} cjob={...} cjob_key=c` | `data` (oder Felder `data_*`) verschlüsseln, als `cjob[cjob_key]` einsetzen und `cjob` ausführen |
 
-**Achtung:** `op=encrypt` und `op=decrypt` sind für jeden nutzbar, der die API erreicht.
+`data` darf auch eine Data-URL (`data:...;base64,...`) sein. In der UI lässt sich eine Datei auswählen, das
+Ergebnis wird direkt heruntergeladen. Verschlüsselte Dateien sind kompatibel zu `CryptMixin.encrypt_file`/`decrypt_file`.
+
+Für große Dateien sind `encrypt_stream_file`/`decrypt_stream_file` effizienter: Sie arbeiten direkt auf Pfaden des
+Servers, ohne Upload und Base64, und halten immer nur einen 1-MiB-Block im Speicher. Der AES-Schlüssel wird per HKDF
+aus dem Fernet-Schlüssel in `key_file` abgeleitet. Das Format (`NXC1`-Header, Blöcke mit Zähler und
+Letzter-Block-Flag in der Nonce) erkennt vertauschte, veränderte und abgeschnittene Blöcke. Ausgabe wird erst
+nach Erfolg geschrieben (über `<outfile>.part`), bestehende Dateien nur mit `overwrite=1` ersetzt.
+
+Für große Dateien vom eigenen Rechner gibt es in der UI ein Upload-Formular (mit Fortschrittsanzeige). Es
+schickt die Datei als Multipart-POST an `/pysys/dispatcher?type=crypt&crypt=stream_upload&mode=encrypt|decrypt`
+(Feld `file`). Der Server ver- bzw. entschlüsselt im selben `.nxc`-Format über eine temporäre Datei und liefert das
+Ergebnis als Download, bei Fehlern Status 400 mit der Meldung als Text.
+
+**Achtung:** `op=encrypt`, `op=decrypt` und die Datei-Ops sind für jeden nutzbar, der die API erreicht; die
+Stream-Ops lesen und schreiben dabei beliebige Pfade, auf die der Runner-Prozess Zugriff hat.
 
 ### Smb
 

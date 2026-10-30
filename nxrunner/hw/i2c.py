@@ -37,13 +37,22 @@ class JoystickM5(r.BaseJobExecutor):
         self.jobdef = None
         self.jobdef_x_name = None
 
-        self.define_sig(d.PStr("op", "read"))
+        self.define_sig(d.PStr("op", "read")).set_description(
+            "Achsen (8 und 16 Bit), Taster (0 = gedrueckt), Firmware, Bootloader und I2C-Adresse"
+        ).r(success='bool', message='str', x16='int', y16='int', x='int', y='int', button='int',
+            firmware='int', bootloader='int', address='str')
         self.define_sig(
             d.PStr("op", "rgb"),
             d.Param("r", "int"),
             d.Param("g", "int"),
             d.Param("b", "int")
-        )
+        ).set_description("Farbe der LED setzen (0-255 je Kanal)").r(success='bool', message='str')
+        self.define_sig(
+            d.PStr("op", "setaction"),
+            d.PStr("jobdef"),
+            d.PStr("x_var")
+        ).set_description("Alle 0,5 s den Job jobdef mit dem X-Wert (8 Bit) in x_var ausfuehren").r(
+            success='bool', message='str')
 
     # ------------------------------------------------------------------
     # low level
@@ -143,16 +152,16 @@ class JoystickM5(r.BaseJobExecutor):
         x16, y16 = self.get_adc_16bit_xy()
         x8, y8 = self.get_adc_8bit_xy()
 
-        return self.success({
-            "x16": x16,
-            "y16": y16,
-            "x": x8,
-            "y": y8,
-            "button": self.get_button(), # 0 für pressed
-            "firmware": self.get_firmware_version(),
-            "bootloader": self.get_bootloader_version(),
-            "address": hex(self.get_i2c_address())
-        })
+        return self.success(
+            x16=x16,
+            y16=y16,
+            x=x8,
+            y=y8,
+            button=self.get_button(),  # 0 für pressed
+            firmware=self.get_firmware_version(),
+            bootloader=self.get_bootloader_version(),
+            address=hex(self.get_i2c_address())
+        )
 
     def execute_rgb(self, data):
 
@@ -202,6 +211,7 @@ class JoystickM5(r.BaseJobExecutor):
         self.jobdef_x_name = x_var
         if self.ticker is None:
             self.ticker = self.periodic(0.5, self.tick)
+        return self.success()
 
     def part_bind(self, p: b.Page, params={}):
         p("Set Actions")

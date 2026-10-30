@@ -18,6 +18,7 @@ import time
 
 from nwebclient import runner as r, base
 from nwebclient import web as w
+from nwebclient import dev as d
 
 
 class RfcommTransport:
@@ -118,6 +119,22 @@ class BluetoothDevice(r.BaseJobExecutor):
         self.scan_results = {}
         self.last_bt_output = ''
         self.last_error = None
+        self.define_sig(d.PStr('op', 'set_address'), d.PStr('address')).set_description(
+            "Bluetooth-Adresse des Geraets setzen").r(success='bool', message='str', address='str')
+        self.define_sig(d.PStr('op', 'bt_power')).set_description(
+            "Bluetooth einschalten (bluetoothctl power on)").r(success='bool', message='str', output='str')
+        self.define_sig(d.PStr('op', 'bt_scan'), d.PInt('duration', 10)).set_description(
+            "Geraete suchen (duration in s)").r(success='bool', message='str', devices='list')
+        self.define_sig(d.PStr('op', 'bt_disconnect'), d.PStr('address')).set_description(
+            "Verbindung zum Geraet trennen").r(success='bool', message='str', output='str')
+        self.define_sig(d.PStr('op', 'bt_device_info'), d.PStr('address')).set_description(
+            "bluetoothctl info zum Geraet").r(success='bool', message='str', output='str')
+        f = self.define_sig(d.PStr('op', 'bt_pair'), d.PStr('address')).set_description(
+            "Geraet koppeln, vertrauen und als Adresse setzen")
+        f.r_success(address='str', output='str')
+        f.r_fail(address='str', output='str')
+        self.define_sig(d.PStr('op', 'bt_remove'), d.PStr('address')).set_description(
+            "Kopplung entfernen").r(success='bool', message='str', output='str')
 
     def is_target_device(self, name):
         """ Ueberschreiben, um passende Geraete in der Liste hervorzuheben """

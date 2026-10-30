@@ -122,10 +122,22 @@ class NimbotB1(BluetoothDevice):
         self.height_mm = int(args.get('nimbot_height_mm', height_mm))
         self.density = int(args.get('nimbot_density', density))
         self.buffer = bytearray()
-        self.define_sig(d.PStr('op', 'print_text'), d.Param('text', 'str'))
-        self.define_sig(d.PStr('op', 'print_image'), d.Param('file', 'str'))
-        self.define_sig(d.PStr('op', 'print_image'), d.Param('image', 'str'))
-        self.define_sig(d.PStr('op', 'info'))
+        self.define_sig(d.PStr('op', 'print_text'), d.Param('text', 'str'), d.PInt('font_size', 0),
+                        *self.print_params()).set_description(
+            "Text als Etikett drucken (font_size 0 = automatisch)").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'print_image'), d.Param('file', 'str'), *self.print_params()).set_description(
+            "Bilddatei auf dem Server drucken").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'print_image'), d.Param('image', 'str'), *self.print_params()).set_description(
+            "Bild drucken: URL, Base64 oder data:-URL").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'info')).set_description(
+            "Akku, Seriennummer, Software- und Hardware-Version").r(
+            success='bool', message='str', battery='int', serial='str', software_version='float',
+            hardware_version='float')
+
+    @staticmethod
+    def print_params():
+        """ optionale Parameter der Druck-Ops, siehe print_opts """
+        return (d.PStr('label', ''), d.PInt('quantity', 1), d.PInt('density', 0), d.PInt('rotate', 0))
 
     def is_target_device(self, name):
         return name.upper().startswith('B1')

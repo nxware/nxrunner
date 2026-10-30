@@ -1,6 +1,7 @@
 import os
 import shutil
 import socket
+import tempfile
 
 
 class Destination:
@@ -164,6 +165,7 @@ class DriveDestinationZip(DriveDestination):
     TITLE = 'Laufwerk (ZIP)'
     FIELDS = ['drive', 'path', 'keep']
     INCREMENTAL = False
+    SUFFIX = '.zip'
 
     def __init__(self, row: dict, backup=None):
         super().__init__(row, backup)
@@ -173,23 +175,27 @@ class DriveDestinationZip(DriveDestination):
         self.tmp = None
 
     def describe(self):
-        text = self.drive + ':/' + (self.path.strip('/') + '/' if self.path.strip('/') else '') + '<Quelle>.zip'
+        text = self.drive + ':/' + (self.path.strip('/') + '/' if self.path.strip('/') else '') + '<Quelle>' + self.SUFFIX
         return text + (f', {self.keep} alte Versionen' if self.keep else '')
 
     def open(self, source):
-        import zipfile
         super().open(source)
         # super().open liefert <Pfad>/<Quelle> als Verzeichnis, hier wird daraus <Pfad>/<Quelle>.zip
-        self.target = self.root + '.zip'
+        self.target = self.root + self.SUFFIX
         os.makedirs(os.path.dirname(self.target), exist_ok=True)
         self.tmp = self.target + '.nxbackup.tmp'
-        self.zip = zipfile.ZipFile(self.tmp, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True)
+        self.zip = self.open_zip(self.tmp)
+
+    @staticmethod
+    def open_zip(path):
+        import zipfile
+        return zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True)
 
     def copy(self, rel, full, st):
         self.zip.write(full, arcname=rel)
 
     def version(self, n):
-        return self.target[:-len('.zip')] + f'.{n}.zip'
+        return self.target[:-len(self.SUFFIX)] + f'.{n}' + self.SUFFIX
 
     def rotate(self):
         """ vorige Versionen weiterschieben, die aelteste ueber keep hinaus entfaellt """
@@ -291,7 +297,144 @@ class SmbDestination(Destination):
         self.smb = None
 
 
-DESTINATIONS = {c.KIND: c for c in [DriveDestination, DriveDestinationZip, SmbDestination]}
+class ZipCryptMixin:
+    """
+      ZIP-Sicherung, verschluesselt mit dem CryptRunner crypt (op encrypt_stream_file, AES-256-GCM, .zip.nxc):
+      Die ZIP entsteht lokal in einer temporaeren Datei, wird bei commit() verschluesselt und die verschluesselte
+      Datei dann ins Ziel geschoben. Lokale Zwischendateien werden immer geloescht (auch nach Fehlern).
+      Entschluesseln z.B. mit op=decrypt_stream_file oder dem Upload-Formular des crypt-Runners.
+    """
+
+    SUFFIX = '.zip.nxc'
+    local_zip = None
+    local_enc = None
+
+    def crypt_executor(self):
+        root = self.backup.getRoot()
+        executor = getattr(root, 'jobexecutor', root)
+        if 'crypt' not in executor:
+            raise RuntimeError('CryptRunner crypt nicht verfuegbar, verschluesselte Sicherung nicht moeglich')
+        return executor
+
+    def open_local_zip(self):
+        self.crypt_executor()  # vor dem Packen pruefen, nicht erst beim commit
+        fd, self.local_zip = tempfile.mkstemp(prefix='nxbackup_', suffix='.zip')
+        os.close(fd)
+        self.local_enc = None
+        self.zip = DriveDestinationZip.open_zip(self.local_zip)
+
+    def encrypt_local(self):
+        """ ZIP abschliessen und verschluesseln, :return: Pfad der lokalen verschluesselten Datei """
+        self.zip.close()
+        self.zip = None
+        self.local_enc = self.local_zip + '.nxc'
+        res = self.crypt_executor().execute(dict(type='crypt', op='encrypt_stream_file', infile=self.local_zip,
+                                                 outfile=self.local_enc, overwrite=True))
+        self.remove_local()
+        if not res.get('success'):
+            raise RuntimeError('Verschluesselung fehlgeschlagen: ' + str(res.get('message')))
+        return self.local_enc
+
+    def remove_local(self, enc=False):
+        """ lokale ZIP loeschen, mit enc=True auch die verschluesselte Datei """
+        for name in (['local_zip', 'local_enc'] if enc else ['local_zip']):
+            path = getattr(self, name)
+            if path is not None and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            setattr(self, name, None)
+
+    def close_local(self):
+        if self.zip is not None:
+            try:
+                self.zip.close()
+            except Exception:
+                pass
+            self.zip = None
+        self.remove_local(enc=True)
+
+
+class DriveDestinationZipCrypt(ZipCryptMixin, DriveDestinationZip):
+    """
+      Wie DriveDestinationZip, aber verschluesselt: <Pfad>/<Name der Quelle>.zip.nxc (alte Versionen <Name>.1.zip.nxc ...).
+      Die ZIP entsteht lokal, auf das Laufwerk kommt nur die verschluesselte Datei.
+    """
+
+    KIND = 'drive_zip_crypt'
+    TITLE = 'Laufwerk (ZIP, verschlüsselt)'
+
+    def open(self, source):
+        DriveDestination.open(self, source)
+        self.target = self.root + self.SUFFIX
+        os.makedirs(os.path.dirname(self.target), exist_ok=True)
+        self.tmp = self.target + '.nxbackup.tmp'
+        self.open_local_zip()
+
+    def commit(self):
+        local = self.encrypt_local()
+        shutil.copyfile(local, self.tmp)
+        self.remove_local(enc=True)
+        self.rotate()
+        os.replace(self.tmp, self.target)
+        self.tmp = None
+
+    def close(self):
+        self.close_local()
+        super().close()
+
+
+class SmbDestinationZipCrypt(ZipCryptMixin, SmbDestination):
+    """
+      SMB-Freigabe, gesichert wird verschluesselt nach \\\\host\\share\\pfad\\<Name der Quelle>.zip.nxc.
+      Die ZIP entsteht lokal, hochgeladen wird nur die verschluesselte Datei (erst als .nxbackup.tmp, dann
+      umbenannt, damit eine halbe Sicherung nicht die vorige ersetzt).
+    """
+
+    KIND = 'smb_zip_crypt'
+    TITLE = 'SMB (ZIP, verschlüsselt)'
+    INCREMENTAL = False
+
+    def __init__(self, row: dict, backup=None):
+        super().__init__(row, backup)
+        self.zip = None
+        self.target = None
+
+    def describe(self):
+        return super().describe().rstrip('\\') + '\\<Quelle>' + self.SUFFIX
+
+    def open(self, source):
+        super().open(source)
+        # super().open liefert /share/pfad/<Quelle> als Verzeichnis, hier wird daraus /share/pfad/<Quelle>.zip.nxc
+        self.target = self.base + self.SUFFIX
+        self.open_local_zip()
+
+    def copy(self, rel, full, st):
+        self.zip.write(full, arcname=rel)
+
+    def commit(self):
+        local = self.encrypt_local()
+        self.makedirs(self.target.rsplit('/', 1)[0])
+        tmp = self.smb._build_path(self.target + '.nxbackup.tmp')
+        try:
+            self.smb.copy_to_remote(local, self.target + '.nxbackup.tmp')
+            self.remove_local(enc=True)
+            self.smb.client.replace(tmp, self.smb._build_path(self.target))
+        except BaseException:
+            try:
+                self.smb.client.remove(tmp)
+            except Exception:
+                pass
+            raise
+
+    def close(self):
+        self.close_local()
+        super().close()
+
+
+DESTINATIONS = {c.KIND: c for c in [DriveDestination, DriveDestinationZip, DriveDestinationZipCrypt, SmbDestination,
+                                    SmbDestinationZipCrypt]}
 
 
 def create_destination(row: dict, backup=None) -> Destination:

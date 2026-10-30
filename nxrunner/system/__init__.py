@@ -6,6 +6,7 @@ import subprocess
 from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import web as w
+from nwebclient import dev as d
 
 
 class Wsl(r.BaseJobExecutor):
@@ -32,6 +33,22 @@ class Wsl(r.BaseJobExecutor):
         super().__init__(type)
         self.timeout = int(timeout)
         self.define_vars('timeout')
+        run_result = dict(success='bool', message='str', returncode='int', stdout='str', stderr='str')
+        self.define_sig(d.PStr('op', 'mount'), d.PStr('drive'), d.PStr('mountpoint', '')).set_description(
+            "Windows-Laufwerk per drvfs mounten (mountpoint leer = /mnt/<laufwerk>)").r(mountpoint='str', **run_result)
+        self.define_sig(d.PStr('op', 'mount'), d.PStr('share'), d.PStr('mountpoint')).set_description(
+            "Netzwerkfreigabe (\\\\server\\share) per drvfs mounten").r(mountpoint='str', **run_result)
+        self.define_sig(d.PStr('op', 'umount'), d.PStr('mountpoint', ''), d.PStr('drive', '')).set_description(
+            "Mountpoint oder Laufwerk aushaengen").r(**run_result)
+        self.define_sig(d.PStr('op', 'mounts')).set_description(
+            "drvfs-/9p-Mounts (source, mountpoint, fstype)").r(success='bool', message='str', value='list')
+        self.define_sig(d.PStr('op', 'drives')).set_description(
+            "Windows-Laufwerksbuchstaben (C:, D:, ...)").r(value='list', **run_result)
+        self.define_sig(d.PStr('op', 'volumes')).set_description(
+            "Windows-Laufwerke mit Volume-Label und Freigabepfad {D: {label, provider}}").r(
+            success='bool', message='str', value='dict')
+        self.define_sig(d.PStr('op', 'cmd'), d.PStr('cmd'), d.PInt('timeout', 0)).set_description(
+            "Befehl auf der Windows cmd ausfuehren (timeout 0 = Standard)").r(**run_result)
 
     @staticmethod
     def is_wsl():

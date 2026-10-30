@@ -10,6 +10,7 @@ from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import web as w
 from nwebclient import util as u
+from nwebclient import dev as d
 
 
 from nxrunner.system import Wsl
@@ -62,6 +63,26 @@ class NFile(r.BaseJobExecutor):
         self.volume_cache = None  # (zeitpunkt, volumes)
         self.volume_thread = None
         self.define_vars('search_limit')
+        self.define_sig(d.PStr('op', 'drives')).set_description(
+            "Laufwerke mit Name, Mountpoint und Herkunft des Namens").r(success='bool', message='str', value='list')
+        self.define_sig(d.PStr('op', 'update_drives')).set_description(
+            "Alle Windows-Laufwerke ueber den Wsl-Runner mounten (nur WSL)").r(
+            success='bool', message='str', value='list', drives='list')
+        self.define_sig(d.PStr('op', 'index'), d.PStr('drive', ''), d.PStr('path', ''),
+                        d.PStr('exclude', '')).set_description(
+            "Laufwerk (leer = alle mit nweb.ini) im Hintergrund indexieren, path nur mit drive, exclude: a,b").r(
+            success='bool', message='str', drives='list', path='str', exclude='list')
+        self.define_sig(d.PStr('op', 'status')).set_description(
+            "Fortschritt der Indexierung je Laufwerk").r(success='bool', message='str', running='bool', value='dict')
+        self.define_sig(d.PStr('op', 'wipe'), d.PStr('drive')).set_description(
+            "Index eines Laufwerks loeschen").r(success='bool', message='str', count='int')
+        self.define_sig(d.PStr('op', 'index_list')).set_description(
+            "Alle Laufwerke im Index mit Anzahl Dateien und letzter Indexierung").r(
+            success='bool', message='str', value='list')
+        self.define_sig(d.PStr('op', 'search'), d.PStr('q'), d.PStr('drive', ''), d.PInt('limit', 0)).set_description(
+            "Dateien, deren Name q enthaelt (limit 0 = search_limit)").r(success='bool', message='str', value='list')
+        self.define_sig(d.PStr('op', 'ls'), d.PStr('drive'), d.PStr('path', '')).set_description(
+            "Verzeichnisinhalt (name, dir), Verzeichnisse zuerst").r(success='bool', message='str', value='list')
 
     # --- nweb-Persistence ---
 

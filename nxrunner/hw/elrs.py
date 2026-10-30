@@ -16,7 +16,7 @@ class Binding:
     job_data: dict
 
     def __init__(self, data):
-        self.channel = data['channel']
+        self.channel = int(data['channel'])
         self.mode = data['mode']
         self.value_name = data['value_name']
         self.job_data = u.load_to_dict(data['job_data'])
@@ -36,12 +36,7 @@ class Binding:
 
     @classmethod
     def from_dict(cls, data):
-        return cls(
-            channel=data["channel"],
-            mode=data["mode"],
-            value_name=data["value_name"],
-            job_data=data["job_data"]
-        )
+        return cls(data)
 
     def execute_from_array(self, channels, job_callback):
         pwm = channels[self.channel]
@@ -93,6 +88,20 @@ class ElrsDisplay(r.BaseJobExecutor):
         self.bindings = list(map(Binding.from_dict, args.get('elrs_bindings', [])))
         self.auto_fetch_interval = 1
         self.threads = {}
+        self.define_sig(d.PStr('op', 'fetch'), d.PStr('ip')).set_description(
+            "Kanalwerte einmal vom ESP (http://ip/val) lesen").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'auto_fetch'), d.PStr('ip')).set_description(
+            "Kanalwerte periodisch vom ESP lesen (Thread auto_fetch)").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'bind_esp_motor'), d.PStr('ip'), d.PInt('channel', 2)).set_description(
+            "Kanal periodisch auf Motor 0 des ESP uebertragen").r(success='bool', message='str', thread='str')
+        self.define_sig(d.PStr('op', 'binding'), d.PInt('channel'), d.PStr('mode'), d.PStr('value_name'),
+                        d.Param('job_data', 'dict')).set_description(
+            "Binding anlegen: Kanal + Modus (PWM_H, PWM_L, PWM_F, DIR_H, DIR_L) -> value_name in job_data").r(
+            success='bool', message='str')
+        self.define_sig(d.PStr('op', 'process_line'), d.PStr('value')).set_description(
+            "Kanalwerte aus einem Query-String (channel1=...) setzen").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'stop_thread'), d.PStr('thread_name')).set_description(
+            "Thread (auto_fetch, esp_motor_<channel>) stoppen").r(success='bool', message='str')
 
     def execute(self, data):
         for i in range(1, 11):
@@ -122,7 +131,7 @@ class ElrsDisplay(r.BaseJobExecutor):
         u.wget(f"http://{ip}/motor_set?motor=0&speed={v}")
 
     def execute_bind_esp_motor(self, data):
-        channel = data.get('channel', 2)
+        channel = int(data.get('channel', 2))
         n = f"esp_motor_{channel}"
         self.threads[n] = self.periodic(self.auto_fetch_interval, lambda: self.motor_esp_i2c_drive(data['ip'], channel))
         return self.success(thread=n)
@@ -206,6 +215,8 @@ class ElrsDisplay(r.BaseJobExecutor):
         mode = data['mode']
         value_name = data['value_name']
         job_data = data['job_data']
+        self.bindings.append(Binding(dict(channel=channel, mode=mode, value_name=value_name, job_data=job_data)))
+        return self.success(f"Binding Channel {channel} {mode} -> {value_name}")
 
     def part_bindings(self, p: base.Page, params={}):
         p.form_input("channel", "Channel", id='channel')

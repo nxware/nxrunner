@@ -30,6 +30,7 @@ import weakref
 import requests
 
 from nwebclient import runner as r
+from nwebclient import dev as d
 from nwebclient import base as b
 from nwebclient import web as w
 
@@ -159,6 +160,18 @@ class DockerProxy(r.BaseJobExecutor):
         self.build_log = []
         self.lock = threading.Lock()
         self.thread = None
+        # nur die Ops des Proxys, alle anderen Jobs gehen an den Runner im Container
+        self.define_sig(d.PStr('op', 'docker_status')).set_description(
+            "Zustand des Containers (state, message, image, port, mounts, ports, packages, spec)").r(
+            success='bool', message='str', value='dict')
+        for op, desc in (('docker_start', "Container starten"), ('docker_restart', "Container neu starten"),
+                         ('docker_rebuild', "Image neu bauen und Container starten")):
+            self.define_sig(d.PStr('op', op)).set_description(desc + " (im Hintergrund)").r(
+                success='bool', message='str')
+        self.define_sig(d.PStr('op', 'docker_stop')).set_description(
+            "Container stoppen und entfernen").r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'docker_logs')).set_description(
+            "Logs des Containers bzw. Build-Log").r(success='bool', message='str', value='str')
         DockerProxy.instances.add(self)
         if start:
             self.start_async()
