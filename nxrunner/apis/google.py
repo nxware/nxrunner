@@ -49,7 +49,7 @@ class CalendarAPI(r.BaseJobExecutor):
       Ohne Zugangsdaten zeigt die Seite eine Anleitung zum Einrichten, ohne Anmeldung direkt den Anmelde-Link.
     """
     MODULES = ['google-api-python-client', 'google-auth-oauthlib']
-    TAGS = ['api', 'calendar']
+    TAGS = ['api', 'calendar', 'external-api']
 
     def __init__(self, type='google_calendar', credentials='~/.config/nxrunner/google_credentials.json',
                  token='~/.config/nxrunner/google_token.json', calendar_id='primary', days=14):

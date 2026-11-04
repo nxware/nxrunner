@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import traceback
+import urllib.parse
 import weakref
 
 from nwebclient import runner as r
@@ -37,6 +38,8 @@ class Backup(r.BaseJobExecutor):
       op=source_delete source_id
       op=destinations | op=destination_save kind name [drive path host share username password] [destination_id]
       op=destination_delete destination_id
+      op=destination_test destination_id    Ziel gruendlich pruefen (z.B. SMB-Anmeldung, Freigabe/Pfad lesbar)
+      op=destination_files destination_id [dir]   Dateiliste des Ziels
       op=run source_id [destination_id]   Quelle jetzt sichern (alle bzw. ein Ziel)
       op=run_due                     alle faelligen Quellen/Ziele sichern (laeuft auch automatisch)
       op=status                      Fortschritt
@@ -390,6 +393,23 @@ class Backup(r.BaseJobExecutor):
         nw.dml("DELETE FROM backup_destination WHERE destination_id = ?", [destination_id])
         return self.success('Ziel geloescht', ui_reload=True)
 
+    @r.op("Prueft ein Ziel gruendlich, z.B. SMB-Anmeldung und ob Freigabe/Pfad lesbar sind",
+          result={'success': 'bool', 'message': 'str'})
+    def destination_test(self, destination_id: int):
+        try:
+            ok, message = create_destination(self.get_destination(self.nweb(), destination_id), self).test()
+        except Exception as e:
+            return self.fail(f'{type(e).__name__}: {e}')
+        return self.success(message) if ok else self.fail(message)
+
+    @r.op("Dateien und Verzeichnisse eines Ziels unter dir (relativ zum Pfad des Ziels)",
+          success={'value': 'list'}, fail={})
+    def destination_files(self, destination_id: int, dir: str = ''):
+        try:
+            return self.success('ok', value=create_destination(self.get_destination(self.nweb(), destination_id), self).list_dir(dir))
+        except Exception as e:
+            return self.fail(f'{type(e).__name__}: {e}')
+
     # --- Sichern ---
 
     def is_running(self):
@@ -502,8 +522,13 @@ class Backup(r.BaseJobExecutor):
     RUN_COLS = ['run_id', 'source_id', 'destination_id', 'started', 'finished', 'status', 'count', 'copied', 'skipped',
                 'failed', 'bytes', 'message']
 
-    def get_runs(self, nw, source_id=None, limit=50):
-        where, params = ('WHERE source_id = ?', [int(source_id)]) if source_id not in (None, '') else ('', [])
+    def get_runs(self, nw, source_id=None, limit=50, destination_id=None):
+        where, params = [], []
+        for col, value in (('source_id', source_id), ('destination_id', destination_id)):
+            if value not in (None, ''):
+                where.append(col + ' = ?')
+                params.append(int(value))
+        where = 'WHERE ' + ' AND '.join(where) if where else ''
         return self.select_dicts(nw, f"SELECT {', '.join(self.RUN_COLS)} FROM backup_run {where} ORDER BY started DESC, run_id DESC LIMIT {int(limit)}",
                                  params, self.RUN_COLS)
 
@@ -784,10 +809,13 @@ class Backup(r.BaseJobExecutor):
         """ Detailseite einer Quelle (part_source) """
         return f'?type={self.type}&{self.type}=source&source_id={int(source_id)}'
 
+    def btn_back(self):
+        return w.button_js("Zurück zur Übersicht", f'location.href = {json.dumps(self.link_index())};', hint="Zur Backup-Übersicht")
+
     def part_source(self, p: b.Page, params={}):
-        """ Detailseite einer Quelle: Ziele mit Stand, Sichern, Bearbeiten und die letzten Sicherungen """
+        """ Detailseite einer Quelle: Sicherungen je Ziel, Sichern, Bearbeiten und die letzten Sicherungen """
         p.h1("Backup")
-        p(w.button_js("Zurück zur Übersicht", f'location.href = {json.dumps(self.link_index())};'))
+        p(self.btn_back())
         if params.get('source_id', '') == '':
             p.div("Keine Quelle angegeben.")
             return
@@ -796,13 +824,12 @@ class Backup(r.BaseJobExecutor):
             source = self.get_source(nw, params['source_id'])
             destinations = self.get_destinations(nw)
             dest_names = {d['destination_id']: d['name'] for d in destinations}
-            stats = self.backup_stats(nw)
             sid = source['source_id']
             with p.section(h="Quelle: " + source['name']):
+                p.div("Art: " + html.escape(SOURCES[source['kind']].TITLE if source['kind'] in SOURCES else source['kind']))
+                p.div("Pfad: " + html.escape(self.source_description(source)))
                 p.div("Größe: " + self.html_source_size(source))
-                p.div(self.html_source_targets(source, self.get_links(nw, sid), dest_names, stats))
-                p(self.action_btn_parametric("Jetzt sichern", dict(type=self.type, op='run', source_id=sid), on_success='backup_progress'))
-                p.div('', id='backup_progress')
+            self.part_source_backups(p, nw, source, destinations, params)
             self.part_run_errors(p, sid)
             self.part_create_source(p, params)
             self.part_runs(p, nw, {sid: source['name']}, dest_names, source_id=sid, title="Letzte Sicherungen", params=params)
@@ -810,6 +837,136 @@ class Backup(r.BaseJobExecutor):
             p.div("Fehler: " + html.escape(str(e)))
         p.pre('', id='result')
         p.script(self.js_progress() + ('backup_progress();' if self.is_running() else ''))
+
+    def part_source_backups(self, p: b.Page, nw, source, destinations, params):
+        """ Sicherungen einer Quelle: je Ziel Stand und letzter Lauf, Sichern auf genau dieses Ziel oder auf alle """
+        sid = source['source_id']
+        dests = {d['destination_id']: d for d in destinations}
+        entries = [{**link, 'dest_name': dests[link['destination_id']]['name'], 'dest': dests[link['destination_id']]}
+                   for link in self.get_links(nw, sid) if link['destination_id'] in dests]
+        with p.section(h="Sicherungen"):
+            p.grid(entries, [
+                w.Grid.col('dest_name', "Ziel", html=True, sort=lambda e: e['dest_name'].lower(),
+                           value=lambda e: self.html_destination_link(e['dest'])),
+                w.Grid.col('describe', "Ort", sortable=False, value=lambda e: self.destination_tooltip(e['dest'])),
+                *self.link_cols(self.backup_stats(nw)),
+                w.Grid.col('actions', '', html=True, sortable=False,
+                           value=lambda e: self.btn_run_link(source['name'], sid, e['dest_name'], e['destination_id'])),
+            ], params, empty="Keine Ziele zugeordnet (unter Bearbeiten auswählen).", prefix='z_')
+            if entries:
+                p(self.action_btn_parametric("Auf alle Ziele sichern", dict(type=self.type, op='run', source_id=sid),
+                                             on_success='backup_progress', hint=f"{source['name']} nacheinander auf alle Ziele sichern"))
+            p.div('', id='backup_progress')
+
+    def link_cols(self, stats):
+        """ Grid-Spalten zum Stand einer Zuordnung Quelle -> Ziel (Zeilen aus backup_source_destination) """
+        def backed_up(link):
+            return stats.get((link['source_id'], link['destination_id']), (0, 0))
+        return [
+            w.Grid.col('backed_up', "Gesichert", sort=lambda e: backed_up(e)[1] or 0,
+                       value=lambda e: f"{backed_up(e)[0]} Dateien, {u.format_size(backed_up(e)[1] or 0)}"),
+            w.Grid.col('last_run', "Letzte Sicherung", html=True, sort=lambda e: e['last_run'] or 0,
+                       value=lambda e: self.html_age(e['last_run'])),
+            w.Grid.col('last_status', "Status", sort=lambda e: e['last_status'] or '',
+                       value=lambda e: f"{e['last_status']}: {e['last_message'] or ''}" if e['last_status'] else '–'),
+        ]
+
+    def btn_run_link(self, source_name, source_id, dest_name, destination_id):
+        """ Button: Quelle jetzt auf genau ein Ziel sichern """
+        return self.action_btn_parametric("Sichern", dict(type=self.type, op='run', source_id=source_id, destination_id=destination_id),
+                                          on_success='backup_progress', hint=f"{source_name} jetzt auf {dest_name} sichern")
+
+    def link_destination(self, destination_id, rel=''):
+        """ Detailseite eines Ziels (part_destination), rel: Verzeichnis der Dateiliste """
+        link = f'?type={self.type}&{self.type}=destination&destination_id={int(destination_id)}'
+        return link + ('&dir=' + urllib.parse.quote(rel) if rel else '')
+
+    def html_destination_link(self, dest_row):
+        return f'<a href="{html.escape(self.link_destination(dest_row["destination_id"]), quote=True)}" ' \
+               f'title="{html.escape(self.destination_tooltip(dest_row), quote=True)}">{html.escape(dest_row["name"])}</a>'
+
+    def part_destination(self, p: b.Page, params={}):
+        """ Detailseite eines Ziels: Stand, Verbindung pruefen, Quellen, Dateiliste, Bearbeiten, letzte Sicherungen """
+        p.h1("Backup")
+        p(self.btn_back())
+        if params.get('destination_id', '') == '':
+            p.div("Kein Ziel angegeben.")
+            return
+        try:
+            nw = self.nweb()
+            row = self.destination_row(nw, self.get_destination(nw, params['destination_id']))
+            sources = {s['source_id']: s for s in self.get_sources(nw)}
+            self.part_destination_info(p, row)
+            self.part_destination_sources(p, nw, row, sources, params)
+            self.part_destination_files(p, row, params.get('dir', ''), params)
+            self.part_create_target(p, params)
+            self.part_runs(p, nw, {sid: s['name'] for sid, s in sources.items()}, {row['destination_id']: row['name']},
+                           destination_id=row['destination_id'], title="Letzte Sicherungen", params=params)
+        except Exception as e:
+            p.div("Fehler: " + html.escape(str(e)))
+        p.pre('', id='result')
+        p.script(self.js_progress() + ('backup_progress();' if self.is_running() else ''))
+
+    def part_destination_info(self, p: b.Page, row):
+        did = row['destination_id']
+        with p.section(h="Ziel: " + row['name']):
+            p.div("Art: " + html.escape(row['kind_title']))
+            p.div("Ziel: " + html.escape(row['describe']))
+            p.div(f"Status: {'erreichbar' if row['available'] else 'nicht erreichbar'} ({html.escape(str(row['message']))})")
+            p.div("Belegt: " + self.html_disk_usage(row))
+            hint = "Anmeldung (SMB) und Lesbarkeit des Zielverzeichnisses prüfen, Ergebnis unten"
+            p(self.action_btn_parametric("Verbindung prüfen", dict(type=self.type, op='destination_test', destination_id=did), hint=hint))
+            p(' ' + self.confirm_btn("Löschen", f"Ziel {row['name']} löschen?", dict(type=self.type, op='destination_delete', destination_id=did),
+                                     hint="Ziel löschen, nur möglich, wenn keine Quelle es verwendet"))
+
+    def part_destination_sources(self, p: b.Page, nw, row, sources, params):
+        """ Quellen, die auf dieses Ziel sichern, mit Stand und Button zum Sichern """
+        did = row['destination_id']
+        entries = [{**link, 'name': sources[link['source_id']]['name']}
+                   for link in self.get_links(nw, destination_id=did) if link['source_id'] in sources]
+        with p.section(h="Quellen"):
+            p.grid(entries, [
+                self.col_source("Quelle"),
+                *self.link_cols(self.backup_stats(nw)),
+                w.Grid.col('actions', '', html=True, sortable=False,
+                           value=lambda e: self.btn_run_link(e['name'], e['source_id'], row['name'], did)),
+            ], params, empty="Keine Quelle sichert auf dieses Ziel.", prefix='q_')
+            p.div('', id='backup_progress')
+
+    def part_destination_files(self, p: b.Page, row, rel, params):
+        """ Dateien und Verzeichnisse im Ziel, Verzeichnisse per Link (Parameter dir) """
+        dest = create_destination(row, self)
+        parts = dest.rel_parts(rel)
+        with p.section(h="Dateien"):
+            p.div(self.html_breadcrumb(row['destination_id'], parts))
+            if not row['available']:
+                p.div("Ziel nicht erreichbar: " + html.escape(str(row['message'])))
+                return
+            try:
+                entries = dest.list_dir('/'.join(parts))
+            except Exception as e:
+                p.div("Dateiliste nicht verfügbar: " + html.escape(f'{type(e).__name__}: {e}'))
+                return
+            p.grid(entries, [
+                w.Grid.col('name', "Name", html=True, sort=lambda e: (not e['dir'], e['name'].lower()),
+                           value=lambda e: self.html_file_name(row['destination_id'], parts, e)),
+                w.Grid.col('size', "Größe", sort=lambda e: e['size'] or 0,
+                           value=lambda e: '' if e['size'] is None else u.format_size(e['size'])),
+                w.Grid.col('mtime', "Geändert", sort=lambda e: e['mtime'] or 0,
+                           value=lambda e: u.format_datetime(e['mtime']) if e['mtime'] else ''),
+            ], params, empty="Verzeichnis ist leer.", prefix='f_', page_size=200)
+
+    def html_breadcrumb(self, destination_id, parts):
+        """ Pfad der Dateiliste, jede Ebene als Link """
+        links = [w.a("Ziel", self.link_destination(destination_id))]
+        for i, part in enumerate(parts):
+            links.append(w.a(html.escape(part), self.link_destination(destination_id, '/'.join(parts[:i + 1]))))
+        return ' / '.join(links)
+
+    def html_file_name(self, destination_id, parts, entry):
+        if entry['dir']:
+            return '&#128193; ' + w.a(html.escape(entry['name']), self.link_destination(destination_id, '/'.join([*parts, entry['name']])))
+        return html.escape(entry['name'])
 
     def link_due(self):
         """ Seite der faelligen Sicherungen (part_due) """
@@ -962,19 +1119,24 @@ class Backup(r.BaseJobExecutor):
         self.part_create_source(p, {})
         with p.section(h="Ziele"):
             p.grid([self.destination_row(nw, d) for d in destinations], [
-                w.Grid.col('name', "Name"),
+                w.Grid.col('name', "Name", html=True, sort=lambda d: d['name'].lower(), value=self.html_destination_link),
                 w.Grid.col('kind_title', "Art"),
                 w.Grid.col('describe', "Ziel"),
                 w.Grid.col('available', "Status", value=lambda d: 'erreichbar' if d['available'] else 'nicht erreichbar',
                            td={'title': lambda d: d['message']}),
                 w.Grid.col('disk_used', "Belegt", value=self.html_disk_usage, html=True),
-                w.Grid.col('delete', '', html=True, sortable=False, value=lambda d: self.confirm_btn(
-                    "Löschen", f"Ziel {d['name']} löschen?", dict(type=self.type, op='destination_delete', destination_id=d['destination_id']))),
+                w.Grid.col('delete', '', html=True, sortable=False, value=self.html_destination_actions),
             ], params, empty="Noch keine Ziele.", prefix='d_')
-        self.part_create_target(p, params)
+        self.part_create_target(p, {})
         self.part_runs(p, nw, {s['source_id']: s['name'] for s in sources}, dest_names, params=params)
         p.pre('', id='result')
         p.script(self.js_progress() + ('backup_progress();' if self.is_running() else ''))
+
+    def html_destination_actions(self, d):
+        did = d['destination_id']
+        return w.button_js("Details", f'location.href = {json.dumps(self.link_destination(did))};',
+                           hint="Detailseite: bearbeiten, Verbindung prüfen, Dateien")             + ' ' + self.confirm_btn("Löschen", f"Ziel {d['name']} löschen?", dict(type=self.type, op='destination_delete', destination_id=did),
+                                     hint="Ziel löschen, nur möglich, wenn keine Quelle es verwendet")
 
     def destination_row(self, nw, d):
         """
@@ -1042,8 +1204,9 @@ class Backup(r.BaseJobExecutor):
             + ' ' + w.button_js("Details", f'location.href = {json.dumps(self.link_source(sid))};') \
             + ' ' + self.confirm_btn("Löschen", f"Quelle {source['name']} löschen?", dict(type=self.type, op='source_delete', source_id=sid))
 
-    def part_runs(self, p: b.Page, nw, source_names, dest_names, limit=20, source_id=None, title="Letzte Läufe", params=None):
-        runs = self.get_runs(nw, source_id, limit=limit)
+    def part_runs(self, p: b.Page, nw, source_names, dest_names, limit=20, source_id=None, title="Letzte Läufe", params=None,
+                  destination_id=None):
+        runs = self.get_runs(nw, source_id, limit=limit, destination_id=destination_id)
 
         def duration(run):
             return (run['finished'] or run['started']) - run['started']
@@ -1066,8 +1229,8 @@ class Backup(r.BaseJobExecutor):
                 w.Grid.col('message', "Meldung"),
             ], params, empty="Noch keine Sicherungen.", prefix='r_')
 
-    def confirm_btn(self, title, question, job):
-        return w.button_js(title, f'if (confirm({json.dumps(question)})) {{ exec_job({json.dumps(job)}); }}')
+    def confirm_btn(self, title, question, job, hint=None):
+        return w.button_js(title, f'if (confirm({json.dumps(question)})) {{ exec_job({json.dumps(job)}); }}', hint=hint)
 
     def destination_tooltip(self, row):
         """ Tooltip eines Ziels, z.B. 'Laufwerk: usb-platte:/backup/pc1' """
@@ -1158,25 +1321,34 @@ class Backup(r.BaseJobExecutor):
     TARGET_FIELDS = ['drive', 'path', 'keep', 'host', 'share', 'username', 'password']
 
     def part_create_target(self, p: b.Page, params={}):
-        """ Formular: Ziel anlegen, Felder werden passend zur Art ein- und ausgeblendet """
+        """ Formular: Ziel anlegen bzw. mit destination_id bearbeiten, Felder werden passend zur Art ein- und ausgeblendet """
         drives = [d['name'] for d in self.drives() if d.get('name')]
-        with p.section(h="Ziel anlegen"):
-            p.form_select('kind', "Art", {k: c.TITLE for k, c in DESTINATIONS.items()}, id='bd_kind', onchange='backup_target_fields()')
-            p.form_input('name', "Name", id='bd_name', placeholder='z.B. USB-Platte')
-            p.form_input('drive', "Laufwerk", id='bd_drive', list='bd_drives')
+        dest = {}
+        if params.get('destination_id', '') != '':
+            dest = self.get_destination(self.nweb(), params['destination_id'])
+        value = lambda key: html.escape(str(dest.get(key) or ''), quote=True)
+        with p.section(h=f"Ziel bearbeiten: {dest['name']}" if dest else "Ziel anlegen"):
+            p.hidden('destination_id', dest.get('destination_id', ''), id='bd_destination_id')
+            p.form_select('kind', "Art", {k: c.TITLE for k, c in DESTINATIONS.items()}, dest.get('kind'), id='bd_kind',
+                          onchange='backup_target_fields()')
+            p.form_input('name', "Name", id='bd_name', placeholder='z.B. USB-Platte', value=value('name'))
+            p.form_input('drive', "Laufwerk", id='bd_drive', list='bd_drives', value=value('drive'))
             p('<datalist id="bd_drives">' + ''.join(f'<option value="{html.escape(n)}">' for n in drives) + '</datalist>')
-            p.form_input('path', "Pfad", id='bd_path', placeholder='backup/pc1')
+            p.form_input('path', "Pfad", id='bd_path', placeholder='backup/pc1', value=value('path'))
             # form_input verwendet title als Beschriftung, fuer den Tooltip daher ein eigenes input
             keep_hint = 'Anzahl vorheriger ZIP-Dateien, die behalten werden (<Quelle>.1.zip ...), 0 = nur die aktuelle'
-            p.form_elem(f'<input name="keep" id="bd_keep" type="number" min="0" value="0" title="{html.escape(keep_hint, quote=True)}">',
-                        "Alte Versionen behalten")
-            p.form_input('host', "Host", id='bd_host', placeholder='nas.local')
-            p.form_input('share', "Freigabe", id='bd_share', placeholder='backup')
-            p.form_input('username', "Benutzer", id='bd_username')
-            p.form_input('password', "Passwort", id='bd_password', type='password', autocomplete='new-password')
+            p.form_elem(f'<input name="keep" id="bd_keep" type="number" min="0" value="{int(dest.get("keep") or 0)}" '
+                        f'title="{html.escape(keep_hint, quote=True)}">', "Alte Versionen behalten")
+            p.form_input('host', "Host", id='bd_host', placeholder='nas.local', value=value('host'))
+            p.form_input('share', "Freigabe", id='bd_share', placeholder='backup', value=value('share'))
+            p.form_input('username', "Benutzer", id='bd_username', value=value('username'))
+            # Passwort nie ausgeben; leer lassen = bisheriges behalten
+            p.form_input('password', "Passwort", id='bd_password', type='password', autocomplete='new-password',
+                         placeholder='unverändert' if dest.get('password') else '')
             p(self.action_btn_parametric("Ziel speichern", dict(
-                type=self.type, op='destination_save', kind='#bd_kind', name='#bd_name', drive='#bd_drive', path='#bd_path',
-                keep='#bd_keep', host='#bd_host', share='#bd_share', username='#bd_username', password='#bd_password')))
+                type=self.type, op='destination_save', destination_id='#bd_destination_id', kind='#bd_kind', name='#bd_name',
+                drive='#bd_drive', path='#bd_path', keep='#bd_keep', host='#bd_host', share='#bd_share', username='#bd_username',
+                password='#bd_password'), hint="Ziel speichern; nach Änderungen mit „Verbindung prüfen“ testen"))
             p.div("Das SMB-Passwort wird im Klartext in der nweb-Datenbank gespeichert.", id='bd_password_hint')
             p.script(self.js_target_fields() + 'backup_target_fields();')
 

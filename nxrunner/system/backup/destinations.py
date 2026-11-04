@@ -1,3 +1,5 @@
+import contextlib
+import errno
 import os
 import shutil
 import socket
@@ -38,6 +40,30 @@ class Destination:
           :return: (erreichbar, Meldung)
         """
         return True, 'ok'
+
+    def test(self, timeout=5):
+        """
+          Gruendlicher als check(): z.B. Anmeldung bei SMB und ob das Verzeichnis des Ziels lesbar ist
+          :return: (ok, Meldung)
+        """
+        return self.check(timeout)
+
+    def list_dir(self, rel=''):
+        """ Inhalt von <Ziel>/<rel>: [{name, dir, size, mtime}], Verzeichnisse zuerst """
+        raise NotImplementedError('Dateiliste nicht verfuegbar fuer ' + self.TITLE)
+
+    @staticmethod
+    def rel_parts(rel):
+        """ relativer Pfad als Liste, ohne '', '.' und '..', damit er innerhalb des Ziels bleibt """
+        return [p for p in str(rel or '').replace('\\', '/').split('/') if p not in ('', '.', '..')]
+
+    @staticmethod
+    def entry(name, is_dir, size, mtime):
+        return {'name': name, 'dir': is_dir, 'size': None if is_dir else size, 'mtime': None if mtime is None else int(mtime)}
+
+    @staticmethod
+    def sort_entries(entries):
+        return sorted(entries, key=lambda e: (not e['dir'], e['name'].lower()))
 
     def open(self, source):
         pass
@@ -95,6 +121,37 @@ class DriveDestination(Destination):
         except OSError as e:
             return False, f'Laufwerk nicht lesbar: {self.drive} ({e})'
         return True, mountpoint
+
+    def base_dir(self):
+        """ Verzeichnis des Ziels (<Laufwerk>/<Pfad>), darunter liegen die Quellen """
+        mountpoint = self.backup.drive_mountpoint(self.drive)
+        if mountpoint is None:
+            raise RuntimeError('Laufwerk nicht gemountet: ' + self.drive)
+        return os.path.join(os.path.realpath(mountpoint), *self.rel_parts(self.path))
+
+    def test(self, timeout=5):
+        available, message = self.check(timeout)
+        if not available:
+            return False, message
+        base = self.base_dir()
+        if not os.path.isdir(base):
+            return True, f'Laufwerk ok, Verzeichnis {base} noch nicht vorhanden (wird bei der ersten Sicherung angelegt)'
+        try:
+            os.listdir(base)
+        except OSError as e:
+            return False, f'Verzeichnis nicht lesbar: {base} ({e})'
+        return True, 'Verzeichnis lesbar: ' + base
+
+    def list_dir(self, rel=''):
+        entries = []
+        with os.scandir(os.path.join(self.base_dir(), *self.rel_parts(rel))) as it:
+            for e in it:
+                try:
+                    st = e.stat()
+                    entries.append(self.entry(e.name, e.is_dir(), st.st_size, st.st_mtime))
+                except OSError:
+                    entries.append(self.entry(e.name, False, None, None))
+        return self.sort_entries(entries)
 
     def usage(self):
         mountpoint = self.backup.drive_mountpoint(self.drive)
@@ -262,6 +319,59 @@ class SmbDestination(Destination):
         except OSError as e:
             return False, f'SMB-Host nicht erreichbar: {self.host} ({e})'
         return True, self.host
+
+    def unc(self, *parts):
+        """ \\\\host\\share\\pfad\\parts """
+        return '\\\\' + '\\'.join([self.host, self.share, *self.rel_parts(self.path), *parts])
+
+    @contextlib.contextmanager
+    def session(self, timeout=5):
+        """
+          Eigene Verbindung (nicht der gemeinsame Cache von smbclient), damit geaenderte Zugangsdaten wirklich
+          geprueft werden. Liefert (smbclient, kwargs fuer smbclient-Aufrufe), Anmeldefehler beim Betreten.
+        """
+        import smbclient
+        cache = {}
+        kwargs = dict(username=self.username or None, password=self.password or None, connection_timeout=timeout,
+                      connection_cache=cache)
+        try:
+            smbclient.register_session(self.host, **kwargs)
+            yield smbclient, kwargs
+        finally:
+            try:
+                smbclient.reset_connection_cache(connection_cache=cache)
+            except Exception:
+                pass
+
+    def test(self, timeout=5):
+        available, message = self.check(timeout)
+        if not available:
+            return False, message
+        user = self.username or '(ohne Benutzer)'
+        step = f'Anmeldung als {user}'
+        try:
+            with self.session(timeout) as (client, kwargs):
+                step = 'Freigabe ' + self.share
+                client.listdir('\\\\' + self.host + '\\' + self.share, **kwargs)
+                if self.rel_parts(self.path):
+                    step = 'Pfad ' + self.unc()
+                    try:
+                        client.listdir(self.unc(), **kwargs)
+                    except OSError as e:
+                        if e.errno != errno.ENOENT:
+                            raise
+                        return True, f'Anmeldung als {user} ok, {self.unc()} noch nicht vorhanden (wird bei der ersten Sicherung angelegt)'
+        except Exception as e:
+            return False, f'{step} fehlgeschlagen: {type(e).__name__}: {e}'
+        return True, f'Anmeldung als {user} ok, {self.unc()} lesbar'
+
+    def list_dir(self, rel=''):
+        entries = []
+        with self.session() as (client, kwargs):
+            for e in client.scandir(self.unc(*self.rel_parts(rel)), **kwargs):
+                st = e.stat()
+                entries.append(self.entry(e.name, e.is_dir(), st.st_size, st.st_mtime))
+        return self.sort_entries(entries)
 
     def open(self, source):
         from nxrunner.fs import Smb

@@ -163,7 +163,13 @@ class SshDirSource(Source):
         return f"{self.username + '@' if self.username else ''}{self.host}:{self.path}"
 
     def ssh_config(self) -> dict:
-        """ Eintrag fuer self.host aus ~/.ssh/config (wie ssh), ohne Datei oder paramiko leer """
+        """
+          Eintrag fuer self.host aus ~/.ssh/config {hostname, port, user, identityfile: []}. Bevorzugt per ssh -G
+          (wertet die Config genau wie ssh aus, auch Include/Match), sonst mit paramiko; ohne beides leer.
+        """
+        conf = self.ssh_config_openssh()
+        if conf is not None:
+            return conf
         path = os.path.expanduser('~/.ssh/config')
         if not os.path.isfile(path):
             return {}
@@ -172,6 +178,27 @@ class SshDirSource(Source):
             return paramiko.SSHConfig.from_path(path).lookup(self.host)
         except Exception:
             return {}
+
+    def ssh_config_openssh(self):
+        """ Konfiguration fuer self.host per ssh -G, None wenn ssh fehlt oder fehlschlaegt """
+        if shutil.which('ssh') is None:
+            return None
+        try:
+            res = subprocess.run(['ssh', '-G', '--', self.host], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if res.returncode != 0:
+            return None
+        conf = {'identityfile': []}
+        for line in res.stdout.splitlines():
+            key, _, value = line.partition(' ')
+            if key == 'identityfile':
+                # ssh -G nennt auch die Standard-Schluessel, die es nicht gibt
+                if os.path.isfile(os.path.expanduser(value)):
+                    conf['identityfile'].append(value)
+            elif key in ('hostname', 'port', 'user'):
+                conf[key] = value.strip()
+        return conf
 
     def target(self) -> dict:
         """ Verbindungsdaten: Angaben der Quelle, fehlende aus ~/.ssh/config {hostname, port, username, key_files} """
@@ -186,6 +213,10 @@ class SshDirSource(Source):
                 'key_files': key_files}
 
     def check(self, timeout=3):
+        try:
+            import paramiko  # noqa: F401
+        except ImportError:
+            return False, 'paramiko nicht installiert (pip install paramiko), SSH-Quellen nicht moeglich'
         t = self.target()
         try:
             socket.create_connection((t['hostname'], t['port']), timeout=timeout).close()

@@ -40,6 +40,53 @@ class NxRunner(r.AutoDispatcher):
         self.type = 'nxrunner'
         self.registry_cache = None  # (Zeitpunkt, Eintraege)
 
+    # --- Favoriten: in der nweb-Persistence (system__setting), sonst im LocalStorage des Browsers ---
+
+    FAVORITES_SETTING = 'nxrunner.ui.favorites'
+
+    def favorites_store(self):
+        """ lokale nweb-Persistence (Arg DB) mit setting/set_setting oder None """
+        nw = getattr(self.getRoot(), 'nweb', None) or getattr(self, 'nweb', None)
+        return nw if nw is not None and hasattr(nw, 'set_setting') and hasattr(nw, 'setting') else None
+
+    def favorites_list(self, nw) -> list:
+        try:
+            value = json.loads(nw.setting(self.FAVORITES_SETTING, '[]') or '[]')
+        except ValueError:
+            return []
+        return [str(v) for v in value] if isinstance(value, list) else []
+
+    def execute_favorites(self, data):
+        """ favorisierte Runner der UI (persistent=False: keine nweb-Persistence, Browser nutzt LocalStorage) """
+        nw = self.favorites_store()
+        if nw is None:
+            return self.success('Keine nweb-Persistence', value=[], persistent=False)
+        return self.success('ok', value=self.favorites_list(nw), persistent=True)
+
+    def execute_favorite_set(self, data):
+        """ Runner als Favorit markieren (favorite=1) oder entfernen (favorite=0) """
+        nw = self.favorites_store()
+        if nw is None:
+            return self.fail('Keine nweb-Persistence (Arg DB setzen)', persistent=False)
+        name = str(data.get('name', '')).strip()
+        favorite = str(data.get('favorite', '1')).strip().lower() in ('1', 'true', 'yes', 'on')
+        if not name:
+            return self.fail('name fehlt')
+        values = [v for v in self.favorites_list(nw) if v != name]
+        if favorite:
+            values.append(name)
+        nw.set_setting(self.FAVORITES_SETTING, json.dumps(values))
+        return self.success(name + (' favorisiert' if favorite else ' entfernt'), value=values, persistent=True)
+
+    def ui_favorites(self):
+        """ Favoriten fuer DATA.favorites, None = Browser speichert im LocalStorage """
+        nw = self.favorites_store()
+        try:
+            return None if nw is None else self.favorites_list(nw)
+        except Exception as e:
+            self.error('Favoriten: ' + str(e))
+            return None
+
     def ui_data(self):
         instances = [{'name': name, 'cls': type(runner).__name__} for name, runner in self.instances.items()]
         classes = [{'name': name, 'cls': str(cls)} for name, cls in self.classes.items() if name not in self.instances]
@@ -47,6 +94,7 @@ class NxRunner(r.AutoDispatcher):
             'key': self.key,
             'instances': instances,
             'classes': classes,
+            'favorites': self.ui_favorites(),
             'links': [
                 {'title': "Dispatcher", 'url': '/pysys/runner'},
                 {'title': "Runner-UI", 'url': '/pysys/runner-ui'},

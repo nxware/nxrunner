@@ -1,4 +1,4 @@
 
 
- - Obere Leiste hat Background #2c2f31
+ - Obere Leiste wie bsnx.net: Background #343a40, Links weiss mit 50 % Deckkraft
  - Keine Abgerundeten Ecken
