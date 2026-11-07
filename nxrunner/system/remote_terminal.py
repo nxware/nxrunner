@@ -4,7 +4,8 @@ Terminal einer anderen Instanz ueber einen Job-Speicher (Standard: MongoDB-Runne
 Befehle gehen verschluesselt (cenqueue, CryptRunner crypt noetig) mit guid und target in den Speicher, die
 Ziel-Instanz fuehrt sie mit ihrem Terminal-Runner aus (MongoDB-Ticker, kurzes mongo_job_cron waehlen). Ein Thread
 fragt die Ergebnisse per guid ab (cresult) und uebernimmt den Bildschirm; die Seite ist die des Terminals
-(terminal.js), da RemoteTerminal dieselben Ops anbietet.
+(terminal.js), da RemoteTerminal dieselben Ops anbietet. Senden und Abfragen uebernimmt
+nxrunner.jobstore:RemoteJobMixin.
 
     Config (runners):
         rterm: nxrunner.system.remote_terminal:RemoteTerminal(target="pi4")
@@ -18,19 +19,15 @@ fragt die Ergebnisse per guid ab (cresult) und uebernimmt den Bildschirm; die Se
 
     Job-Speicher: Runner mit nxrunner.jobstore:JobStoreMixin (op=cenqueue, op=cresult), z.B. MongoDB.
 """
-import threading
-import time
-
 from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import dev as d
-from nwebclient import util as u
 
-from nxrunner.jobstore import JobStoreMixin
+from nxrunner.jobstore import RemoteJobMixin
 from nxrunner.system.terminal import Terminal, terminal_page
 
 
-class RemoteTerminal(r.BaseJobExecutor):
+class RemoteTerminal(r.BaseJobExecutor, RemoteJobMixin):
 
     TAGS = ['system', 'terminal', 'remote']
 
@@ -45,12 +42,8 @@ class RemoteTerminal(r.BaseJobExecutor):
         :param timeout: Sekunden, nach denen eine Antwort verworfen wird
         """
         super().__init__(type)
-        self.target = target
-        self.store = store
-        self.remote_type = remote_type
+        self.init_remote(target, store, remote_type, poll_interval, timeout)
         self.wait_time = float(wait_time)
-        self.poll_interval = float(poll_interval)
-        self.timeout = float(timeout)
         self.define_vars('target', 'store', 'remote_type')
         self.define_sig(d.PStr('op', 'screen'), d.PInt('version', -1)).r(
             success='bool', lines='list', cursor='dict', version='int', running='bool', unchanged='bool')
@@ -58,38 +51,16 @@ class RemoteTerminal(r.BaseJobExecutor):
         self.define_sig(d.PStr('op', 'key'), d.PStr('key', 'ctrl_c')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'refresh')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'restart')).r(success='bool', message='str')
-        self.lock = threading.Lock()
         self.lines = []
         self.cursor = None
         self.running = True
         self.version = 0
-        self.error = ''
-        self.seq = 0            # laufende Nummer gesendeter Jobs
         self.applied_seq = 0    # Nummer des Jobs, dessen Bildschirm angezeigt wird
-        self.pending = {}       # guid -> {seq, ts, screen, label}
-        self.poller = None
-        self.last_update = None
         self.started = False    # Bildschirm der Ziel-Instanz schon angefordert
-        self.store_ok = False   # store als Job-Speicher geprueft
 
-    # --- Job-Speicher ---------------------------------------------------------------------------
+    # --- RemoteJobMixin -------------------------------------------------------------------------
 
-    def store_execute(self, data: dict) -> dict:
-        return self.getRoot().jobexecutor.execute({'type': self.store, **data})
-
-    def check_store(self) -> str:
-        """ :return: Fehlermeldung, '' wenn store ein Job-Speicher ist (JobStoreMixin bzw. dessen Ops) """
-        executor = self.getRoot().jobexecutor
-        if self.store not in executor:
-            return f'Job-Speicher {self.store} ist nicht geladen'
-        get_runner = getattr(executor, 'get_runner', None)
-        runner = get_runner(self.store) if get_runner is not None else None
-        if runner is not None and not JobStoreMixin.is_job_store(runner):
-            return f'{self.store} ({type(runner).__name__}) ist kein Job-Speicher, op=cenqueue/cresult fehlen'
-        return ''
-
-    @staticmethod
-    def describe(job: dict):
+    def remote_job_label(self, job: dict):
         """ Anzeige des Jobs in der Statuszeile, None fuer get_terminal nach einer Eingabe """
         op = job.get('op')
         if op == 'exec':
@@ -102,76 +73,15 @@ class RemoteTerminal(r.BaseJobExecutor):
             return None if 'wait_time' in job else 'Bildschirm abrufen'
         return str(op)
 
-    def send(self, job: dict, screen: bool) -> str:
-        """
-          Job verschluesselt in den Speicher schreiben.
-          :param screen: Ergebnis enthaelt den Bildschirm (exec, get_terminal)
-          :return: guid
-        """
-        if not self.target:
-            raise RuntimeError('target (Name der Ziel-Instanz) ist nicht gesetzt')
-        if not self.store_ok:
-            error = self.check_store()
-            if error:
-                raise RuntimeError(error)
-            self.store_ok = True
-        guid = u.guid()
-        res = self.store_execute(dict(op='cenqueue', jobdef={'type': self.remote_type, **job}, guid=guid,
-                                      target=self.target))
-        if not isinstance(res, dict) or not res.get('success', False):
-            message = res.get('message', res) if isinstance(res, dict) else res
-            raise RuntimeError(f'Job-Speicher {self.store}: {message}')
-        with self.lock:
-            self.seq += 1
-            self.pending[guid] = dict(seq=self.seq, ts=time.time(), screen=screen, label=self.describe(job))
-            self.error = ''
-            self.version += 1
-            if self.poller is None:
-                self.poller = threading.Thread(target=self.poll_loop, daemon=True, name='remote-terminal-' + self.type)
-                self.poller.start()
-        return guid
+    def remote_changed(self):
+        self.version += 1
 
-    def poll_loop(self):
-        while True:
-            time.sleep(self.poll_interval)
-            with self.lock:
-                guids = list(self.pending.keys())
-                if not guids:
-                    self.poller = None
-                    return
-            for guid in guids:
-                try:
-                    self.poll(guid)
-                except Exception as e:
-                    self.set_error(f'Abfrage {guid}: {type(e).__name__}: {e}')
-
-    def poll(self, guid):
-        res = self.store_execute(dict(op='cresult', guid=guid, delete=1))
-        with self.lock:
-            job = self.pending.get(guid)
-            if job is None:
-                return
-            if not isinstance(res, dict) or not res.get('success', False):
-                self.error = str(res.get('message', res) if isinstance(res, dict) else res)
-                self.version += 1
-            elif res.get('pending', False):
-                if time.time() - job['ts'] > self.timeout:
-                    del self.pending[guid]
-                    self.error = f'Keine Antwort von {self.target} nach {int(self.timeout)} s'
-                    self.version += 1
-            else:
-                del self.pending[guid]
-                self.apply(job, res.get('result') or {})
-                self.version += 1
-
-    def apply(self, job: dict, result: dict):
-        """ Ergebnis uebernehmen (unter self.lock), aeltere Bildschirme ueberschreiben keine neueren """
-        self.last_update = time.time()
-        if not result.get('success', False):
-            self.error = str(result.get('message', 'Fehler auf ' + self.target))
+    def on_remote_result(self, meta: dict, result: dict):
+        """ Bildschirm uebernehmen, aeltere Bildschirme ueberschreiben keine neueren """
+        if not result.get('success', False) or not meta['screen'] or 'value' not in result:
             return
-        if job['screen'] and 'value' in result and job['seq'] > self.applied_seq:
-            self.applied_seq = job['seq']
+        if meta['seq'] > self.applied_seq:
+            self.applied_seq = meta['seq']
             self.lines = str(result['value']).split('\n')
             self.cursor = result.get('cursor')
             self.running = bool(result.get('running', True))
@@ -186,28 +96,13 @@ class RemoteTerminal(r.BaseJobExecutor):
             self.lines.append('')
         self.lines[c['y']] = self.lines[c['y']].ljust(c['x'] + 1)
 
-    def set_error(self, message):
-        with self.lock:
-            self.error = message
-            self.version += 1
-
     # --- Jobs -----------------------------------------------------------------------------------
 
     def screen_dict(self):
-        with self.lock:
-            status = self.target or '(kein target)'
-            if self.pending:
-                status += f' – wartet auf {len(self.pending)} Antwort(en)'
-                labels = [j['label'] for j in sorted(self.pending.values(), key=lambda j: j['seq']) if j['label']]
-                if labels:
-                    text = ', '.join(labels)
-                    status += ': ' + (text if len(text) <= 80 else text[:77] + '...')
-            elif self.last_update is not None:
-                status += ' – Stand ' + time.strftime('%H:%M:%S', time.localtime(self.last_update))
-            if self.error:
-                status += ' – ' + self.error
+        with self.remote_lock:
             return dict(lines=list(self.lines), cursor=self.cursor, version=self.version, running=self.running,
-                        exit_code=None, mode='remote ' + self.store, title=status, pending=len(self.pending))
+                        exit_code=None, mode='remote ' + self.store, title=self.remote_status(),
+                        pending=len(self.remote_pending))
 
     def execute_screen(self, data):
         if not self.started and self.target:
@@ -219,12 +114,12 @@ class RemoteTerminal(r.BaseJobExecutor):
         return self.success('ok', **self.screen_dict())
 
     def run_send(self, *jobs):
-        """ jobs: (job, screen) in dieser Reihenfolge senden """
+        """ jobs: (job, screen) in dieser Reihenfolge senden, screen: Ergebnis enthaelt den Bildschirm """
         try:
             for job, screen in jobs:
-                self.send(job, screen)
+                self.remote_send(job, screen=screen)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_remote_error(str(e))
             return self.fail(str(e))
         return self.success('gesendet, wartet auf Antwort')
 
@@ -253,6 +148,6 @@ class RemoteTerminal(r.BaseJobExecutor):
     def part_index(self, p: b.Page, params={}):
         error = self.check_store() if self.target else 'target (Name der Ziel-Instanz) ist nicht gesetzt'
         terminal_page(p, self.type, error, title='Remote-Terminal ' + self.target,
-                      buttons='<button type="button" id="term_refresh">Aktualisieren</button>')
+                      buttons='<button type="button" id="term_refresh" title="Bildschirm der Ziel-Instanz neu abrufen">Aktualisieren</button>')
         p.div(f'Job-Speicher: {self.store}, Terminal auf der Ziel-Instanz: {self.remote_type}. '
               'Die Ziel-Instanz arbeitet die Jobs im Takt ihres Tickers ab (mongo_job_cron).')

@@ -114,6 +114,160 @@ class JobStoreMixin:
         return self.success('ok', pending=False, result=result)
 
 
+class RemoteJobMixin:
+    """
+      Gegenstueck zum Job-Speicher: Jobs fuer die Instanz target einstellen (op=cenqueue, verschluesselt) und in
+      einem Thread alle poll_interval Sekunden die Ergebnisse per guid abholen (op=cresult). Fuer Runner, die eine
+      andere Instanz fernsteuern (z.B. RemoteTerminal).
+
+      Im __init__ des Runners init_remote(...) aufrufen. Unterklassen setzen um (aufgerufen unter remote_lock):
+          on_remote_result(meta, result)   Ergebnis eines Jobs (result der Ziel-Instanz, success=False bei Fehler dort)
+          remote_changed()                 Zustand geaendert: gesendet, Ergebnis, Fehler, Timeout
+          remote_job_label(job)            Anzeige des Jobs in remote_status(), None = nicht anzeigen
+
+      Zustand: remote_pending {guid: meta}, remote_error, remote_last_update; meta enthaelt seq (laufende Nummer),
+      ts, label und die an send() uebergebenen Felder.
+    """
+
+    def init_remote(self, target='', store='mongodb', remote_type='', poll_interval=10, timeout=6000):
+        """
+        :param target: Name der Ziel-Instanz (nwebclient.nx.get_name() dort, i.d.R. der Hostname)
+        :param store: type des Job-Speicher-Runners (JobStoreMixin)
+        :param remote_type: type des Runners auf der Ziel-Instanz, an den die Jobs gehen
+        :param poll_interval: Sekunden zwischen den Abfragen der Ergebnisse
+        :param timeout: Sekunden, nach denen eine Antwort verworfen wird
+        """
+        self.target = target
+        self.store = store
+        self.remote_type = remote_type
+        self.poll_interval = float(poll_interval)
+        self.timeout = float(timeout)
+        self.remote_lock = threading.Lock()
+        self.remote_seq = 0          # laufende Nummer gesendeter Jobs
+        self.remote_pending = {}     # guid -> meta
+        self.remote_error = ''
+        self.remote_last_update = None
+        self.remote_poller = None
+        self.store_ok = False        # store als Job-Speicher geprueft
+
+    # --- von Unterklassen umzusetzen ------------------------------------------------------------
+
+    def on_remote_result(self, meta: dict, result: dict):
+        pass
+
+    def remote_changed(self):
+        pass
+
+    def remote_job_label(self, job: dict) -> Optional[str]:
+        return str(job.get('op', job.get('type', '')))
+
+    # --- Job-Speicher ---------------------------------------------------------------------------
+
+    def store_execute(self, data: dict) -> dict:
+        return self.getRoot().jobexecutor.execute({'type': self.store, **data})
+
+    def check_store(self) -> str:
+        """ :return: Fehlermeldung, '' wenn store ein Job-Speicher ist (JobStoreMixin bzw. dessen Ops) """
+        executor = self.getRoot().jobexecutor
+        if self.store not in executor:
+            return f'Job-Speicher {self.store} ist nicht geladen'
+        get_runner = getattr(executor, 'get_runner', None)
+        runner = get_runner(self.store) if get_runner is not None else None
+        if runner is not None and not JobStoreMixin.is_job_store(runner):
+            return f'{self.store} ({type(runner).__name__}) ist kein Job-Speicher, op=cenqueue/cresult fehlen'
+        return ''
+
+    def remote_send(self, job: dict, **meta) -> str:
+        """
+          Job fuer remote_type auf target verschluesselt in den Speicher schreiben, Fehler als Exception.
+          :param meta: zusaetzliche Felder, die on_remote_result mit dem Ergebnis erhaelt
+          :return: guid
+        """
+        if not self.target:
+            raise RuntimeError('target (Name der Ziel-Instanz) ist nicht gesetzt')
+        if not self.store_ok:
+            error = self.check_store()
+            if error:
+                raise RuntimeError(error)
+            self.store_ok = True
+        guid = u.guid()
+        res = self.store_execute(dict(op='cenqueue', jobdef={'type': self.remote_type, **job}, guid=guid,
+                                      target=self.target))
+        if not isinstance(res, dict) or not res.get('success', False):
+            message = res.get('message', res) if isinstance(res, dict) else res
+            raise RuntimeError(f'Job-Speicher {self.store}: {message}')
+        with self.remote_lock:
+            self.remote_seq += 1
+            self.remote_pending[guid] = dict(meta, seq=self.remote_seq, ts=time.time(), label=self.remote_job_label(job))
+            self.remote_error = ''
+            self.remote_changed()
+            self.start_remote_poller()
+        return guid
+
+    def start_remote_poller(self):
+        """ unter remote_lock: Abfrage-Thread starten, falls keiner laeuft (er endet, wenn nichts mehr aussteht) """
+        if self.remote_poller is None:
+            self.remote_poller = threading.Thread(target=self.remote_poll_loop, daemon=True,
+                                                  name='remote-' + str(getattr(self, 'type', '')))
+            self.remote_poller.start()
+
+    def remote_poll_loop(self):
+        while True:
+            time.sleep(self.poll_interval)
+            with self.remote_lock:
+                guids = list(self.remote_pending.keys())
+                if not guids:
+                    self.remote_poller = None
+                    return
+            for guid in guids:
+                try:
+                    self.remote_poll(guid)
+                except Exception as e:
+                    self.set_remote_error(f'Abfrage {guid}: {type(e).__name__}: {e}')
+
+    def remote_poll(self, guid):
+        res = self.store_execute(dict(op='cresult', guid=guid, delete=1))
+        with self.remote_lock:
+            meta = self.remote_pending.get(guid)
+            if meta is None:
+                return
+            if not isinstance(res, dict) or not res.get('success', False):
+                self.remote_error = str(res.get('message', res) if isinstance(res, dict) else res)
+            elif res.get('pending', False):
+                if time.time() - meta['ts'] <= self.timeout:
+                    return
+                del self.remote_pending[guid]
+                self.remote_error = f'Keine Antwort von {self.target} nach {int(self.timeout)} s'
+            else:
+                del self.remote_pending[guid]
+                self.remote_last_update = time.time()
+                result = res.get('result') or {}
+                if not result.get('success', False):
+                    self.remote_error = str(result.get('message', 'Fehler auf ' + self.target))
+                self.on_remote_result(meta, result)
+            self.remote_changed()
+
+    def set_remote_error(self, message):
+        with self.remote_lock:
+            self.remote_error = message
+            self.remote_changed()
+
+    def remote_status(self, max_len=80) -> str:
+        """ unter remote_lock: Statuszeile aus target, ausstehenden Jobs, letztem Stand und Fehler """
+        status = self.target or '(kein target)'
+        if self.remote_pending:
+            status += f' – wartet auf {len(self.remote_pending)} Antwort(en)'
+            pending = sorted(self.remote_pending.values(), key=lambda m: m['seq'])
+            text = ', '.join(m['label'] for m in pending if m['label'])
+            if text:
+                status += ': ' + (text if len(text) <= max_len else text[:max_len - 3] + '...')
+        elif self.remote_last_update is not None:
+            status += ' – Stand ' + time.strftime('%H:%M:%S', time.localtime(self.remote_last_update))
+        if self.remote_error:
+            status += ' – ' + self.remote_error
+        return status
+
+
 class DirectJobStore(r.BaseJobExecutor, JobStoreMixin):
     """
       Job-Speicher fuer Tests: fuehrt Jobs beim Einstellen sofort lokal aus und haelt das Ergebnis im Speicher,

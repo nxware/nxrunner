@@ -123,6 +123,19 @@ Hinweise:
 - Operationen ohne Pflichtparameter, die im Dashboard ausgewählt werden, laufen bei jeder Aktualisierung.
   Dort nur Aufrufe ohne Nebenwirkungen eintragen.
 
+### Variablen mit `@var`
+
+Statt `define_vars(...)` kann ein berechneter Wert als Methode `get_<name>` mit `@r.var` markiert werden. Er ist dann
+wie eine Variable per `getvar`, `get_vars` und in der Oberfläche (z.B. im Dashboard) lesbar:
+
+```python
+@r.var
+def get_uptime(self):
+    return time.time() - self.started
+```
+
+Ohne Methode `set_<name>` ist die Variable nur lesbar, `setvar` liefert dann einen Fehler.
+
 ### Ohne `@op`
 
 Wird das komplette `data` gebraucht, kann weiterhin eine Methode `execute_<name>(self, data)` geschrieben werden.
