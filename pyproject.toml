@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = "Backup System"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = ["nwebclient", "waitress", "flask"]
 
 [project.optional-dependencies]
@@ -48,6 +48,7 @@ m5_multi = "nxrunner.devices.esp_m5:EspM5"
 esp_home = "nxrunner.devices.esphome:EspHome"
 meshtastic = "nxrunner.devices.meshtastic:MeshtasticBot"
 network_manager = "nxrunner.network.networkmanager:NetworkManager"
+deployments = "nxrunner.projects:Deployments"
 anemometer = "nxrunner.app.anemometer:AnemometerKalibrierung"
 nwebdir = "nxrunner.nweb:NWebDir"
 google_calendar = "nxrunner.apis.google:CalendarAPI"

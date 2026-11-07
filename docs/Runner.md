@@ -34,6 +34,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `pihole_api` | `nxrunner.apis:PiHoleApi` | Statistik eines Pi-hole 6 | `pihole6api` |
 | `trello` | `nxrunner.apis:Trello` | Boards eines Trello-Kontos | `py-trello` |
 | `website` | `nxrunner.web:WebsiteController` | Webseite im Browser per Userscript steuern, CSS-Selektoren, Daten auslesen/ändern | `flask` |
+| `deployments` | `nxrunner.projects:Deployments` | Git-Checkouts per SSH mit origin vergleichen und aktualisieren | (`ssh`-Client) |
 
 Fehlende Module lassen sich in der Registry mit `op=registry_pip name=<entry>` installieren, oder der Runner wird
 mit `op=registry_docker` in einem Container gestartet (siehe [NxRunner](#nxrunner-dispatcher)).
@@ -465,6 +466,45 @@ verbundenen Tabs ausführen.
 Variablen: `port`, `host`, `timeout`
 
 ---
+
+### Deployments
+
+`nxrunner.projects:Deployments(type='deployments', ssh='ssh', connect_timeout=5, timeout=60, update_timeout=600)`
+
+Git-Checkouts auf entfernten Rechnern. Die Deployments stehen im Arg `deployment` (ein Eintrag oder eine Liste):
+
+```yaml
+deployment:
+  - sshhost: raspi5
+    path: /home/pi/nwebclient
+    update_cmd: pip install -e .     # str oder Liste, optional
+  - sshhost: handy
+    path: /data/app
+    mobile: true                     # nicht immer online
+```
+
+Name eines Deployments: `<sshhost>-<letzter Bestandteil von path>`, z.B. `raspi5-nwebclient`. SSH läuft mit
+`BatchMode=yes` (Schlüssel oder Agent nötig). Die Prüfung macht `git fetch origin` und vergleicht `HEAD` mit dem
+Upstream-Branch. Der Status wird, wenn vorhanden, in der nweb-Persistence (Setting `deployments.status.<name>`)
+gespeichert; für offline Geräte (v.a. `mobile`) zeigt das Grid den letzten bekannten Stand mit „offline“.
+
+Die Seite **Hosts** zeigt je SSH-Host der Deployments die Ausgaben der Befehle aus dem Arg `hostinfo`
+(alle Befehle in einem SSH-Aufruf je Host). Die Werte werden mit Zeitstempel im Setting `deployments.host.<sshhost>`
+gespeichert und bleiben sichtbar, wenn der Host offline ist (Tooltip „Stand …“ je Wert):
+
+```yaml
+hostinfo:
+  os_issue: cat /etc/issue
+  python_version: python -V
+  df: df -h / | tail -n 1
+```
+
+| Job | Beschreibung |
+|---|---|
+| `op=list` | Deployments mit letztem bekanntem Status |
+| `op=check [name]` | ein bzw. alle Deployments mit origin vergleichen |
+| `op=update name` | `git pull` und danach `update_cmd` im Verzeichnis `path` ausführen, anschließend prüfen |
+| `op=hostinfo [host]` | Host-Infos (Arg `hostinfo`) eines bzw. aller SSH-Hosts abfragen und speichern |
 
 ## Infrastruktur
 
