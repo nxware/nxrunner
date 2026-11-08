@@ -292,3 +292,4 @@ from nxrunner.system.backup import Backup  # noqa: E402
 from nxrunner.system.crypt import CryptRunner  # noqa: E402
 from nxrunner.system.terminal import Terminal  # noqa: E402
 from nxrunner.system.remote_terminal import RemoteTerminal  # noqa: E402
+from nxrunner.system.log import LogFoundation  # noqa: E402

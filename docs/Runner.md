@@ -22,6 +22,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `nfile` | `nxrunner.system:NFile` | Dateien von Laufwerken indexieren und durchsuchen | |
 | `backup` | `nxrunner.system:Backup` | Inkrementelle Backups aus Quellen in Ziele | (`paramiko`, `smbprotocol`) |
 | `crypt` | `nxrunner.system:CryptRunner` | Verschlüsselte Jobs (Fernet) entschlüsseln und ausführen | `cryptography` |
+| `log` | `nxrunner.system:LogFoundation` | Logs entgegennehmen (Job, SSH, MQTT, Befehl) und darstellen | (`paho-mqtt`) |
 | `smb` | `nxrunner.fs:Smb` | Zugriff auf SMB-/Windows-Freigaben | `smbprotocol` |
 | `mongo` | `nxrunner.db.mongo:MongoDB` | MongoDB: einfügen, suchen, Dateien sammeln | `pymongo` |
 | `nwebdir` | `nxrunner.nweb:NWebDir` | Verzeichnis mit nweb-Gruppe abgleichen | |
@@ -187,6 +188,46 @@ Methoden: `listdir(path)`, `get_contents(path)`, `put_contents(path, contents)`,
 `copy_to_remote(src_path, dst_path, mtime=None)`
 
 ---
+
+### LogFoundation
+
+`nxrunner.system:LogFoundation(type='log', logmax=10000, page_size=200)`, Tags `system`, `log`
+
+Nimmt Log-Einträge entgegen und stellt sie dar. Ein Eintrag hat `text`, `created`, `category` und `importance`
+(`verbose`, `debug`, `info`, `warning`, `error`, `alert`). Im Speicher bleiben die letzten `logmax` Einträge. Ohne
+Angabe wird die `importance` aus dem Text erkannt (z.B. `error`, `warn`, `critical`).
+
+Quellen stehen im Arg `logsources` und werden in der GUI aktiviert oder gestoppt (mit `autostart: true` beim Laden):
+
+```yaml
+logsources:
+  - type: ssh
+    host: mysshhost                    # category ssh-mysshhost
+    file: /var/log/apache2/error.log   # tail -F
+    sudo: true                         # optional, default false (sudo -n)
+  - type: ssh
+    host: mysshhost
+    cmd: pm2 logs 2
+  - type: mqtt                         # benötigt paho-mqtt, JSON {text, importance, category} wird gelesen
+    host: 127.0.0.1                    # category mqtt-127.0.0.1
+    topic: logs/#
+  - type: cmd
+    cmd: journalctl -f                 # category cmd-journalctl
+```
+
+Optional je Quelle: `category`, `importance` (fest), `autostart`. SSH läuft mit BatchMode (Schlüssel/Agent nötig).
+
+| Job | Beschreibung |
+|---|---|
+| `op=log text [category] [importance]` | Eintrag hinzufügen |
+| `op=entries [category] [importance] [q] [limit=100]` | Einträge, neueste zuerst; `importance` = Mindeststufe |
+| `op=clear` | Einträge im Speicher löschen |
+| `op=sources` | Logquellen mit Status |
+| `op=source_start id` / `op=source_stop id` | Logquelle starten/stoppen (`id` = Position in `logsources`) |
+
+Events: `on_info` (importance `info`), `on_error` (importance `error`), `on_alert` (importance `alert`), mit den Werten des Eintrags.
+
+Variablen: `logmax`, `page_size`
 
 ## Datenbanken
 

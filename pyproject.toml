@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = "Backup System"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = ["nwebclient", "waitress", "flask"]
 
 [project.optional-dependencies]
@@ -42,6 +42,7 @@ nweb_jobs = "nxrunner.jobstore:NWebJobRunner"
 direct_job_store = "nxrunner.jobstore:DirectJobStore"
 terminal = "nxrunner.system:Terminal"
 remote_terminal = "nxrunner.system:RemoteTerminal"
+log = "nxrunner.system:LogFoundation"
 remote_runner = "nxrunner.jobstore:RemoteRunner"
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
