@@ -16,12 +16,14 @@ Zusagen eines Speichers:
 import json
 import threading
 import time
+from html import escape as esc
 from typing import Optional, List
 
 from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import util as u
 from nwebclient import dev as d
+from nwebclient import web as w
 
 
 class JobStoreMixin:
@@ -126,7 +128,7 @@ class RemoteJobMixin:
           remote_job_label(job)            Anzeige des Jobs in remote_status(), None = nicht anzeigen
 
       Zustand: remote_pending {guid: meta}, remote_error, remote_last_update; meta enthaelt seq (laufende Nummer),
-      ts, label und die an send() uebergebenen Felder.
+      guid, ts, label und die an send() uebergebenen Felder.
     """
 
     def init_remote(self, target='', store='mongodb', remote_type='', poll_interval=10, timeout=6000):
@@ -198,7 +200,7 @@ class RemoteJobMixin:
             raise RuntimeError(f'Job-Speicher {self.store}: {message}')
         with self.remote_lock:
             self.remote_seq += 1
-            self.remote_pending[guid] = dict(meta, seq=self.remote_seq, ts=time.time(), label=self.remote_job_label(job))
+            self.remote_pending[guid] = dict(meta, guid=guid, seq=self.remote_seq, ts=time.time(), label=self.remote_job_label(job))
             self.remote_error = ''
             self.remote_changed()
             self.start_remote_poller()
@@ -521,3 +523,364 @@ class NWebJobRunner(r.BaseJobExecutor, JobStoreMixin):
             p.form_input('add_type', "Add Job Type", id='add_type')
             p(self.action_btn_parametric("Add Type", dict(type=self.type, add_type='#add_type')))
             p(self.action_btn(dict(title="Run Now", type=self.type, execute=1)))
+
+
+class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
+    """
+      Runner einer anderen Instanz ueber einen Job-Speicher bedienen: Die Seite zeigt je Runner der Ziel-Instanz ein
+      aufklappbares Feld mit dessen Signaturen; "Ausfuehren" oeffnet ein Formular fuer die Parameter und stellt den
+      Job (verschluesselt, cenqueue) in den Job-Speicher. Die Ergebnisse zeigt die Seite "Ergebnisse".
+
+      Die Runner der Ziel-Instanz kommen von {type: list_runners} (per Spec registrierte Runner) und runners,
+      ihre Signaturen von {type: <runner>, op: get_signatures}.
+
+        Config (runners):
+            remote: nxrunner.jobstore:RemoteRunner(target="pi4")
+            remote: nxrunner.jobstore:RemoteRunner(target="pi4", store="nweb_jobs", runners="terminal,backup")
+            remote: nxrunner.jobstore:RemoteRunner(target="local", store="store", poll_interval=1)   # mit DirectJobStore
+
+        Jobs:
+            op=refresh                      Runner und Signaturen der Ziel-Instanz abrufen
+            op=runners                      bekannte Runner mit Signaturen
+            op=run jobdef={...}             Job an die Ziel-Instanz senden, liefert guid
+            op=results                      gesendete Jobs mit Status und Ergebnis
+            op=result guid                  ein Job mit Ergebnis
+            op=clear_results [guid]         ein bzw. alle abgeschlossenen Ergebnisse entfernen
+    """
+
+    TAGS = ['remote']
+
+    def __init__(self, type='remote_runner', target='', store='mongodb', runners='', poll_interval=10,
+                 timeout=6000, max_results=200):
+        """
+        :param target: Name der Ziel-Instanz (nwebclient.nx.get_name() dort, i.d.R. der Hostname)
+        :param store: type des Job-Speicher-Runners (JobStoreMixin)
+        :param runners: zusaetzliche Runner der Ziel-Instanz (Komma-getrennt), die list_runners nicht liefert
+        :param poll_interval: Sekunden zwischen den Abfragen der Ergebnisse
+        :param timeout: Sekunden, nach denen eine Antwort verworfen wird
+        :param max_results: Anzahl gespeicherter Jobs, aeltere abgeschlossene werden verworfen
+        """
+        super().__init__(type)
+        self.init_remote(target, store, '', poll_interval, timeout)
+        self.extra_runners = [t.strip() for t in str(runners or '').split(',') if t.strip()]
+        self.max_results = int(max_results)
+        self.remote_runners = {}  # type -> {'signatures': [...] | None, 'error': str}
+        self.jobs = {}            # guid -> Eintrag (siehe add_job), in Reihenfolge des Sendens
+        self.define_vars('target', 'store', 'max_results')
+        self.define_sig(d.PStr('op', 'refresh')).r(success='bool', message='str')
+        self.define_sig(d.PStr('op', 'runners')).r(success='bool', runners='dict')
+        self.define_sig(d.PStr('op', 'run'), d.PStr('jobdef')).r(success='bool', message='str', guid='str')
+        self.define_sig(d.PStr('op', 'results')).r(success='bool', results='list')
+        self.define_sig(d.PStr('op', 'result'), d.PStr('guid')).r(success='bool', result='dict')
+        self.define_sig(d.PStr('op', 'clear_results'), d.PStr('guid', '')).r(success='bool', message='str')
+
+    # --- RemoteJobMixin -------------------------------------------------------------------------
+
+    def remote_job_label(self, job: dict):
+        if job.get('type') == 'list_runners':
+            return 'Runner abrufen'
+        if job.get('op') == 'get_signatures':
+            return 'Signaturen ' + str(job.get('type', ''))
+        return self.job_label(job)
+
+    @staticmethod
+    def job_label(job: dict) -> str:
+        label = str(job.get('type', ''))
+        if job.get('op'):
+            label += ' ' + str(job['op'])
+        return label
+
+    def on_remote_result(self, meta: dict, result: dict):
+        """ unter remote_lock """
+        kind = meta.get('kind')
+        if kind == 'list':
+            self.on_runner_list(result)
+        elif kind == 'sigs':
+            self.on_signatures(meta['runner'], result)
+        elif kind == 'job':
+            self.on_job_result(meta['guid'], result)
+
+    def remote_changed(self):
+        """ unter remote_lock: Jobs, deren Antwort verworfen wurde (Timeout), als timeout markieren """
+        for guid, job in self.jobs.items():
+            if job['status'] == 'pending' and guid not in self.remote_pending:
+                job['status'] = 'timeout'
+                job['done'] = time.time()
+
+    # --- Runner und Signaturen der Ziel-Instanz -------------------------------------------------
+
+    def on_runner_list(self, result: dict):
+        """ unter remote_lock: Ergebnis von list_runners (ohne success), danach Signaturen anfordern """
+        names = result.get('names')
+        if not isinstance(names, list):
+            self.remote_error = 'list_runners: ' + str(result.get('message', 'keine Runner'))
+            names = []
+        else:
+            self.remote_error = ''
+        names = sorted(set(map(str, names)) | set(self.extra_runners))
+        for name in names:
+            self.remote_runners.setdefault(name, {'signatures': None, 'error': ''})
+        # remote_send nimmt remote_lock, daher im eigenen Thread
+        threading.Thread(target=self.request_signatures, args=(names,), daemon=True).start()
+
+    def request_signatures(self, names):
+        for name in names:
+            try:
+                self.remote_send({'type': name, 'op': 'get_signatures'}, kind='sigs', runner=name)
+            except Exception as e:
+                self.set_remote_error(str(e))
+                return
+
+    def on_signatures(self, name: str, result: dict):
+        entry = self.remote_runners.setdefault(name, {'signatures': None, 'error': ''})
+        if result.get('success', False) and isinstance(result.get('signatures'), list):
+            entry['signatures'] = result['signatures']
+            entry['error'] = ''
+        else:
+            entry['error'] = str(result.get('message', 'keine Signaturen'))
+
+    def execute_refresh(self, data):
+        """ Runner der Ziel-Instanz (list_runners) und danach deren Signaturen abrufen """
+        try:
+            self.remote_send({'type': 'list_runners'}, kind='list')
+        except Exception as e:
+            self.set_remote_error(str(e))
+            return self.fail(str(e))
+        if self.extra_runners:
+            threading.Thread(target=self.request_signatures, args=(list(self.extra_runners),), daemon=True).start()
+        return self.success('Abfrage gesendet, wartet auf Antwort')
+
+    def execute_runners(self, data):
+        with self.remote_lock:
+            return self.success(runners={k: dict(v) for k, v in self.remote_runners.items()})
+
+    # --- Jobs -----------------------------------------------------------------------------------
+
+    def execute_run(self, data):
+        """ Job aus jobdef (JSON mit type) an die Ziel-Instanz senden """
+        job, error = JobStoreMixin.parse_jobdef(self, data)
+        if error is not None:
+            return self.fail(error)
+        with self.remote_lock:
+            self.trim_jobs()
+        try:
+            guid = self.remote_send(job, kind='job')
+        except Exception as e:
+            self.set_remote_error(str(e))
+            return self.fail(str(e))
+        with self.remote_lock:
+            self.jobs[guid] = dict(guid=guid, job=job, label=self.job_label(job), status='pending',
+                                   sent=time.time(), done=None, result=None)
+        return self.success(f'{self.job_label(job)} gesendet', guid=guid)
+
+    def trim_jobs(self):
+        """ unter remote_lock: aelteste abgeschlossene Jobs entfernen, bis Platz fuer einen neuen ist """
+        for guid in list(self.jobs.keys()):
+            if len(self.jobs) < self.max_results:
+                return
+            if self.jobs[guid]['status'] != 'pending':
+                del self.jobs[guid]
+
+    def on_job_result(self, guid: str, result: dict):
+        job = self.jobs.get(guid)
+        if job is None:
+            return
+        job['status'] = 'ok' if result.get('success', True) else 'error'
+        job['done'] = time.time()
+        job['result'] = result
+
+    def execute_results(self, data):
+        with self.remote_lock:
+            return self.success(results=[dict(j) for j in self.jobs.values()])
+
+    def execute_result(self, data):
+        with self.remote_lock:
+            job = self.jobs.get(str(data.get('guid', '')))
+            if job is None:
+                return self.fail('Unbekannte guid')
+            return self.success(result=dict(job))
+
+    def execute_clear_results(self, data):
+        guid = str(data.get('guid') or '')
+        with self.remote_lock:
+            if guid:
+                removed = 1 if self.jobs.pop(guid, None) is not None else 0
+            else:
+                done = [g for g, j in self.jobs.items() if j['status'] != 'pending']
+                for g in done:
+                    del self.jobs[g]
+                removed = len(done)
+        return self.success(f'{removed} Ergebnis(se) entfernt', ui_reload=True)
+
+    # --- Seite: Runner --------------------------------------------------------------------------
+
+    RUN_JS = """
+    function nxrr_toggle(id) {
+      var e = document.getElementById(id);
+      e.style.display = e.style.display === 'none' ? 'block' : 'none';
+    }
+    function nxrr_submit(id, rtype) {
+      var f = document.getElementById(id);
+      var job = JSON.parse(f.dataset.job);
+      f.querySelectorAll('[data-param]').forEach(function(i) {
+        var v = i.value;
+        if (v === '') { return; }
+        if (i.type === 'number') { v = Number(v); }
+        job[i.dataset.param] = v;
+      });
+      var msg = f.querySelector('.nxrr_msg');
+      msg.textContent = 'sende...';
+      exec_job({type: rtype, op: 'run', jobdef: JSON.stringify(job)}, function(r) {
+        msg.textContent = (r && r.message) ? r.message : JSON.stringify(r);
+      });
+    }
+    """
+
+    def nav(self, p: b.Page):
+        with self.remote_lock:
+            pending = sum(1 for j in self.jobs.values() if j['status'] == 'pending')
+            count = len(self.jobs)
+        p.div(' | '.join([w.a("Runner", self.link(self.part_index), hint="Runner und Signaturen der Ziel-Instanz"),
+                          w.a(f"Ergebnisse ({count}, {pending} offen)", self.link(self.part_results),
+                              hint="Gesendete Jobs mit Status und Ergebnis")]))
+
+    def part_header(self, p: b.Page):
+        error = self.check_store() if self.target else 'target (Name der Ziel-Instanz) ist nicht gesetzt'
+        if error:
+            p(w.alert_error(esc(error)))
+        with self.remote_lock:
+            p.prop("Status", esc(self.remote_status()))
+        p.prop("Job-Speicher", esc(self.store))
+
+    def part_index(self, p: b.Page, params={}):
+        self.nav(p)
+        self.part_header(p)
+        p.div(self.action_btn(dict(type=self.type, op='refresh', title="Runner abrufen"),
+                              hint="Fragt die Runner der Ziel-Instanz und ihre Signaturen ueber den Job-Speicher ab"))
+        p.script(self.RUN_JS)
+        with self.remote_lock:
+            runners = {k: dict(v) for k, v in self.remote_runners.items()}
+        if not runners:
+            p(w.alert_info("Noch keine Runner bekannt, mit \"Runner abrufen\" abfragen."))
+        for i, (name, entry) in enumerate(sorted(runners.items())):
+            self.part_remote_runner(p, f'nxrr_{i}', name, entry)
+
+    def part_remote_runner(self, p: b.Page, prefix: str, name: str, entry: dict):
+        sigs = entry.get('signatures')
+        count = '?' if sigs is None else len(sigs)
+        with p.expandable(f'{esc(name)} ({count})', expanded=False):
+            if entry.get('error'):
+                p(w.alert_error(esc(entry['error'])))
+            if sigs is None:
+                p.div("Signaturen noch nicht abgerufen.")
+                return
+            if not sigs:
+                p.div("Keine Signaturen.")
+            for j, sig in enumerate(sigs):
+                self.part_signature(p, f'{prefix}_{j}', name, sig)
+
+    def part_signature(self, p: b.Page, form_id: str, runner: str, sig: dict):
+        label = sig.get('label') or sig.get('name') or '?'
+        p('<div class="nxrr_sig" style="margin: 4px 0;">')
+        p(w.button_js("Ausführen", f'nxrr_toggle({json.dumps(form_id)});',
+                      hint=f"Formular fuer die Parameter von {label} anzeigen"))
+        p(f' <b>{esc(label)}</b>')
+        if sig.get('description'):
+            p(f' <small>{esc(sig["description"])}</small>')
+        self.part_signature_form(p, form_id, runner, sig)
+        p('</div>')
+
+    def part_signature_form(self, p: b.Page, form_id: str, runner: str, sig: dict):
+        job = dict(sig.get('job') or {}, type=runner)
+        p(f'<div id="{form_id}" data-job="{esc(json.dumps(job))}" '
+          f'style="display: none; margin: 4px 0 8px 20px;">')
+        for param in sig.get('params', []):
+            if param.get('name') == 'op' and 'op' in job:
+                continue  # fester Name der Signatur
+            self.part_param_input(p, param)
+        p(w.button_js("Senden", f'nxrr_submit({json.dumps(form_id)}, {json.dumps(self.type)});',
+                      hint=f"Job an {self.target} ueber den Job-Speicher {self.store} senden"))
+        p(' <span class="nxrr_msg"></span> ')
+        p(w.a("Ergebnisse", self.link(self.part_results), hint="Ergebnisse der gesendeten Jobs"))
+        p('</div>')
+
+    @staticmethod
+    def part_param_input(p: b.Page, param: dict):
+        name = str(param.get('name', ''))
+        ptype = str(param.get('type', 'str'))
+        default = param.get('default')
+        attrs = {'data-param': name, 'placeholder': ptype}
+        if default is not None:
+            attrs['value'] = esc(default if isinstance(default, str) else json.dumps(default))
+        if ptype in ('int', 'integer', 'float', 'number', 'double', 'real'):
+            attrs['type'] = 'number'
+            attrs['step'] = 'any'
+        hint = f"{name}: {ptype}" + ('' if default is not None else ' (Pflicht, leer = nicht senden)')
+        p.form_input(name, esc(name), hint=hint, **attrs)
+
+    # --- Seite: Ergebnisse ----------------------------------------------------------------------
+
+    STATUS_BADGES = {'pending': ('wartet', 'tag'), 'ok': ('ok', 'ok'), 'error': ('Fehler', 'warn'),
+                     'timeout': ('Timeout', 'warn')}
+
+    def part_results(self, p: b.Page, params={}):
+        self.nav(p)
+        self.part_header(p)
+        with self.remote_lock:
+            rows = [dict(j) for j in reversed(list(self.jobs.values()))]
+        with p.section(h="Ergebnisse"):
+            p.grid(rows, self.result_cols(), params, search=True, empty="Noch keine Jobs gesendet.")
+            p.div(self.action_btn(dict(type=self.type, op='clear_results', title="Abgeschlossene entfernen"),
+                                  hint="Entfernt alle Ergebnisse, auf die nicht mehr gewartet wird"))
+        if any(row['status'] == 'pending' for row in rows):
+            p.js_ready(f'setTimeout(function() {{ window.location.reload(); }}, {int(max(self.poll_interval, 2) * 1000)});')
+
+    def result_cols(self):
+        col = w.Grid.col
+        return [
+            col('sent', "Gesendet", value=lambda e: fmt_ts(e['sent']), sort=lambda e: e['sent']),
+            col('label', "Job", html=True, value=self.col_label, sort=lambda e: e['label']),
+            col('status', "Status", html=True, value=self.col_status),
+            col('duration', "Dauer", value=lambda e: f"{e['done'] - e['sent']:.1f} s" if e['done'] else ''),
+            col('message', "Meldung", value=lambda e: str((e['result'] or {}).get('message', ''))[:120]),
+            col('actions', '', html=True, sortable=False, value=self.col_actions),
+        ]
+
+    def col_label(self, e):
+        return w.a(esc(e['label']), self.link(self.part_result, guid=e['guid']),
+                   hint=json.dumps(e['job'], default=str))
+
+    def col_status(self, e):
+        text, css = self.STATUS_BADGES.get(e['status'], (e['status'], ''))
+        return f'<span class="badge {css}">{esc(text)}</span>'
+
+    def col_actions(self, e):
+        rerun = dict(type=self.type, op='run', jobdef=json.dumps(e['job']), title="Erneut")
+        clear = dict(type=self.type, op='clear_results', guid=e['guid'], title="Entfernen")
+        return (self.action_btn(rerun, hint="Denselben Job noch einmal senden") +
+                self.action_btn(clear, hint="Ergebnis aus der Liste entfernen"))
+
+    def part_result(self, p: b.Page, params={}):
+        self.nav(p)
+        with self.remote_lock:
+            job = self.jobs.get(str(params.get('guid', '')))
+            job = dict(job) if job is not None else None
+        if job is None:
+            p(w.alert_error("Unbekannte guid"))
+            return
+        with p.section(h=f"Job {esc(job['label'])}"):
+            p.prop("guid", esc(job['guid']))
+            p.prop("Status", self.col_status(job))
+            p.prop("Gesendet", fmt_ts(job['sent']))
+            p.prop("Fertig", fmt_ts(job['done']))
+            p.div(self.col_actions(job))
+            p.h3("Job")
+            p.pre(esc(json.dumps(job['job'], indent=2, default=str)))
+            p.h3("Ergebnis")
+            p.pre(esc(json.dumps(job['result'], indent=2, default=str)) if job['result'] is not None else 'wartet...')
+        if job['status'] == 'pending':
+            p.js_ready(f'setTimeout(function() {{ window.location.reload(); }}, {int(max(self.poll_interval, 2) * 1000)});')
+
+
+def fmt_ts(ts) -> str:
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts else ''

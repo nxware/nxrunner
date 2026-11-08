@@ -35,6 +35,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `trello` | `nxrunner.apis:Trello` | Boards eines Trello-Kontos | `py-trello` |
 | `website` | `nxrunner.web:WebsiteController` | Webseite im Browser per Userscript steuern, CSS-Selektoren, Daten auslesen/ändern | `flask` |
 | `deployments` | `nxrunner.projects:Deployments` | Git-Checkouts per SSH mit origin vergleichen und aktualisieren | (`ssh`-Client) |
+| `remote_runner` | `nxrunner.jobstore:RemoteRunner` | Runner einer anderen Instanz über einen Job-Speicher ausführen | |
 
 Fehlende Module lassen sich in der Registry mit `op=registry_pip name=<entry>` installieren, oder der Runner wird
 mit `op=registry_docker` in einem Container gestartet (siehe [NxRunner](#nxrunner-dispatcher)).
@@ -507,6 +508,40 @@ hostinfo:
 | `op=hostinfo [host]` | Host-Infos (Arg `hostinfo`) eines bzw. aller SSH-Hosts abfragen und speichern |
 
 ## Infrastruktur
+
+### RemoteRunner
+
+`nxrunner.jobstore:RemoteRunner(type='remote_runner', target='', store='mongodb', runners='', poll_interval=10,
+timeout=6000, max_results=200)`, Tag `remote`
+
+Bedient die Runner einer anderen Instanz `target` über einen Job-Speicher (`store`, ein Runner mit `JobStoreMixin`,
+z.B. `nweb_jobs`, MongoDB oder zum Testen `DirectJobStore`). Jobs gehen verschlüsselt (`cenqueue`, CryptRunner
+`crypt` nötig) in den Speicher, ein Thread holt die Ergebnisse per guid ab (`RemoteJobMixin`).
+
+```
+remote: nxrunner.jobstore:RemoteRunner(target="pi4", store="nweb_jobs")
+remote: nxrunner.jobstore:RemoteRunner(target="local", store="store", poll_interval=1)   # mit DirectJobStore
+```
+
+- **Runner**: „Runner abrufen“ fragt `{type: list_runners}` (per Spec registrierte Runner) und je Runner
+  `op=get_signatures` ab. Runner, die `list_runners` nicht liefert, lassen sich mit `runners="a,b"` ergänzen. Je
+  Runner gibt es ein aufklappbares Feld mit seinen Signaturen; „Ausführen“ öffnet ein Formular für die Parameter
+  (Standardwerte vorbelegt, leere Felder werden nicht gesendet), „Senden“ stellt den Job in den Speicher.
+- **Ergebnisse**: gesendete Jobs mit Status (wartet, ok, Fehler, Timeout), Dauer und Meldung; je Job eine Seite mit
+  Job und Ergebnis, „Erneut“ sendet ihn noch einmal. Die Seite lädt neu, solange Antworten ausstehen. Gehalten
+  werden höchstens `max_results` Jobs (nur im Speicher).
+
+| Job | Beschreibung |
+|---|---|
+| `op=refresh` | Runner und Signaturen der Ziel-Instanz abrufen |
+| `op=runners` | bekannte Runner mit Signaturen |
+| `op=run jobdef={...}` | Job (mit `type`) an die Ziel-Instanz senden, liefert `guid` |
+| `op=results` | gesendete Jobs mit Status und Ergebnis |
+| `op=result guid` | ein Job mit Ergebnis |
+| `op=clear_results [guid]` | ein bzw. alle abgeschlossenen Ergebnisse entfernen |
+
+Variablen: `target`, `store`, `max_results`
+
 
 ### NxRunner (Dispatcher)
 
