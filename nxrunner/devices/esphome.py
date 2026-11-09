@@ -387,6 +387,7 @@ class EspHomeDevice(r.BaseJobExecutor):
         {"type": "kueche", "op": "logs"}                                     mitgeschriebene Logs (nur live)
         {"type": "kueche", "op": "switch", "key": "relais", "state": true}   key = Key, object_id oder Name
         {"type": "kueche", "op": "button", "name": "Neustart"}               Button ueber die native API
+        {"type": "kueche", "op": "neustart"}                                 Button per object_id, je Button eine Signatur
         {"type": "kueche", "op": "web_button", "name": "neustart"}           Button ueber die Web-API
         {"type": "kueche", "op": "number", "name": "helligkeit", "value": 5} Number ueber die Web-API
         {"type": "kueche", "op": "service", "name": "play", "params": {}}    User-Service (api: actions:)
@@ -412,6 +413,7 @@ class EspHomeDevice(r.BaseJobExecutor):
         self.values = {}
         self.value_times = {}
         self.entity_vars = {}
+        self.button_ops = {}  # op -> Key der Button-Entity, siehe update_button_sigs
         self.logs = deque(maxlen=500)
         self.log_level = log_level
         self.live_api = None
@@ -933,6 +935,21 @@ class EspHomeDevice(r.BaseJobExecutor):
             self.define_sig(d.PInt('read_a', 1), d.PInt('channel', 0)
                             .desc(f"Kanal 0-{len(self.ANALOG_IDS) - 1} = {', '.join(self.ANALOG_IDS)}")) \
                 .set_description("Liest einen analogen Eingang").r(success='bool', message='str', value='float')
+        self.update_button_sigs()
+
+    def update_button_sigs(self):
+        """
+        Je Button-Entity eine Signatur op=<object_id>, z.B. {"op": "stepper_vorw_rts"} fuer "Stepper vorwärts".
+        object_ids, die schon als Op belegt sind (execute_<op>), bekommen keine Signatur.
+        """
+        old = set(self.button_ops)
+        self.signatures.items = [s for s in self.signatures if not ('op' in s and s['op'].default_value in old)]
+        self.button_ops = {}
+        for e in self.entities:
+            if isinstance(e, self.aio.ButtonInfo) and not hasattr(self, 'execute_' + e.object_id):
+                self.button_ops[e.object_id] = e.key
+                self.define_sig(d.PStr('op', e.object_id)) \
+                    .set_description(f"Drückt den Button {e.name}").r(success='bool', message='str')
 
     def define_static_sigs(self):
         self.define_sig(d.PStr('op', 'refresh')).set_description("Entities, Services und Zustände neu laden") \
@@ -951,6 +968,9 @@ class EspHomeDevice(r.BaseJobExecutor):
                 return self.success('ok', value=self.read_a(data.get('channel', 0)))
             except Exception as e:
                 return self.fail(str(e))
+        if data.get('op') in self.button_ops:
+            self.button_press(self.button_ops[data['op']])
+            return self.success('done')
         return super().execute(data)
 
     # --- Jobs -------------------------------------------------------------------------------

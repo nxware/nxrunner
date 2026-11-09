@@ -32,7 +32,6 @@ header nav { margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }
 #nav a { color: var(--header-muted); text-decoration: none; font-size: 14px; }
 #nav a:hover { color: rgba(255, 255, 255, .75); }
 main { display: grid; grid-template-columns: 280px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
-@media (max-width: 760px) { main { grid-template-columns: 1fr; padding: 16px; } }
 .card { background: var(--panel); border: 1px solid var(--border); padding: 16px; }
 aside input[type=search] { width: 100%; padding: 8px 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
 .list { list-style: none; margin: 12px 0 0; padding: 0; max-height: 70vh; overflow: auto; }
@@ -94,6 +93,37 @@ pre { background: var(--code); padding: 12px; overflow: auto; max-height: 50vh; 
 .reg-msg.ok { color: var(--ok); }
 .reg-msg.err { color: var(--err); }
 .reg-msg pre { margin-top: 4px; max-height: 200px; }
+/* Mobile: nur unterhalb 760px, Desktop bleibt unveraendert */
+@media (max-width: 760px) {
+  header { position: static; flex-wrap: wrap; gap: 4px 12px; padding: 10px 12px; min-height: 0; }
+  header nav { margin-left: 0; width: 100%; flex-wrap: nowrap; overflow-x: auto; gap: 0; -webkit-overflow-scrolling: touch; }
+  #nav a { padding: 8px 12px 4px 0; white-space: nowrap; }
+  main { grid-template-columns: 1fr; gap: 12px; padding: 12px; }
+  .card { padding: 12px; }
+  #content { scroll-margin-top: 12px; }
+  /* 16px verhindert das automatische Zoomen auf iOS */
+  input, textarea, select { font-size: 16px; }
+  aside input[type=search] { padding: 10px; }
+  .list { max-height: 40vh; }
+  .list li { padding: 12px 10px; }
+  /* kein Hover auf Touch-Geraeten: Favoriten-Stern immer sichtbar und gross genug zum Antippen */
+  .list li button.fav { opacity: .6; font-size: 20px; padding: 4px 8px; }
+  #content .nx_menu li { flex: 1 1 calc(50% - 6px); }
+  #content .nx_menu a { padding: 10px 12px; text-align: center; }
+  button { padding: 10px 16px; }
+  pre { font-size: 12px; }
+  #error { margin: 0 12px 12px; }
+  #content img, #content video, #content iframe { max-width: 100%; height: auto; }
+  #content table { display: block; overflow-x: auto; }
+  /* Registry / Installieren */
+  .reg-tools input[type=search] { min-width: 0; flex-basis: 100%; }
+  .reg-head .actions { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  .reg-head .actions button { padding: 8px 12px; flex: 1 1 auto; }
+  .chip { padding: 6px 10px; }
+  .reg-form { grid-template-columns: 1fr; gap: 4px; }
+  .reg-form label { margin-top: 6px; }
+  .reg-form input, .reg-form textarea { padding: 8px; }
+}
 </style>
 </head>
 <body class="light">
@@ -239,6 +269,8 @@ function select(name) {
   history.pushState(null, '', '?' + new URLSearchParams({[DATA.key]: name}));
   qs('#error').textContent = '';
   setContent('<div class="muted">L&auml;dt&hellip;</div>');
+  // auf dem Handy liegt der Inhalt unter der Liste
+  if (matchMedia('(max-width: 760px)').matches) qs('#content').scrollIntoView({behavior: 'smooth'});
   exec_job({[DATA.key]: name, page: 'index'}, result => {
     if (result.lazyload) markLoaded(name);
     if (current !== name) return;
