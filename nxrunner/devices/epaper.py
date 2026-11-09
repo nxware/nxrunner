@@ -27,8 +27,10 @@ Angezeigt werden die ersten MAX_ROWS Eintraege des Dashboards als Zeilen "Label 
         {"type": "crowpanel", "op": "get_script"}         Script als value
         {"type": "crowpanel", "op": "set_sleep", "seconds": 600}
         {"type": "crowpanel", "op": "set_dark", "dark": 1}     Darkmode, das Geraet speichert ihn im Flash
+        {"type": "crowpanel", "op": "set_refresh", "mode": "still"}
+            standard: ein Voll-Refresh (flackert schwarz/weiss)
+            still:    mehrere Teil-Refreshes ohne Invertieren, das Geraet speichert den Modus im Flash
 
-    Ein Akkustand ist nicht verfuegbar: das Board fuehrt die Akkuspannung auf keinen ADC-Pin.
 """
 import html
 import time
@@ -56,11 +58,14 @@ class EspEPaperDashboard(Dashboard):
     # Tasten im Broadcast -> Event
     BUTTON_EVENTS = {'exit': 'on_exit', 'menu': 'on_menu', 'rswitch': 'on_rswitch'}
 
+    REFRESH_MODES = {'standard': 'Standard', 'still': 'Still'}
+
     def __init__(self, type='epaper', items=None, file=None, interval=5000, db: bool = False,
-                 sleep=None, dark=False, udp=True, udp_port=7070):
+                 sleep=None, dark=False, refresh='standard', udp=True, udp_port=7070):
         """
         :param sleep: Sekunden Deep Sleep bis zur naechsten Aktualisierung, ohne Angabe SLEEP_SECONDS der Firmware
         :param dark: Darkmode (weiss auf schwarz)
+        :param refresh: standard (Voll-Refresh) oder still (mehrere Teil-Refreshes ohne Flackern)
         :param udp: bei Bedarf einen UdpServer auf udp_port anlegen und die Broadcasts des Geraets auswerten
         """
         super().__init__(type, items=items, file=file, interval=interval, db=db)
@@ -68,6 +73,7 @@ class EspEPaperDashboard(Dashboard):
         if sleep is not None:
             self.set_sleep_seconds(sleep)
         self.dark = bool(dark)
+        self.refresh = refresh if refresh in self.REFRESH_MODES else 'standard'
         self.udp = udp
         self.udp_port = int(udp_port)
         self.udp_runner = None
@@ -77,7 +83,7 @@ class EspEPaperDashboard(Dashboard):
         self.last_request = None   # Zeitpunkt des letzten Script-Abrufs
         self.last_done = None      # Zeitpunkt der letzten Rueckmeldung w=done
         self.last_error = None
-        self.define_vars('ip', 'sleep', 'dark', 'last_announce', 'last_button', 'last_request', 'last_done',
+        self.define_vars('ip', 'sleep', 'dark', 'refresh', 'last_announce', 'last_button', 'last_request', 'last_done',
                          'last_error')
         self.define_event('on_exit')
         self.define_event('on_menu')
@@ -126,6 +132,9 @@ class EspEPaperDashboard(Dashboard):
         self.emit_var_change('ip', parts[2])
         self.ip = parts[2]
         self.last_announce = time.time()
+        button = ' '.join(parts[3:])
+        self.info(f'{time.strftime("%H:%M:%S")} Panel {parts[1]} meldet sich ({parts[2]})'
+                  + (f', Taste: {button}' if button else ''))
         if len(parts) > 3:
             self.on_button(parts[3], parts[4] if len(parts) > 4 else '')
 
@@ -175,6 +184,7 @@ class EspEPaperDashboard(Dashboard):
             lines.append(f'v{i + 1} set-x {value_x}')
             lines.append(f'v{i + 1} set-text {self.quote(value[:value_len])}')
         lines.append(f'epaper dark {1 if self.dark else 0}')
+        lines.append(f'epaper refresh {self.refresh}')
         if self.sleep is not None:
             lines.append(f'epaper sleep {self.sleep}')
         return '\n'.join(lines) + '\n'
@@ -191,12 +201,14 @@ class EspEPaperDashboard(Dashboard):
             return self.device_request()
         if 'op' not in data and 'w' in data:
             self.last_done = time.time()
+            self.info(f'{time.strftime("%H:%M:%S")} Panel {self.type} hat die Anzeige aktualisiert')
             return self.success('ok')
         return super().execute(data)
 
     def device_request(self) -> str:
         """ Antwort als Text, der Runner-Server sendet Strings unveraendert """
         self.last_request = time.time()
+        self.info(f'{time.strftime("%H:%M:%S")} Panel {self.type} ruft die Anzeige ab')
         try:
             script = self.script()
             self.last_error = None
@@ -232,6 +244,16 @@ class EspEPaperDashboard(Dashboard):
         self.set_dark_value(dark)
         return self.success(f'Darkmode {"an" if self.dark else "aus"}', ui_reload=True)
 
+    @op("Setzt den Refresh-Modus (mode: standard oder still), gilt ab dem naechsten Abruf und wird dort gespeichert",
+        result={'success': 'bool', 'message': 'str'})
+    def set_refresh(self, mode: str = 'standard'):
+        mode = str(mode).strip().lower()
+        if mode not in self.REFRESH_MODES:
+            return self.fail(f'Unbekannter Modus {mode}, erlaubt: {", ".join(self.REFRESH_MODES)}')
+        self.emit_var_change('refresh', mode)
+        self.refresh = mode
+        return self.success(f'Refresh-Modus {self.REFRESH_MODES[mode]}', ui_reload=True)
+
     # --- Seite --------------------------------------------------------------------------------
 
     def part_index(self, p: base.Page, params={}):
@@ -245,6 +267,12 @@ class EspEPaperDashboard(Dashboard):
                 {'title': 'Ausschalten' if self.dark else 'Einschalten', 'type': self.type, 'op': 'set_dark',
                  'dark': 0 if self.dark else 1},
                 hint='Weiß auf Schwarz, wirkt beim nächsten Abruf, das Gerät speichert die Einstellung'))
+            hints = {'standard': 'Ein Voll-Refresh, das Display flackert schwarz/weiß',
+                     'still': 'Mehrere Teil-Refreshes ohne Invertieren'}
+            p.div(f'Refresh: {self.REFRESH_MODES[self.refresh]} ' + ' '.join(
+                self.action_btn({'title': title, 'type': self.type, 'op': 'set_refresh', 'mode': mode},
+                                hint=hints[mode])
+                for mode, title in self.REFRESH_MODES.items() if mode != self.refresh))
             p(self.action_btn({'title': 'Script anzeigen', 'type': self.type, 'op': 'get_script'},
                               hint='Befehle, die das Gerät beim nächsten Aufwachen erhält'))
         super().part_index(p, params)
@@ -258,7 +286,7 @@ class EspEPaperDashboard(Dashboard):
                 p.div(f'{title}: {u.format_age(t)}', title=u.format_datetime(t))
         if self.last_button:
             p.div('Letzte Taste: ' + html.escape(self.last_button))
-        p.div('Akku: nicht messbar (Akkuspannung liegt an keinem ADC-Pin)')
+        # p.div('Akku: nicht messbar (Akkuspannung liegt an keinem ADC-Pin)')
         if not self.udp:
             p.div('UDP aus')
         elif self.udp_runner is None:
