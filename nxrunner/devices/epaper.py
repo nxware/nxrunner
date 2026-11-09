@@ -1,8 +1,10 @@
 """
 Dashboard fuer ein E-Paper-Display (CrowPanel 2.13", ESP32-S3, 250x122) mit der Firmware esp_epaper.
 
-Das Geraet schlaeft die meiste Zeit (Deep Sleep) und ist daher nicht erreichbar. Nach jedem Aufwachen:
-    1. UDP-Broadcast an Port 7070: "nxepaper <NX_NAME> <ip>"
+Das Geraet schlaeft die meiste Zeit (Deep Sleep) und ist daher nicht erreichbar. Es wacht nach der Schlafdauer
+oder durch die Tasten EXIT, MENU und den Drehschalter auf. Nach jedem Aufwachen:
+    1. UDP-Broadcast an Port 7070: "nxepaper <NX_NAME> <ip>", nach einem Tastendruck mit Taste
+       ("... exit", "... menu", "... rswitch up|down|press") -> Events on_exit, on_menu, on_rswitch (direction)
     2. GET NPY_URL?type=<NX_NAME>&r=1&v=0      -> Antwort ist ein nxmc-Script (ein Befehl pro Zeile, CMD.md)
     3. Anzeige aktualisieren
     4. GET NPY_URL?type=<NX_NAME>&w=done
@@ -14,7 +16,7 @@ Angezeigt werden die ersten MAX_ROWS Eintraege des Dashboards als Zeilen "Label 
 
     Config (runners):
         crowpanel: nxrunner.devices.epaper:EspEPaperDashboard(items=["pin1.state"])
-        crowpanel: nxrunner.devices.epaper:EspEPaperDashboard(db=True, sleep=600)
+        crowpanel: nxrunner.devices.epaper:EspEPaperDashboard(db=True, sleep=600, dark=True)
         crowpanel: nxrunner.devices.epaper:EspEPaperDashboard(udp=False)     ohne UdpServer
 
     Gibt es keinen UdpServer auf udp_port, wird einer angelegt (udp7070), um die Broadcasts zu empfangen.
@@ -24,12 +26,16 @@ Angezeigt werden die ersten MAX_ROWS Eintraege des Dashboards als Zeilen "Label 
         {"type": "crowpanel", "w": "done"}                Geraet hat die Anzeige aktualisiert
         {"type": "crowpanel", "op": "get_script"}         Script als value
         {"type": "crowpanel", "op": "set_sleep", "seconds": 600}
+        {"type": "crowpanel", "op": "set_dark", "dark": 1}     Darkmode, das Geraet speichert ihn im Flash
+
+    Ein Akkustand ist nicht verfuegbar: das Board fuehrt die Akkuspannung auf keinen ADC-Pin.
 """
 import html
 import time
 
 from nwebclient import base
 from nwebclient import util as u
+from nwebclient import web as w
 from nwebclient.runner import op
 from nwebclient.runner.dashboard import Dashboard
 from nwebclient.runner.dispatcher import LazyDispatcher
@@ -47,29 +53,39 @@ class EspEPaperDashboard(Dashboard):
     MAX_LABEL = 14
     MIN_SLEEP = 60
 
+    # Tasten im Broadcast -> Event
+    BUTTON_EVENTS = {'exit': 'on_exit', 'menu': 'on_menu', 'rswitch': 'on_rswitch'}
+
     def __init__(self, type='epaper', items=None, file=None, interval=5000, db: bool = False,
-                 sleep=None, udp=True, udp_port=7070):
+                 sleep=None, dark=False, udp=True, udp_port=7070):
         """
         :param sleep: Sekunden Deep Sleep bis zur naechsten Aktualisierung, ohne Angabe SLEEP_SECONDS der Firmware
+        :param dark: Darkmode (weiss auf schwarz)
         :param udp: bei Bedarf einen UdpServer auf udp_port anlegen und die Broadcasts des Geraets auswerten
         """
         super().__init__(type, items=items, file=file, interval=interval, db=db)
         self.sleep = None
         if sleep is not None:
             self.set_sleep_seconds(sleep)
+        self.dark = bool(dark)
         self.udp = udp
         self.udp_port = int(udp_port)
-        self.udp_listening = False
+        self.udp_runner = None
         self.ip = None
         self.last_announce = None  # Zeitpunkt des letzten Broadcasts
+        self.last_button = None    # zuletzt gedrueckte Taste, z.B. "menu" oder "rswitch up"
         self.last_request = None   # Zeitpunkt des letzten Script-Abrufs
         self.last_done = None      # Zeitpunkt der letzten Rueckmeldung w=done
         self.last_error = None
-        self.define_vars('ip', 'sleep', 'last_announce', 'last_request', 'last_done', 'last_error')
+        self.define_vars('ip', 'sleep', 'dark', 'last_announce', 'last_button', 'last_request', 'last_done',
+                         'last_error')
+        self.define_event('on_exit')
+        self.define_event('on_menu')
+        self.define_event('on_rswitch', {'direction': 'str'})
 
     def onOwnerChanged(self, newOnwer):
         super().onOwnerChanged(newOnwer)
-        if self.udp and not self.udp_listening:
+        if self.udp and self.udp_runner is None:
             self.listen_udp()
 
     # --- UDP ----------------------------------------------------------------------------------
@@ -95,19 +111,33 @@ class EspEPaperDashboard(Dashboard):
         if dispatcher is None:
             return
         try:
-            self.udp_server(dispatcher).add_event_listener('on_udp_message', self.on_udp_message)
-            self.udp_listening = True
+            runner = self.udp_server(dispatcher)
+            runner.add_event_listener('on_udp_message', self.on_udp_message)
+            self.udp_runner = runner
         except Exception as e:
             self.last_error = f'UDP {self.udp_port}: {type(e).__name__}: {e}'
             self.error(self.last_error)
 
     def on_udp_message(self, data):
-        """ "nxepaper <name> <ip>" des eigenen Geraets (name = type des Runners) """
+        """ "nxepaper <name> <ip> [<taste> [<richtung>]]" des eigenen Geraets (name = type des Runners) """
         parts = str(data.get('message', '')).split()
-        if len(parts) == 3 and parts[0] == self.ANNOUNCE_PREFIX and parts[1].lower() == self.type.lower():
-            self.emit_var_change('ip', parts[2])
-            self.ip = parts[2]
-            self.last_announce = time.time()
+        if len(parts) < 3 or parts[0] != self.ANNOUNCE_PREFIX or parts[1].lower() != self.type.lower():
+            return
+        self.emit_var_change('ip', parts[2])
+        self.ip = parts[2]
+        self.last_announce = time.time()
+        if len(parts) > 3:
+            self.on_button(parts[3], parts[4] if len(parts) > 4 else '')
+
+    def on_button(self, button, direction=''):
+        event = self.BUTTON_EVENTS.get(button)
+        if event is None:
+            return
+        self.last_button = (button + ' ' + direction).strip()
+        if event == 'on_rswitch':
+            self.emit_event(event, ip=self.ip, direction=direction)
+        else:
+            self.emit_event(event, ip=self.ip)
 
     # --- Script -------------------------------------------------------------------------------
 
@@ -129,7 +159,7 @@ class EspEPaperDashboard(Dashboard):
 
     def rows(self) -> list:
         """ (Label, Wert) der ersten MAX_ROWS Eintraege """
-        return [(self.label(item)[:self.MAX_LABEL], self.value_text(item['value']))
+        return [(self.title(item)[:self.MAX_LABEL], self.value_text(item['value']))
                 for item in self.values()[:self.MAX_ROWS]]
 
     def script(self) -> str:
@@ -144,6 +174,7 @@ class EspEPaperDashboard(Dashboard):
             lines.append(f't{i + 1} set-text {self.quote(label)}')
             lines.append(f'v{i + 1} set-x {value_x}')
             lines.append(f'v{i + 1} set-text {self.quote(value[:value_len])}')
+        lines.append(f'epaper dark {1 if self.dark else 0}')
         if self.sleep is not None:
             lines.append(f'epaper sleep {self.sleep}')
         return '\n'.join(lines) + '\n'
@@ -189,6 +220,18 @@ class EspEPaperDashboard(Dashboard):
             return self.fail(f'Ungueltige Sekunden: {seconds}')
         return self.success(f'Deep Sleep: {self.sleep or "Standard der Firmware"} s', ui_reload=True)
 
+    def set_dark_value(self, value):
+        """ auch fuer setvar """
+        dark = str(value).strip().lower() in ('1', 'true', 'ja', 'on')
+        self.emit_var_change('dark', dark)
+        self.dark = dark
+
+    @op("Schaltet den Darkmode des Geraets (dark: 1/0), gilt ab dem naechsten Abruf und wird dort gespeichert",
+        result={'success': 'bool', 'message': 'str'})
+    def set_dark(self, dark: str = '1'):
+        self.set_dark_value(dark)
+        return self.success(f'Darkmode {"an" if self.dark else "aus"}', ui_reload=True)
+
     # --- Seite --------------------------------------------------------------------------------
 
     def part_index(self, p: base.Page, params={}):
@@ -198,6 +241,10 @@ class EspEPaperDashboard(Dashboard):
                          value=html.escape(str(self.sleep or ''), quote=True), placeholder='Standard der Firmware')
             p(self.action_btn_parametric('Setzen', {'type': self.type, 'op': 'set_sleep', 'seconds': '#epaper_sleep'},
                                          hint='Schlafdauer zwischen zwei Aktualisierungen, wirkt beim nächsten Abruf'))
+            p.div(f'Darkmode: {"an" if self.dark else "aus"} ' + self.action_btn(
+                {'title': 'Ausschalten' if self.dark else 'Einschalten', 'type': self.type, 'op': 'set_dark',
+                 'dark': 0 if self.dark else 1},
+                hint='Weiß auf Schwarz, wirkt beim nächsten Abruf, das Gerät speichert die Einstellung'))
             p(self.action_btn({'title': 'Script anzeigen', 'type': self.type, 'op': 'get_script'},
                               hint='Befehle, die das Gerät beim nächsten Aufwachen erhält'))
         super().part_index(p, params)
@@ -209,9 +256,14 @@ class EspEPaperDashboard(Dashboard):
                          ('Letzte Aktualisierung', self.last_done)]:
             if t:
                 p.div(f'{title}: {u.format_age(t)}', title=u.format_datetime(t))
+        if self.last_button:
+            p.div('Letzte Taste: ' + html.escape(self.last_button))
+        p.div('Akku: nicht messbar (Akkuspannung liegt an keinem ADC-Pin)')
         if not self.udp:
             p.div('UDP aus')
-        elif not self.udp_listening:
+        elif self.udp_runner is None:
             p.div(f'UDP {self.udp_port}: nicht verbunden')
+        else:
+            p.div('UDP: ' + w.a(html.escape(self.udp_runner.type), f'?type={self.udp_runner.type}'))
         if self.last_error:
             p.alert_error(html.escape(self.last_error))

@@ -127,7 +127,7 @@ class DashboardCYD(Dashboard):
         for item in self.values()[:self.MAX_METRICS]:
             label = self.label(item)
             options = {k: v for k, v in self.metric_options.get(label, {}).items() if k in self.METRIC_OPTIONS}
-            metric = {'id': self.metric_id(label, used), 'label': label, **options,
+            metric = {'id': self.metric_id(label, used), 'label': self.title(item), **options,
                       'value': self.metric_value(item['value'])}
             metric['label'] = self.ascii(metric['label'])
             if 'unit' in metric:
