@@ -61,7 +61,7 @@ class EspEPaperDashboard(Dashboard):
     REFRESH_MODES = {'standard': 'Standard', 'still': 'Still'}
 
     def __init__(self, type='epaper', items=None, file=None, interval=5000, db: bool = False,
-                 sleep=None, dark=False, refresh='standard', udp=True, udp_port=7070):
+                 sleep=None, dark=False, refresh='still', udp=True, udp_port=7070):
         """
         :param sleep: Sekunden Deep Sleep bis zur naechsten Aktualisierung, ohne Angabe SLEEP_SECONDS der Firmware
         :param dark: Darkmode (weiss auf schwarz)

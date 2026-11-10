@@ -1567,6 +1567,55 @@ class PythonRepo(GitRepo):
         with p.section(h="Python"):
             p(self.action_btn(dict(title="pip install", type=self.type, pip_install=1)))
             p.ul([w.a("pydeps", self.link(self.part_pydeps))])
+        self.part_nxdoc(p)
+
+    def package_candidates(self) -> list:
+        """ moegliche Importnamen: [project] name aus pyproject.toml (- zu _), Runner-Typ, Verzeichnisname """
+        project = self.props.get('project', {})
+        names = [project.get('name') if isinstance(project, dict) else None, self.type,
+                 os.path.basename(str(self.path).rstrip('/\\'))]
+        res = []
+        for n in names:
+            n = (n or '').replace('-', '_')
+            if n and n not in res:
+                res.append(n)
+        return res
+
+    def package_name(self) -> Optional[str]:
+        """ erster importierbarer Kandidat aus package_candidates, None wenn keiner installiert ist """
+        import importlib.util
+        for n in self.package_candidates():
+            try:
+                if importlib.util.find_spec(n) is not None:
+                    return n
+            except (ImportError, ValueError):
+                pass
+        return None
+
+    @r.op("Eigenen Flask-Server fuer nxdoc starten (wenn nxdoc nicht in der Web-App eingehaengt ist)",
+          result={'success': 'bool', 'message': 'str'})
+    def nxdoc_server(self, host: str = '127.0.0.1', port: int = 7012):
+        """ eigenen nxdoc-Server starten, wenn nxdoc nicht in der Web-App eingehaengt ist """
+        from nxrunner.projects import documentation
+        if documentation.start_server(host, port):
+            return self.success('nxdoc: ' + documentation.base_url + 'documentation/')
+        return self.fail('nxdoc-Server nicht gestartet: ' + documentation.server_error)
+
+    def part_nxdoc(self, p: base.Page):
+        """ Abschnitt Doku mit Link auf die nxdoc-Seite des Pakets, nur wenn nxdoc installiert ist """
+        from nxrunner.projects import documentation
+        pkg = self.package_name()
+        if pkg is None or not documentation.installed():
+            return
+        documentation.add_package(pkg, self.path)
+        with p.section(h="Doku"):
+            url = documentation.url(pkg)
+            if url is None:
+                p.div("nxdoc ist nicht in die Web-App eingehängt.")
+                p(self.action_btn(dict(title="nxdoc-Server starten", type=self.type, op='nxdoc_server'),
+                                  hint="Startet einen eigenen Flask-Server für nxdoc (Port 7012)"))
+            else:
+                p.ul([w.a("nxdoc: " + html.escape(pkg), url)])
 
     def part_pydeps(self, p: base.Page, params={}):
         m = self.type

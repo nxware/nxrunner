@@ -320,4 +320,14 @@ class NxRunner(r.AutoDispatcher):
                              methods=['GET', 'POST'])
         except Exception as e:
             self.error(str(e))
+        self.setup_documentation(app)
+
+    def setup_documentation(self, app):
+        """ nxdoc (/documentation/...) einhaengen, wenn installiert; Pakete schaltet PythonRepo frei """
+        from nxrunner.projects import documentation
+        try:
+            if documentation.register(app):
+                self.info("nxdoc unter /documentation/ eingehaengt")
+        except Exception as e:
+            self.error(f"nxdoc nicht eingehaengt: {e}")
 
