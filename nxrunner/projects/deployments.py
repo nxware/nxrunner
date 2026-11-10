@@ -345,13 +345,15 @@ class Deployments(r.BaseJobExecutor):
     def btn(self, title, op_name, hint, **params):
         return self.action_btn(dict(type=self.type, op=op_name, title=title, **params), hint=hint)
 
-    def nav(self, p: base.Page):
-        p.div(' | '.join([w.a("Übersicht", self.link(self.part_index), hint="Alle Deployments"),
-                          w.a("Hosts", self.link(self.part_hosts), hint="Infos je SSH-Host (Arg hostinfo)"),
-                          w.a("Letzte Ausgabe", self.link(self.part_output), hint="Ausgabe des letzten Updates")]))
+    def nav(self, p: base.Page, active=None):
+        """ obere Navigation, active = Titel der aktuellen Seite """
+        p.nav(("Übersicht", self.link(self.part_index), "Alle Deployments"),
+              ("Hosts", self.link(self.part_hosts), "Infos je SSH-Host (Arg hostinfo)"),
+              ("Letzte Ausgabe", self.link(self.part_output), "Ausgabe des letzten Updates"),
+              active=active)
 
     def part_index(self, p: base.Page, params={}):
-        self.nav(p)
+        self.nav(p, "Übersicht")
         deps = self.deployments()
         with p.section(h="Deployments"):
             if not deps:
@@ -481,7 +483,7 @@ class Deployments(r.BaseJobExecutor):
             p.pre(esc(upd.get('output') or ''))
 
     def part_output(self, p: base.Page, params={}):
-        self.nav(p)
+        self.nav(p, "Letzte Ausgabe")
         with p.section(h="Letzte Ausgabe"):
             p.div(esc(self.last_cmd or "Seit dem Start wurde nichts aktualisiert."))
             p.pre(esc(self.last_output))
@@ -491,7 +493,7 @@ class Deployments(r.BaseJobExecutor):
     # ------------------------------------------------------------------
 
     def part_hosts(self, p: base.Page, params={}):
-        self.nav(p)
+        self.nav(p, "Hosts")
         hosts = self.hosts()
         cmds = self.hostinfo_cmds()
         with p.section(h="Hosts"):

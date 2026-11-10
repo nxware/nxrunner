@@ -120,7 +120,7 @@ class NxRunner(r.AutoDispatcher):
         except Exception as e:
             result = self.fail(str(e))
         if isinstance(result, dict) and result.get('success') is not False and 'content' in result:
-            return {'name': t, 'content': str(result['content'])}
+            return {'name': t, 'content': str(result['content']), 'links': result.get('intern_links')}
         message = result.get('message', '') if isinstance(result, dict) else str(result)
         return {'name': t, 'error': str(message) or json.dumps(result, default=str)}
 

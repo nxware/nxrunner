@@ -241,22 +241,9 @@ function setContent(html) {
   });
 }
 
-// entspricht BaseJobExecutor.part_intern_links; page_* gibt es nur im alten Dispatcher, part_* rendert v2 selbst
-const INTERN_LINKS = [
-  ['StdOut', 'stdout', true], ['Info', 'runner_info', true], ['Events', 'events', false], ['Vars', 'reflect', false], ['Help', 'help', false],
-  ['Run', 'run', true], ['OpenAPI', 'openapi', false], ['Sigs', 'sigs', true], ['Buttons', 'buttons', true]
-];
-
-function internLinks(name) {
-  const items = INTERN_LINKS.map(([title, page, part]) => {
-    const q = new URLSearchParams({[DATA.key]: name, [name]: page});
-    return '<li><a href="' + esc((part ? '?' : '/pysys/dispatcher?') + q) + '">' + esc(title) + '</a></li>';
-  });
-  return '<ul class="nx_menu">' + items.join('') + '</ul>';
-}
-
-function setRunnerContent(name, html) {
-  setContent(html + internLinks(name));
+// links: HTML aus BaseJobExecutor.part_intern_links, das der Runner mit jeder Seite liefert (intern_links)
+function setRunnerContent(name, html, links) {
+  setContent(html + (links || ''));
 }
 
 function showError(message) {
@@ -277,7 +264,7 @@ function select(name) {
     if (result.success === false || result.content === undefined) {
       showError(result.message || JSON.stringify(result, null, 2));
     } else {
-      setRunnerContent(name, result.content);
+      setRunnerContent(name, result.content, result.intern_links);
     }
   });
 }
@@ -496,7 +483,7 @@ function renderInstall() {
 // serverseitig gerenderte Runner-Seite (?type=x&x=page)
 if (DATA.page) {
   current = DATA.page.name;
-  if (DATA.page.error !== undefined) showError(DATA.page.error); else setRunnerContent(current, DATA.page.content);
+  if (DATA.page.error !== undefined) showError(DATA.page.error); else setRunnerContent(current, DATA.page.content, DATA.page.links);
 } else if (DATA.view === 'registry') {
   renderRegistry();
 } else if (DATA.view === 'install') {

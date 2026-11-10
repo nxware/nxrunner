@@ -121,6 +121,12 @@ class Projects(r.BaseJobExecutor):
 
     def part_index(self, p: base.Page, params={}):
         repos = self.args.get('repos', {})
+        p.nav(
+            w.a("Grid", self.link(self.part_grid)),
+            w.a("Git Actions", self.link(self.part_gitactions)),
+            w.a("Search", self.link(self.part_search)),
+            w.a("Graph", self.link(self.part_graph))
+        )
         p.right(self.action_btn(dict(title="Pull All", type=self.type, op='pull_all')))
         p("Zeigt die in der nweb.json:repos definierten Projekte an.")
 
@@ -616,8 +622,6 @@ class Projects(r.BaseJobExecutor):
         p.div(w.a("Projects", self.link('index')))
 
     def part_system(self, p: base.Page, params={}):
-        p.div(w.a("Grid", self.link(self.part_grid)) + ' ' + w.a("Git Actions", self.link(self.part_gitactions))
-              + ' ' + w.a("Search", self.link(self.part_search)) + ' ' + w.a("Graph", self.link(self.part_graph)))
         p.prop("~/dev", (Path.home() / 'dev').exists())
         p.prop("~/repos", (Path.home() / 'repos').exists())
 
@@ -1453,7 +1457,30 @@ class GitRepo(ProjectDir):
                 w.a("Authors", self.link('authors')),
                 w.a("Remote", self.link('remote'))
             ])
+        self.show_gitlab(p)
         self.part_deployments(p, params)
+
+    def gitlab(self):
+        """ GitlabProjectApi, wenn LOCAL.md gitlab_*-Parameter enthaelt, sonst None """
+        from nxrunner.projects.gitlab import GitlabProjectApi
+        if not GitlabProjectApi.is_configured(self.path):
+            return None
+        return GitlabProjectApi(self.path, [remote['url'] for remote in self.remotes()])
+
+    def show_gitlab(self, p: base.Page):
+        api = self.gitlab()
+        if api is None:
+            return
+        with p.section(h="Gitlab"):
+            api.part_summary(p)
+            p.ul([w.a("Pipelines, MRs, Issues", self.link(self.part_gitlab), hint="GitLab-Details per API laden")])
+
+    def part_gitlab(self, p: base.Page, params={}):
+        api = self.gitlab()
+        if api is None:
+            p.div("Keine gitlab_*-Parameter in LOCAL.md")
+            return
+        api.part_gitlab(p, params)
 
     def project_names(self) -> set:
         """ Namen, unter denen das Repo als project_name eines Deployments vorkommen kann """
