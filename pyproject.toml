@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = "Backup System"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = ["nwebclient", "waitress", "flask"]
 
 [project.optional-dependencies]
