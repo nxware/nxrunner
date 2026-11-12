@@ -785,13 +785,15 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     }
     """
 
-    def nav(self, p: b.Page):
+    def nav(self, p: b.Page, active=None):
+        """ obere Navigation, active = Seite (part_*-Methode), die hervorgehoben wird """
         with self.remote_lock:
             pending = sum(1 for j in self.jobs.values() if j['status'] == 'pending')
             count = len(self.jobs)
-        p.div(' | '.join([w.a("Runner", self.link(self.part_index), hint="Runner und Signaturen der Ziel-Instanz"),
-                          w.a(f"Ergebnisse ({count}, {pending} offen)", self.link(self.part_results),
-                              hint="Gesendete Jobs mit Status und Ergebnis")]))
+        p.nav(("Runner", self.link(self.part_index), "Runner und Signaturen der Ziel-Instanz"),
+              (f"Ergebnisse ({count}, {pending} offen)", self.link(self.part_results),
+               "Gesendete Jobs mit Status und Ergebnis"),
+              active=self.link(active) if active is not None else None)
 
     def part_header(self, p: b.Page):
         error = self.check_store() if self.target else 'target (Name der Ziel-Instanz) ist nicht gesetzt'
@@ -803,7 +805,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         p.prop("Runner gespeichert", 'ja (nweb-Persistence)' if self.runners_store() is not None else 'nein')
 
     def part_index(self, p: b.Page, params={}):
-        self.nav(p)
+        self.nav(p, self.part_index)
         self.part_header(p)
         p.div(self.action_btn(dict(type=self.type, op='refresh', title="Runner abrufen"),
                               hint="Fragt die Runner der Ziel-Instanz und ihre Signaturen ueber den Job-Speicher ab"))
@@ -875,7 +877,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                      'timeout': ('Timeout', 'warn')}
 
     def part_results(self, p: b.Page, params={}):
-        self.nav(p)
+        self.nav(p, self.part_results)
         self.part_header(p)
         with self.remote_lock:
             rows = [dict(j) for j in reversed(list(self.jobs.values()))]
@@ -912,7 +914,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                 self.action_btn(clear, hint="Ergebnis aus der Liste entfernen"))
 
     def part_result(self, p: b.Page, params={}):
-        self.nav(p)
+        self.nav(p, self.part_results)
         with self.remote_lock:
             job = self.jobs.get(str(params.get('guid', '')))
             job = dict(job) if job is not None else None
