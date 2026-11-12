@@ -1461,11 +1461,23 @@ class GitRepo(ProjectDir):
         self.part_deployments(p, params)
 
     def gitlab(self):
-        """ GitlabProjectApi, wenn LOCAL.md gitlab_*-Parameter enthaelt, sonst None """
+        """ GitlabProjectApi (einmal erzeugt, haelt den Agent-Zustand), wenn LOCAL.md gitlab_*-Parameter enthaelt """
         from nxrunner.projects.gitlab import GitlabProjectApi
         if not GitlabProjectApi.is_configured(self.path):
             return None
-        return GitlabProjectApi(self.path, [remote['url'] for remote in self.remotes()])
+        if getattr(self, '_gitlab', None) is None:
+            self._gitlab = GitlabProjectApi(self.path, [remote['url'] for remote in self.remotes()], owner=self)
+        else:
+            self._gitlab.params = GitlabProjectApi.read_params(self.path)
+        return self._gitlab
+
+    @r.op("GitLab-Agent: action=start (periodisch, runner), stop oder do_issues (einmalig, runner)",
+          result={'success': 'bool', 'message': 'str'})
+    def gitlab_agent(self, action: str, runner: str = ''):
+        api = self.gitlab()
+        if api is None:
+            return self.fail("Keine gitlab_*-Parameter in LOCAL.md")
+        return api.agent_job(action, runner)
 
     def show_gitlab(self, p: base.Page):
         api = self.gitlab()

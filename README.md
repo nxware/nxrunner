@@ -13,6 +13,14 @@ python -m nwebclient.runner --rest
 
 Default-Port für das Webinterface ist `7070` (`--port 7070`)
 
+### Mit pipx
+
+```
+pipx install nxrunner             # oder: pipx install "nxrunner[full]"
+nxrunner serv
+pipx inject nxrunner paramiko     # zusätzliche Abhängigkeiten in die pipx-venv
+```
+
 ## Runners/Features
 
  - Backup

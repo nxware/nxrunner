@@ -2,7 +2,11 @@
 name = "nxrunner"
 description = "Backup System"
 version = "1.0.6"
+requires-python = ">=3.10"
 dependencies = ["nwebclient", "waitress", "flask"]
+
+[project.scripts]
+nxrunner = "nxrunner.__main__:main"
 
 [project.optional-dependencies]
 full = ["pymongo", "buenavista", "pihole6api", "py-trello", "pydub", "smbprotocol", "paramiko", "docker",
@@ -45,6 +49,7 @@ terminal = "nxrunner.system:Terminal"
 remote_terminal = "nxrunner.system:RemoteTerminal"
 log = "nxrunner.system:LogFoundation"
 remote_runner = "nxrunner.jobstore:RemoteRunner"
+gitlab_agent = "nxrunner.projects.gitlab:GitlabAgentRunner"
 
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"

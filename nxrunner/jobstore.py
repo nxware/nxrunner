@@ -532,7 +532,9 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
       Job (verschluesselt, cenqueue) in den Job-Speicher. Die Ergebnisse zeigt die Seite "Ergebnisse".
 
       Die Runner der Ziel-Instanz kommen von {type: list_runners} (per Spec registrierte Runner) und runners,
-      ihre Signaturen von {type: <runner>, op: get_signatures}.
+      ihre Signaturen von {type: <runner>, op: get_signatures}. Ist eine nweb-Persistence verfuegbar (root.nweb mit
+      setting/set_setting), werden die erkannten Runner mit Signaturen je target als Setting gespeichert und nach
+      einem Neustart wieder angezeigt.
 
         Config (runners):
             remote: nxrunner.jobstore:RemoteRunner(target="pi4")
@@ -565,7 +567,8 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         self.extra_runners = [t.strip() for t in str(runners or '').split(',') if t.strip()]
         self.max_results = int(max_results)
         self.remote_runners = {}  # type -> {'signatures': [...] | None, 'error': str}
-        self.jobs = {}            # guid -> Eintrag (siehe add_job), in Reihenfolge des Sendens
+        self.runners_loaded = False  # remote_runners aus der nweb-Persistence geladen
+        self.jobs = {}           # guid -> Eintrag (siehe add_job), in Reihenfolge des Sendens
         self.define_vars('target', 'store', 'max_results')
         self.define_sig(d.PStr('op', 'refresh')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'runners')).r(success='bool', runners='dict')
@@ -607,10 +610,51 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                 job['status'] = 'timeout'
                 job['done'] = time.time()
 
+    # --- Persistenz der erkannten Runner (nweb-Persistence, system__setting) ----------------------
+
+    def runners_store(self):
+        """ lokale nweb-Persistence mit setting/set_setting oder None """
+        root = self.getRoot()
+        nw = getattr(root, 'nweb', None) if root is not None else None
+        return nw if nw is not None and hasattr(nw, 'set_setting') and hasattr(nw, 'setting') else None
+
+    def runners_setting_key(self) -> str:
+        return f'{self.type}.runners.{self.target}'
+
+    def ensure_runners_loaded(self):
+        """ unter remote_lock: gespeicherte Runner einmalig laden, neuere Abfragen haben Vorrang """
+        if self.runners_loaded:
+            return
+        nw = self.runners_store()
+        if nw is None:
+            return
+        self.runners_loaded = True
+        try:
+            value = json.loads(nw.setting(self.runners_setting_key(), '{}') or '{}')
+        except Exception as e:
+            self.error("Gespeicherte Runner nicht geladen: " + str(e))
+            return
+        if isinstance(value, dict):
+            for name, entry in value.items():
+                if isinstance(entry, dict):
+                    self.remote_runners.setdefault(str(name), {'signatures': entry.get('signatures'),
+                                                               'error': str(entry.get('error', ''))})
+
+    def save_runners(self):
+        """ unter remote_lock: erkannte Runner mit Signaturen speichern (falls Persistence vorhanden) """
+        nw = self.runners_store()
+        if nw is None:
+            return
+        try:
+            nw.set_setting(self.runners_setting_key(), json.dumps(self.remote_runners, default=str))
+        except Exception as e:
+            self.error("Runner nicht gespeichert: " + str(e))
+
     # --- Runner und Signaturen der Ziel-Instanz -------------------------------------------------
 
     def on_runner_list(self, result: dict):
         """ unter remote_lock: Ergebnis von list_runners (ohne success), danach Signaturen anfordern """
+        self.ensure_runners_loaded()
         names = result.get('names')
         if not isinstance(names, list):
             self.remote_error = 'list_runners: ' + str(result.get('message', 'keine Runner'))
@@ -620,6 +664,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         names = sorted(set(map(str, names)) | set(self.extra_runners))
         for name in names:
             self.remote_runners.setdefault(name, {'signatures': None, 'error': ''})
+        self.save_runners()
         # remote_send nimmt remote_lock, daher im eigenen Thread
         threading.Thread(target=self.request_signatures, args=(names,), daemon=True).start()
 
@@ -632,12 +677,14 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                 return
 
     def on_signatures(self, name: str, result: dict):
+        self.ensure_runners_loaded()
         entry = self.remote_runners.setdefault(name, {'signatures': None, 'error': ''})
         if result.get('success', False) and isinstance(result.get('signatures'), list):
             entry['signatures'] = result['signatures']
             entry['error'] = ''
         else:
             entry['error'] = str(result.get('message', 'keine Signaturen'))
+        self.save_runners()
 
     def execute_refresh(self, data):
         """ Runner der Ziel-Instanz (list_runners) und danach deren Signaturen abrufen """
@@ -652,7 +699,9 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
 
     def execute_runners(self, data):
         with self.remote_lock:
-            return self.success(runners={k: dict(v) for k, v in self.remote_runners.items()})
+            self.ensure_runners_loaded()
+            return self.success(runners={k: dict(v) for k, v in self.remote_runners.items()},
+                                persistent=self.runners_store() is not None)
 
     # --- Jobs -----------------------------------------------------------------------------------
 
@@ -751,6 +800,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         with self.remote_lock:
             p.prop("Status", esc(self.remote_status()))
         p.prop("Job-Speicher", esc(self.store))
+        p.prop("Runner gespeichert", 'ja (nweb-Persistence)' if self.runners_store() is not None else 'nein')
 
     def part_index(self, p: b.Page, params={}):
         self.nav(p)
@@ -759,6 +809,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                               hint="Fragt die Runner der Ziel-Instanz und ihre Signaturen ueber den Job-Speicher ab"))
         p.script(self.RUN_JS)
         with self.remote_lock:
+            self.ensure_runners_loaded()
             runners = {k: dict(v) for k, v in self.remote_runners.items()}
         if not runners:
             p(w.alert_info("Noch keine Runner bekannt, mit \"Runner abrufen\" abfragen."))

@@ -117,23 +117,32 @@ def serv():
 def help():
     print("Usage:")
     print("")
-    print("  python -m nxrunner serv")
-    print("  python -m nxrunner deps")
-    print("  python -m nxrunner install pkg")
+    print("  nxrunner serv            (oder: python -m nxrunner serv)")
+    print("  nxrunner deps")
+    print("  nxrunner install pkg")
+    print("")
+    print("Installation via pipx:")
+    print("  pipx install nxrunner")
+    print("  pipx inject nxrunner <pkg>   # weitere Runner-Pakete")
 
 
-args = u.Args(read_local_only=True)
-args.shift()
-action = args.shift('run')
-match action:
-    case "deps":
-        deps_for_pkg("nxrunner")
-    case "serv":
-        serv()
-    case 'install':
-        install(args.shift('nxrunner'))
-    case 'install_deps':
-        install_deps(args.shift('nxrunner'))
-    case _:
-        print("Action" + action)
-        help()
+def main():
+    args = u.Args(read_local_only=True)
+    args.shift()
+    action = args.shift('run')
+    match action:
+        case "deps":
+            deps_for_pkg("nxrunner")
+        case "serv":
+            serv()
+        case 'install':
+            install(args.shift('nxrunner'))
+        case 'install_deps':
+            install_deps(args.shift('nxrunner'))
+        case _:
+            print("Action: " + action)
+            help()
+
+
+if __name__ == "__main__":
+    main()

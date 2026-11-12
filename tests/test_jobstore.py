@@ -652,6 +652,62 @@ class RemoteRunnerTestCase(unittest.TestCase):
         self.assertIn('cenqueue', {sig['job'].get('op') for sig in entry['signatures']})
 
 
+class FakeSettings:
+    """ nweb-Persistence mit setting/set_setting """
+
+    def __init__(self):
+        self.values = {}
+
+    def setting(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set_setting(self, key, value):
+        self.values[key] = value
+
+
+class RemoteRunnerPersistenceTestCase(unittest.TestCase):
+
+    def create(self, settings):
+        runner = TestRemoteRunner(target='pi', store='store')
+        root = create_root(js.DirectJobStore(type='store'), runner)
+        root.nweb = settings
+        return runner
+
+    def test_saves_and_loads_runners(self):
+        settings = FakeSettings()
+        runner = self.create(settings)
+        with runner.remote_lock:
+            runner.on_signatures('a', {'success': True, 'signatures': [{'name': 'x'}]})
+        self.assertIn('remote_runner.runners.pi', settings.values)
+        restarted = self.create(settings)
+        res = restarted.execute({'op': 'runners'})
+        self.assertTrue(res['persistent'])
+        self.assertEqual(res['runners']['a'], {'signatures': [{'name': 'x'}], 'error': ''})
+
+    def test_new_result_wins_over_saved(self):
+        settings = FakeSettings()
+        settings.set_setting('remote_runner.runners.pi', json.dumps({'a': {'signatures': [], 'error': ''},
+                                                                     'b': {'signatures': None, 'error': ''}}))
+        runner = self.create(settings)
+        with runner.remote_lock:
+            runner.on_signatures('a', {'success': True, 'signatures': [{'name': 'neu'}]})
+        saved = json.loads(settings.values['remote_runner.runners.pi'])
+        self.assertEqual(saved['a']['signatures'], [{'name': 'neu'}])
+        self.assertIn('b', saved)
+
+    def test_without_persistence(self):
+        runner = self.create(None)
+        with runner.remote_lock:
+            runner.on_signatures('a', {'success': True, 'signatures': []})
+        self.assertFalse(runner.execute({'op': 'runners'})['persistent'])
+
+    def test_invalid_setting(self):
+        settings = FakeSettings()
+        settings.set_setting('remote_runner.runners.pi', 'kein json')
+        runner = self.create(settings)
+        self.assertEqual(runner.execute({'op': 'runners'})['runners'], {})
+
+
 class FmtTsTestCase(unittest.TestCase):
 
     def test_fmt_ts(self):

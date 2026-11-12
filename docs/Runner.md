@@ -36,6 +36,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `trello` | `nxrunner.apis:Trello` | Boards eines Trello-Kontos | `py-trello` |
 | `website` | `nxrunner.web:WebsiteController` | Webseite im Browser per Userscript steuern, CSS-Selektoren, Daten auslesen/ändern | `flask` |
 | `deployments` | `nxrunner.projects:Deployments` | Git-Checkouts per SSH mit origin vergleichen und aktualisieren | (`ssh`-Client) |
+| `gitlab_agent` | `nxrunner.projects.gitlab:GitlabAgentRunner` | GitLab-Issues (Labels Agent+TODO) automatisch von einem Runner mit `do_issue` bearbeiten lassen | `requests` |
 | `remote_runner` | `nxrunner.jobstore:RemoteRunner` | Runner einer anderen Instanz über einen Job-Speicher ausführen | |
 
 Fehlende Module lassen sich in der Registry mit `op=registry_pip name=<entry>` installieren, oder der Runner wird
@@ -547,6 +548,29 @@ hostinfo:
 | `op=check [name]` | ein bzw. alle Deployments mit origin vergleichen |
 | `op=update name` | `git pull` und danach `update_cmd` im Verzeichnis `path` ausführen, anschließend prüfen |
 | `op=hostinfo [host]` | Host-Infos (Arg `hostinfo`) eines bzw. aller SSH-Hosts abfragen und speichern |
+
+---
+
+### GitlabAgentRunner
+
+`nxrunner.projects.gitlab:GitlabAgentRunner(type='gitlab_agent', token=None, project=None, url=None, account=None,
+path='.', runner='', interval=None, start=True)`, Tags `agent`, `gitlab`
+
+Prüft alle `interval` Sekunden (Standard 3700) die offenen Issues mit den Labels `Agent` und `TODO`, setzt
+`TODO` → `Doing` und ruft beim Runner `runner` (leer: erster gefundener) `do_issue(name, task_text, path, wait=False)`
+auf, z.B. `nxml.agents:OpenCodeAgent`. Ist das Issue fertig, wird der Log in mehreren Kommentaren ins Issue
+geschrieben und `Doing` → `Done` gesetzt. Ohne `token`/`project` zeigt die Startseite eine Anleitung zur Einrichtung.
+
+```
+gitlab_agent: nxrunner.projects.gitlab:GitlabAgentRunner(token="glpat-...", project="gruppe/repo", path="/pfad/zum/repo")
+```
+
+| Job | Beschreibung |
+|---|---|
+| `op=gitlab_agent action=start [runner]` | periodische Prüfung starten |
+| `op=gitlab_agent action=stop` | periodische Prüfung beenden |
+| `op=gitlab_agent action=do_issues [runner]` | einmalig Issues abrufen und starten |
+| `op=agent_status` | aktiv, Runner, laufende Issues, Log |
 
 ## Infrastruktur
 
