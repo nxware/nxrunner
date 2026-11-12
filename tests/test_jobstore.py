@@ -97,6 +97,19 @@ class FakeNWeb:
         return [json.loads(doc.content()) for doc in self.docs('group_id=' + str(group))]
 
 
+class FakeSettings:
+    """ nweb-Persistence mit setting/set_setting im Speicher """
+
+    def __init__(self):
+        self.values = {}
+
+    def setting(self, name, default=None):
+        return self.values.get(name, default)
+
+    def set_setting(self, name, value):
+        self.values[name] = value
+
+
 def create_root(*runners):
     """ JobRunner mit LazyDispatcher, damit getRoot().jobexecutor funktioniert """
     dispatcher = r.LazyDispatcher()
@@ -643,6 +656,105 @@ class RemoteRunnerTestCase(unittest.TestCase):
         with self.runner.remote_lock:
             self.runner.on_runner_list({'message': 'nix'})
         self.assertIn('nix', self.runner.remote_error)
+
+    def test_on_runner_list_empty(self):
+        self.runner.request_signatures = lambda names: None
+        with self.runner.remote_lock:
+            self.runner.on_runner_list({'names': []})
+        self.assertIn('meldet keine Runner', self.runner.remote_error)
+
+    def test_index_while_refresh_pending(self):
+        from nwebclient import base as b
+        self.store.delay = 1000
+        self.assertTrue(self.runner.execute({'op': 'refresh'})['success'])
+        p = b.Page()
+        self.runner.part_index(p, {})
+        html = str(p)
+        self.assertIn(f"Abfrage {self.runner.refresh['guid']}", html)
+        self.assertIn('noch nicht ausgefuehrt', html)
+        self.assertNotIn('Noch keine Runner bekannt', html)
+        self.assertIn('window.location.reload', html)
+
+    def test_refresh_remembers_guid(self):
+        self.store.delay = 1000
+        self.runner.execute({'op': 'refresh'})
+        refresh = self.runner.refresh
+        self.assertEqual(refresh['status'], 'pending')
+        self.assertIn(refresh['guid'], self.runner.remote_pending)
+        self.assertEqual(self.runner.remote_pending[refresh['guid']]['kind'], 'list')
+        self.assertEqual(self.runner.execute({'op': 'runners'})['refresh']['guid'], refresh['guid'])
+
+    def test_page_checks_store_immediately(self):
+        """ Ergebnis liegt im Speicher: die Seite holt es per guid ab, ohne auf den Poll-Thread zu warten """
+        from nwebclient import base as b
+        self.runner.extra_runners = ['store']
+        self.runner.request_signatures = lambda names: None
+        self.runner.execute({'op': 'refresh'})
+        guid = self.runner.refresh['guid']
+        self.assertIn(guid, self.store.results)
+        p = b.Page()
+        self.runner.part_index(p, {})
+        self.assertEqual(self.runner.refresh['status'], 'done')
+        self.assertNotIn(guid, self.store.results, "Ergebnis abgeholt")
+        self.assertIn('ausgefuehrt', str(p))
+        self.assertIn('store (?)', str(p))
+        self.assertNotIn('window.location.reload', str(p))
+
+    def test_refresh_status_op(self):
+        self.store.delay = 1000
+        self.runner.execute({'op': 'refresh'})
+        self.assertEqual(self.runner.execute({'op': 'refresh_status'})['refresh']['status'], 'pending')
+        guid = self.runner.refresh['guid']
+        self.store.results[guid] = (time.time() - 1, self.store.results[guid][1])
+        self.runner.request_signatures = lambda names: None
+        self.assertEqual(self.runner.execute({'op': 'refresh_status'})['refresh']['status'], 'done')
+
+    def test_refresh_survives_restart(self):
+        """ guid wird gespeichert, ein neuer Runner (Neustart) prueft die Abfrage weiter """
+        settings = FakeSettings()
+        self.root.nweb = settings
+        self.store.delay = 1000
+        self.runner.execute({'op': 'refresh'})
+        guid = self.runner.refresh['guid']
+        self.assertEqual(json.loads(settings.values['remote_runner.refresh.local'])['guid'], guid)
+        restarted = TestRemoteRunner(target='local', store='store')
+        restarted.request_signatures = lambda names: None
+        create_root(self.store, self.rec, restarted).nweb = settings
+        self.store.results[guid] = (time.time() - 1, self.store.results[guid][1])
+        restarted.check_refresh()
+        self.assertEqual(restarted.refresh['guid'], guid)
+        self.assertEqual(restarted.refresh['status'], 'done')
+        self.assertEqual(json.loads(settings.values['remote_runner.refresh.local'])['status'], 'done')
+
+    def test_refresh_timeout(self):
+        from nwebclient import base as b
+        self.store.delay = 1000
+        self.runner.execute({'op': 'refresh'})
+        guid = self.runner.refresh['guid']
+        self.runner.remote_pending[guid]['ts'] -= self.runner.timeout + 1
+        self.runner.remote_poll(guid)
+        self.assertEqual(self.runner.refresh['status'], 'timeout')
+        p = b.Page()
+        self.runner.part_index(p, {})
+        self.assertIn('keine Antwort von local', str(p))
+
+    def test_index_without_runners(self):
+        from nwebclient import base as b
+        p = b.Page()
+        self.runner.part_index(p, {})
+        self.assertIn('Noch keine Runner bekannt', str(p))
+        self.assertNotIn('window.location.reload', str(p))
+
+    def test_refresh_shows_runners(self):
+        from nwebclient import base as b
+        self.runner.extra_runners = ['store']
+        self.runner.request_signatures = lambda names: None
+        self.runner.execute({'op': 'refresh'})
+        self.poll_all()
+        p = b.Page()
+        self.runner.part_index(p, {})
+        self.assertIn('store (?)', str(p))
+        self.assertNotIn('Noch keine Runner bekannt', str(p))
 
     def test_request_signatures(self):
         self.runner.request_signatures(['store'])

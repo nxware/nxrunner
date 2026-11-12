@@ -568,10 +568,13 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         self.max_results = int(max_results)
         self.remote_runners = {}  # type -> {'signatures': [...] | None, 'error': str}
         self.runners_loaded = False  # remote_runners aus der nweb-Persistence geladen
+        self.refresh = None          # letzte Abfrage list_runners: {guid, sent, status, done}, siehe set_refresh
         self.jobs = {}           # guid -> Eintrag (siehe add_job), in Reihenfolge des Sendens
         self.define_vars('target', 'store', 'max_results')
         self.define_sig(d.PStr('op', 'refresh')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'runners')).r(success='bool', runners='dict')
+        self.define_sig(d.PStr('op', 'refresh_status')).set_description(
+            "Prueft im Job-Speicher, ob die letzte Abfrage (guid) ausgefuehrt wurde").r(success='bool', refresh='dict')
         self.define_sig(d.PStr('op', 'run'), d.PStr('jobdef')).r(success='bool', message='str', guid='str')
         self.define_sig(d.PStr('op', 'results')).r(success='bool', results='list')
         self.define_sig(d.PStr('op', 'result'), d.PStr('guid')).r(success='bool', result='dict')
@@ -597,6 +600,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         """ unter remote_lock """
         kind = meta.get('kind')
         if kind == 'list':
+            self.on_refresh_done(meta['guid'])
             self.on_runner_list(result)
         elif kind == 'sigs':
             self.on_signatures(meta['runner'], result)
@@ -609,6 +613,10 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             if job['status'] == 'pending' and guid not in self.remote_pending:
                 job['status'] = 'timeout'
                 job['done'] = time.time()
+        refresh = self.refresh
+        if refresh is not None and refresh['status'] == 'pending' and refresh['guid'] not in self.remote_pending:
+            refresh.update(status='timeout', done=time.time())
+            self.save_refresh()
 
     # --- Persistenz der erkannten Runner (nweb-Persistence, system__setting) ----------------------
 
@@ -629,6 +637,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         if nw is None:
             return
         self.runners_loaded = True
+        self.load_refresh(nw)
         try:
             value = json.loads(nw.setting(self.runners_setting_key(), '{}') or '{}')
         except Exception as e:
@@ -650,6 +659,74 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         except Exception as e:
             self.error("Runner nicht gespeichert: " + str(e))
 
+    # --- letzte Abfrage list_runners: guid merken und Ausfuehrung pruefen ------------------------
+
+    def refresh_setting_key(self) -> str:
+        return f'{self.type}.refresh.{self.target}'
+
+    def set_refresh(self, guid: str):
+        """ unter remote_lock: guid der gesendeten Abfrage merken (und speichern) """
+        self.refresh = dict(guid=guid, sent=time.time(), status='pending', done=None)
+        self.save_refresh()
+
+    def save_refresh(self):
+        """ unter remote_lock: letzte Abfrage speichern (falls Persistence vorhanden) """
+        nw = self.runners_store()
+        if nw is None or self.refresh is None:
+            return
+        try:
+            nw.set_setting(self.refresh_setting_key(), json.dumps(self.refresh))
+        except Exception as e:
+            self.error("Abfrage nicht gespeichert: " + str(e))
+
+    def load_refresh(self, nw):
+        """ unter remote_lock: gespeicherte Abfrage laden, eine ausstehende wird wieder abgefragt """
+        try:
+            value = json.loads(nw.setting(self.refresh_setting_key(), '') or 'null')
+        except Exception as e:
+            self.error("Gespeicherte Abfrage nicht geladen: " + str(e))
+            return
+        if self.refresh is not None or not isinstance(value, dict) or not value.get('guid'):
+            return
+        self.refresh = dict(guid=str(value['guid']), sent=value.get('sent') or time.time(),
+                            status=value.get('status', 'pending'), done=value.get('done'))
+        if self.refresh['status'] == 'pending':
+            self.track_refresh()
+
+    def track_refresh(self):
+        """ unter remote_lock: ausstehende Abfrage (wieder) abfragen, z.B. nach einem Neustart """
+        guid = self.refresh['guid']
+        if guid not in self.remote_pending:
+            self.remote_seq += 1
+            self.remote_pending[guid] = dict(kind='list', guid=guid, seq=self.remote_seq, ts=self.refresh['sent'],
+                                             label=self.remote_job_label({'type': 'list_runners'}))
+            self.start_remote_poller()
+
+    def on_refresh_done(self, guid: str):
+        """ unter remote_lock: Antwort auf eine Abfrage list_runners ist da """
+        if self.refresh is not None and self.refresh['guid'] == guid:
+            self.refresh.update(status='done', done=time.time())
+            self.save_refresh()
+
+    def check_refresh(self):
+        """ ausstehende letzte Abfrage sofort im Job-Speicher pruefen (cresult), statt auf den Poll zu warten """
+        with self.remote_lock:
+            self.ensure_runners_loaded()
+            if self.refresh is None or self.refresh['status'] != 'pending':
+                return
+            self.track_refresh()
+            guid = self.refresh['guid']
+        try:
+            self.remote_poll(guid)
+        except Exception as e:
+            self.set_remote_error(f'Abfrage {guid}: {type(e).__name__}: {e}')
+
+    def execute_refresh_status(self, data):
+        """ letzte Abfrage pruefen, refresh = {guid, sent, status: pending|done|timeout, done} oder None """
+        self.check_refresh()
+        with self.remote_lock:
+            return self.success(refresh=dict(self.refresh) if self.refresh is not None else None)
+
     # --- Runner und Signaturen der Ziel-Instanz -------------------------------------------------
 
     def on_runner_list(self, result: dict):
@@ -659,6 +736,10 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         if not isinstance(names, list):
             self.remote_error = 'list_runners: ' + str(result.get('message', 'keine Runner'))
             names = []
+        elif not names and not self.extra_runners:
+            # list_runners der Ziel-Instanz liefert nur per Spec (z.B. "typ: modul:Klasse") registrierte Runner
+            self.remote_error = (f'{self.target} meldet keine Runner (list_runners), '
+                                 f'weitere Runner mit runners="a,b" angeben')
         else:
             self.remote_error = ''
         names = sorted(set(map(str, names)) | set(self.extra_runners))
@@ -689,10 +770,12 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def execute_refresh(self, data):
         """ Runner der Ziel-Instanz (list_runners) und danach deren Signaturen abrufen """
         try:
-            self.remote_send({'type': 'list_runners'}, kind='list')
+            guid = self.remote_send({'type': 'list_runners'}, kind='list')
         except Exception as e:
             self.set_remote_error(str(e))
             return self.fail(str(e))
+        with self.remote_lock:
+            self.set_refresh(guid)
         if self.extra_runners:
             threading.Thread(target=self.request_signatures, args=(list(self.extra_runners),), daemon=True).start()
         return self.success('Abfrage gesendet, wartet auf Antwort')
@@ -701,7 +784,8 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         with self.remote_lock:
             self.ensure_runners_loaded()
             return self.success(runners={k: dict(v) for k, v in self.remote_runners.items()},
-                                persistent=self.runners_store() is not None)
+                                persistent=self.runners_store() is not None,
+                                refresh=dict(self.refresh) if self.refresh is not None else None)
 
     # --- Jobs -----------------------------------------------------------------------------------
 
@@ -810,13 +894,32 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         p.div(self.action_btn(dict(type=self.type, op='refresh', title="Runner abrufen"),
                               hint="Fragt die Runner der Ziel-Instanz und ihre Signaturen ueber den Job-Speicher ab"))
         p.script(self.RUN_JS)
+        self.check_refresh()
         with self.remote_lock:
-            self.ensure_runners_loaded()
             runners = {k: dict(v) for k, v in self.remote_runners.items()}
-        if not runners:
-            p(w.alert_info("Noch keine Runner bekannt, mit \"Runner abrufen\" abfragen."))
+            refresh = dict(self.refresh) if self.refresh is not None else None
+        self.part_refresh_status(p, refresh, bool(runners))
         for i, (name, entry) in enumerate(sorted(runners.items())):
             self.part_remote_runner(p, f'nxrr_{i}', name, entry)
+
+    def part_refresh_status(self, p: b.Page, refresh: Optional[dict], has_runners: bool):
+        """ Stand der letzten Abfrage list_runners (guid), laedt neu, solange sie nicht ausgefuehrt wurde """
+        if refresh is None:
+            if not has_runners:
+                p(w.alert_info("Noch keine Runner bekannt, mit \"Runner abrufen\" abfragen."))
+            return
+        sent = f"Abfrage {esc(refresh['guid'])} vom {fmt_ts(refresh['sent'])}"
+        if refresh['status'] == 'pending':
+            p(w.alert_info(f"{sent} wurde von {esc(self.target)} noch nicht ausgefuehrt, die Seite prueft erneut."))
+            self.reload_later(p)
+        elif refresh['status'] == 'timeout':
+            p(w.alert_error(f"{sent}: keine Antwort von {esc(self.target)} nach {int(self.timeout)} s."))
+        else:
+            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {fmt_ts(refresh['done'])}")
+
+    def reload_later(self, p: b.Page):
+        """ Seite nach poll_interval (mind. 2 s) neu laden, solange Antworten ausstehen """
+        p.js_ready(f'setTimeout(function() {{ window.location.reload(); }}, {int(max(self.poll_interval, 2) * 1000)});')
 
     def part_remote_runner(self, p: b.Page, prefix: str, name: str, entry: dict):
         sigs = entry.get('signatures')
@@ -886,7 +989,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             p.div(self.action_btn(dict(type=self.type, op='clear_results', title="Abgeschlossene entfernen"),
                                   hint="Entfernt alle Ergebnisse, auf die nicht mehr gewartet wird"))
         if any(row['status'] == 'pending' for row in rows):
-            p.js_ready(f'setTimeout(function() {{ window.location.reload(); }}, {int(max(self.poll_interval, 2) * 1000)});')
+            self.reload_later(p)
 
     def result_cols(self):
         col = w.Grid.col
@@ -932,7 +1035,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             p.h3("Ergebnis")
             p.pre(esc(json.dumps(job['result'], indent=2, default=str)) if job['result'] is not None else 'wartet...')
         if job['status'] == 'pending':
-            p.js_ready(f'setTimeout(function() {{ window.location.reload(); }}, {int(max(self.poll_interval, 2) * 1000)});')
+            self.reload_later(p)
 
 
 def fmt_ts(ts) -> str:
