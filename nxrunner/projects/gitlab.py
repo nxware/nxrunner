@@ -36,6 +36,8 @@ class GitlabProjectApi(b.Base):
     LOCAL_FILE = 'LOCAL.md'
     PARAM_RE = re.compile(r'^\s*[-*]?\s*(gitlab[-_][\w-]+)\s*[:=]\s*(.*?)\s*$', re.IGNORECASE)
     TIMEOUT = 10
+    PER_PAGE = 100
+    REPORT_DAYS = 7  # Standard-Zeitraum des Reports
 
     AGENT_INTERVAL = 3700  # Sekunden zwischen zwei Pruefungen auf neue Agent-Issues
     AGENT_POLL = 30  # Sekunden zwischen zwei Abfragen, ob ein gestartetes Issue fertig ist
@@ -123,6 +125,16 @@ class GitlabProjectApi(b.Base):
         """ GET auf /api/v4/projects/:id{endpoint} """
         return self.request('GET', endpoint, params=params)
 
+    def get_all(self, endpoint: str, max_pages: int = 50, **params) -> List[dict]:
+        """ GET ueber alle Seiten (per_page=100), hoechstens max_pages Seiten """
+        res = []
+        for page in range(1, max_pages + 1):
+            items = self.get(endpoint, per_page=self.PER_PAGE, page=page, **params)
+            res += items
+            if len(items) < self.PER_PAGE:
+                break
+        return res
+
     def put(self, endpoint: str, **data):
         return self.request('PUT', endpoint, data=data)
 
@@ -150,6 +162,26 @@ class GitlabProjectApi(b.Base):
 
     def add_note(self, iid: int, body: str) -> dict:
         return self.post(f'/issues/{iid}/notes', body=body)
+
+    def report(self, since, until) -> str:
+        """ Markdown-Report: neue Issues, Board-Bewegungen (TODO, Doing, Done, Closed), Inhalt der Issues """
+        from nxrunner.projects.gitlab_report import GitlabReport
+        return GitlabReport(self, since, until).markdown()
+
+    @classmethod
+    def report_period(cls, params=None) -> tuple:
+        """ (since, until) als ISO-Datum aus report_from / report_to, Standard die letzten REPORT_DAYS Tage """
+        params = params or {}
+        today = datetime.date.today()
+        since = params.get('report_from') or (today - datetime.timedelta(days=cls.REPORT_DAYS)).isoformat()
+        return since, params.get('report_to') or today.isoformat()
+
+    def report_job(self, since: str = '', until: str = '') -> dict:
+        try:
+            since, until = self.report_period({'report_from': since, 'report_to': until})
+            return {'success': True, 'message': 'ok', 'markdown': self.report(since, until)}
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
 
     # --- Agent --------------------------------------------------------------
 
@@ -358,10 +390,13 @@ class GitlabProjectApi(b.Base):
                 ("Pipelines", self.part_pipelines, "Letzte CI-Pipelines"),
                 ("Merge Requests", self.part_merge_requests, "Offene Merge Requests"),
                 ("Issues", self.part_issues, "Offene Issues"),
-                ("Agent", self.part_agent, "Issues mit Label Agent+TODO automatisch von einem Runner bearbeiten")]
+                ("Agent", self.part_agent, "Issues mit Label Agent+TODO automatisch von einem Runner bearbeiten"),
+                ("Report", lambda pg: self.part_report(pg, params),
+                 "Markdown-Report für einen Zeitraum: neue Issues, Board-Bewegungen, Inhalte")]
         with p.tabs() as t:
             for title, part, hint in tabs:
-                with t(title, hint=hint):
+                active = title == "Report" and 'report_from' in (params or {})
+                with t(title, hint=hint, active=active):
                     self.part_safe(p, part)
 
     @staticmethod
@@ -425,6 +460,40 @@ class GitlabProjectApi(b.Base):
             rows.append([w.s(name), w.s(type(runner).__name__), btns])
         p(w.table(rows))
 
+    def part_report(self, p: b.Page, params=None):
+        """ Zeitraum waehlen (GET-Formular auf dieselbe Seite), Report erst nach Absenden erzeugen """
+        params = params or {}
+        since, until = self.report_period(params)
+        self.part_report_form(p, params, since, until)
+        if 'report_from' not in params:
+            p.div("Zeitraum wählen und „Report erstellen“ klicken.")
+            return
+        md = self.report(since, until)
+        with p.tabs() as t:
+            with t("Ansicht", hint="Report als HTML dargestellt"):
+                p.div('', id='gitlab_report_html', _class='Page_markdown')
+            with t("Markdown", hint="Markdown-Quelltext zum Kopieren"):
+                p(w.textarea(w.s(md), id='gitlab_report_md', style='width: 100%; height: 400px;',
+                             readonly='readonly', title="Markdown-Quelltext des Reports"))
+        # aus textarea.value statt innerHTML, sonst wird > (Zitat) zu &gt;
+        p.script('/static/js/showdown.min.js')
+        p.js_ready("var c = new showdown.Converter({tables: true});"
+                   "document.getElementById('gitlab_report_html').innerHTML = "
+                   "c.makeHtml(document.getElementById('gitlab_report_md').value);")
+
+    @staticmethod
+    def part_report_form(p: b.Page, params, since: str, until: str):
+        p.start_tag('form', method='get')
+        for key, val in params.items():
+            if key not in ('report_from', 'report_to'):
+                p.hidden(key, w.s(val))
+        p.form_input('report_from', "Von", hint="Erster Tag des Zeitraums (UTC)", type='date', value=since)
+        p.form_input('report_to', "Bis", hint="Letzter Tag des Zeitraums, einschließlich (UTC)", type='date',
+                     value=until)
+        p(w.tag('input', '', type='submit', value="Report erstellen",
+                title="Report für den gewählten Zeitraum per GitLab-API erzeugen"))
+        p('</form>')
+
     @staticmethod
     def part_item_list(p: b.Page, items: List[dict], prefix: str):
         if len(items) == 0:
@@ -479,6 +548,13 @@ class GitlabAgentRunner(r.BaseJobExecutor):
             return self.fail("Zugangsdaten fehlen: " + ', '.join(self.missing()))
         return self.api.agent_job(action, runner)
 
+    @r.op("GitLab-Report als Markdown fuer since..until (ISO-Datum, Standard letzte 7 Tage)",
+          result={'success': 'bool', 'message': 'str', 'markdown': 'str'})
+    def gitlab_report(self, since: str = '', until: str = ''):
+        if not self.configured():
+            return self.fail("Zugangsdaten fehlen: " + ', '.join(self.missing()))
+        return self.api.report_job(since, until)
+
     @r.op("Status des Agents", result={'success': 'bool', 'active': 'bool', 'runner': 'str', 'running': 'dict'})
     def agent_status(self):
         return self.success('ok', configured=self.configured(), active=self.api.agent_active(),
@@ -525,3 +601,159 @@ class GitlabAgentRunner(r.BaseJobExecutor):
             p.div(w.s(f"Issues mit {api.LABEL_AGENT} + {api.LABEL_TODO} werden bearbeitet: "
                       f"{api.LABEL_TODO} → {api.LABEL_DOING} → {api.LABEL_DONE}. "
                       "Die Labels im Projekt anlegen (Manage → Labels)."))
+
+
+class Gitlab(r.BaseJobExecutor):
+    """
+    Uebersicht ueber alle geladenen Projekt-Runner (GitRepo), deren Remote origin auf domain zeigt,
+    und Erzeugen eines GitlabAgentRunner fuer ein Projekt.
+
+    account/token gelten fuer alle Projekte, gitlab_*-Parameter in der LOCAL.md eines Projekts haben Vorrang.
+
+    Konfiguration: gitlab: nxrunner.projects.gitlab:Gitlab(account="@...", token="glpat-...")
+    """
+
+    TAGS = ['gitlab']
+    ORIGIN = 'origin'
+
+    def __init__(self, type='gitlab', domain='gitlab.com', account: str = None, token: str = None):
+        """
+        :param domain: Host der GitLab-Instanz, Projekte werden ueber die Domain ihres Remotes origin erkannt
+        :param account: Account (z.B. Service-Account) fuer alle Projekte ohne eigenen in LOCAL.md
+        :param token: Access Token (Scope api) fuer alle Projekte ohne eigenen in LOCAL.md
+        """
+        super().__init__(type)
+        self.domain = domain.lower()
+        self.account = account
+        self.token = token
+
+    def dispatcher(self):
+        return self.getParentClass(r.LazyDispatcher)
+
+    def loaded_runners(self) -> dict:
+        """ {type: runner} aller erzeugten Runner im Dispatcher """
+        disp = self.dispatcher()
+        return {} if disp is None else {e.type: e.instance for e in list(disp.entries.values()) if e.loaded}
+
+    def origin_urls(self, repo) -> List[str]:
+        """ Adressen des Remotes origin, deren Host domain ist """
+        from nxrunner.projects.dev import GitRepo
+        res = []
+        for remote in repo.remotes():
+            web = GitRepo.remote_web_url(remote['url']) if remote['name'] == self.ORIGIN else None
+            if web is not None and (urlsplit(web).hostname or '').lower() == self.domain:
+                res.append(remote['url'])
+        return res
+
+    def projects(self) -> dict:
+        """ {name: GitRepo} aller geladenen Projekt-Runner mit origin auf domain """
+        from nxrunner.projects.dev import GitRepo
+        res = {}
+        for name, runner in self.loaded_runners().items():
+            if isinstance(runner, GitRepo) and len(self.origin_urls(runner)) > 0:
+                res[name] = runner
+        return res
+
+    def api(self, repo) -> GitlabProjectApi:
+        """ API fuer ein Projekt: LOCAL.md des Projekts, ergaenzt um account/token/domain dieses Runners """
+        local = GitlabProjectApi.read_params(repo.path)
+        defaults = {'gitlab_token': self.token, 'gitlab_account': self.account,
+                    'gitlab_url': f'https://{self.domain}'}
+        params = {k: v for k, v in defaults.items() if k not in local}
+        return GitlabProjectApi(repo.path, self.origin_urls(repo), params=params)
+
+    def agents(self) -> dict:
+        """ {name: GitlabAgentRunner} """
+        return {n: run for n, run in self.loaded_runners().items() if isinstance(run, GitlabAgentRunner)}
+
+    @staticmethod
+    def same_path(a: str, b: str) -> bool:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def agents_for(self, path: str) -> List[str]:
+        """ Namen der GitlabAgentRunner, die im Repository path arbeiten """
+        return [n for n, agent in self.agents().items() if self.same_path(agent.path, path)]
+
+    @staticmethod
+    def agent_name(project: str) -> str:
+        return f'{project}_gitlab_agent'
+
+    def agent_spec(self, repo) -> str:
+        """ Zeile fuer die Runner-Konfiguration, der Token wird nicht ausgegeben """
+        api = self.api(repo)
+        local = GitlabProjectApi.read_params(repo.path)
+        extra = '' if 'gitlab_token' in local else ', token="glpat-..."'
+        extra += f', account="{api.params["gitlab_account"]}"' if api.params.get('gitlab_account') and             'gitlab_account' not in local else ''
+        return (f'nxrunner.projects.gitlab:GitlabAgentRunner(path="{Path(repo.path).as_posix()}", '
+                f'project="{api.project_path() or ""}", url="{api.base_url()}"{extra})')
+
+    @r.op("GitlabAgentRunner fuer einen Projekt-Runner erzeugen (Token aus LOCAL.md oder diesem Runner)",
+          result={'success': 'bool', 'message': 'str', 'agent': 'str'})
+    def create_agent(self, project: str, name: str = '', runner: str = '', start: bool = False):
+        """
+        :param project: Name des Projekt-Runners (GitRepo) mit origin auf domain
+        :param name: Name des neuen Runners, Standard <project>_gitlab_agent
+        :param runner: Agent-Runner mit do_issue, '' = erster gefundener
+        :param start: Agent-Loop sofort starten
+        """
+        repo = self.projects().get(project)
+        if repo is None:
+            return self.fail(f"Projekt-Runner {project} mit origin auf {self.domain} nicht gefunden")
+        name = name or self.agent_name(project)
+        disp = self.dispatcher()
+        if disp.support_type(name):
+            return self.fail(f"Runner {name} existiert bereits")
+        api = self.api(repo)
+        agent = GitlabAgentRunner(name, token=api.token(), project=api.project_path(), url=api.base_url(),
+                                  account=api.params.get('gitlab_account'), path=repo.path, runner=runner,
+                                  start=bool(start))
+        res = disp.add_runner(agent)
+        if not res.get('success', False):
+            return res
+        return self.success(f"{name} erzeugt", agent=name, ui_reload=True)
+
+    # --- HTML ---------------------------------------------------------------
+
+    def part_index(self, p: b.Page, params={}):
+        p.h2("GitLab-Projekte")
+        p.div(w.s(f"Geladene Projekt-Runner, deren Remote {self.ORIGIN} auf {self.domain} zeigt"))
+        p.prop("Account", w.s(self.account or '-'))
+        p.prop("Token", "gesetzt" if self.token else "fehlt (nur Projekte mit Token in LOCAL.md nutzbar)")
+        projects = self.projects()
+        if len(projects) == 0:
+            p.div(w.s(f"Kein geladener Projekt-Runner mit {self.ORIGIN} auf {self.domain} "
+                      "(Projekt unter Projects laden)"))
+        else:
+            p(w.table([['Runner', 'GitLab-Projekt', 'Token', 'Agent', '']] +
+                      [self.project_row(name, repo) for name, repo in projects.items()]))
+        self.part_agents(p)
+        p.pre('', id='result')
+
+    def project_row(self, name: str, repo) -> list:
+        api = self.api(repo)
+        prj = api.project_path() or '-'
+        prj_cell = w.a(w.s(prj), api.web_url(), hint="Projekt auf GitLab öffnen") if api.web_url() else w.s(prj)
+        agents = self.agents_for(repo.path)
+        agent_cell = ', '.join(w.a(w.s(a), f'?type={a}', hint="Agent-Runner öffnen") for a in agents) or '-'
+        btns = w.a("Öffnen", f'?type={name}', hint="Projekt-Runner öffnen")
+        if not agents:
+            btns += ' ' + self.action_btn(dict(title="Agent erstellen", type=self.type, op='create_agent',
+                                               project=name),
+                                          hint=f"GitlabAgentRunner {self.agent_name(name)} erzeugen "
+                                               f"(nicht gestartet): {self.agent_spec(repo)}")
+        local = 'gitlab_token' in GitlabProjectApi.read_params(repo.path)
+        token = ("LOCAL.md" if local else "Runner") if api.token() else "fehlt"
+        return [w.s(name), prj_cell, token, agent_cell, btns]
+
+    def part_agents(self, p: b.Page):
+        agents = self.agents()
+        if len(agents) == 0:
+            return
+        p.h3("GitLab-Agent-Runner")
+        rows = [['Runner', 'Projekt', 'Pfad', 'Status']]
+        for name, agent in agents.items():
+            status = f"aktiv mit {agent.api.agent_runner or '(erster Runner)'}" if agent.api.agent_active() \
+                else "inaktiv"
+            rows.append([w.a(w.s(name), f'?type={name}', hint="Agent-Runner öffnen"),
+                         w.s(agent.api.project_path() or '-'), w.s(agent.path), status])
+        p(w.table(rows))

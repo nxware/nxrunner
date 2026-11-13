@@ -1479,6 +1479,14 @@ class GitRepo(ProjectDir):
             return self.fail("Keine gitlab_*-Parameter in LOCAL.md")
         return api.agent_job(action, runner)
 
+    @r.op("GitLab-Report als Markdown fuer since..until (ISO-Datum, Standard letzte 7 Tage)",
+          result={'success': 'bool', 'message': 'str', 'markdown': 'str'})
+    def gitlab_report(self, since: str = '', until: str = ''):
+        api = self.gitlab()
+        if api is None:
+            return self.fail("Keine gitlab_*-Parameter in LOCAL.md")
+        return api.report_job(since, until)
+
     def show_gitlab(self, p: base.Page):
         api = self.gitlab()
         if api is None:
