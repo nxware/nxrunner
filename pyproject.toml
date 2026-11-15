@@ -50,6 +50,7 @@ remote_terminal = "nxrunner.system:RemoteTerminal"
 log = "nxrunner.system:LogFoundation"
 remote_runner = "nxrunner.jobstore:RemoteRunner"
 gitlab_agent = "nxrunner.projects.gitlab:GitlabAgentRunner"
+gitlab = "nxrunner.projects.gitlab:Gitlab"
 
 nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
