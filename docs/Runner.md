@@ -1,7 +1,8 @@
 # Runner in nxrunner
 
 Übersicht über die Runner, die nxrunner mitbringt. Wie man einen eigenen Runner schreibt, steht in der
-[README](../README.md#eigene-runner-erstellen).
+[README](../README.md#eigene-runner-erstellen). Die Operationen, die alle Runner und der Dispatcher haben
+(`getvar`, `setvar`, `op=get_signatures`, Seiten, ...), stehen in [RunnerOps.md](RunnerOps.md).
 
 Alle Runner werden mit einem Job-`dict` aufgerufen, z.B. über REST:
 
@@ -645,3 +646,8 @@ Die Container laufen nur, solange nxrunner läuft.
 | `op=docker_rebuild` | Image neu bauen und starten |
 | `op=docker_logs` | Log des Containers |
 | alle anderen | gehen an den Runner im Container |
+
+
+# See also
+
+ - [RunnerBaseOps](RunnerOps.md)

@@ -118,6 +118,7 @@ def help():
     print("Usage:")
     print("")
     print("  nxrunner serv            (oder: python -m nxrunner serv)")
+    print("        [--host] [--port] [--web_secured 1 --web_password_hash --web_user]")
     print("  nxrunner deps")
     print("  nxrunner install pkg")
     print("")

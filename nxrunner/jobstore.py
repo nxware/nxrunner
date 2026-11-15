@@ -179,14 +179,16 @@ class RemoteJobMixin:
             return f'{self.store} ({type(runner).__name__}) ist kein Job-Speicher, op=cenqueue/cresult fehlen'
         return ''
 
-    def remote_send(self, job: dict, **meta) -> str:
+    def remote_send(self, job: dict, to: Optional[str] = None, **meta) -> str:
         """
           Job fuer remote_type auf target verschluesselt in den Speicher schreiben, Fehler als Exception.
+          :param to: Ziel-Instanz statt target, '' = ohne target (jede Instanz darf ihn ausfuehren)
           :param meta: zusaetzliche Felder, die on_remote_result mit dem Ergebnis erhaelt
           :return: guid
         """
-        if not self.target:
+        if to is None and not self.target:
             raise RuntimeError('target (Name der Ziel-Instanz) ist nicht gesetzt')
+        target = self.target if to is None else to
         if not self.store_ok:
             error = self.check_store()
             if error:
@@ -194,7 +196,7 @@ class RemoteJobMixin:
             self.store_ok = True
         guid = u.guid()
         res = self.store_execute(dict(op='cenqueue', jobdef={'type': self.remote_type, **job}, guid=guid,
-                                      target=self.target))
+                                      target=target))
         if not isinstance(res, dict) or not res.get('success', False):
             message = res.get('message', res) if isinstance(res, dict) else res
             raise RuntimeError(f'Job-Speicher {self.store}: {message}')
@@ -548,6 +550,9 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             op=results                      gesendete Jobs mit Status und Ergebnis
             op=result guid                  ein Job mit Ergebnis
             op=clear_results [guid]         ein bzw. alle abgeschlossenen Ergebnisse entfernen
+            op=query_instances              {type: <store>, op: get_nxname} ohne target einstellen, die
+                                            ausfuehrende Instanz wird unter "Instances" gemerkt
+            op=instances                    bekannte Instanzen und Stand der letzten Abfrage
     """
 
     TAGS = ['remote']
@@ -570,7 +575,13 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         self.runners_loaded = False  # remote_runners aus der nweb-Persistence geladen
         self.refresh = None          # letzte Abfrage list_runners: {guid, sent, status, done}, siehe set_refresh
         self.jobs = {}           # guid -> Eintrag (siehe add_job), in Reihenfolge des Sendens
+        self.instances = {}      # Name der Instanz -> {name, seen, guid}, Antworten auf get_nxname
+        self.instances_query = None  # letzte Abfrage get_nxname: {guid, sent, status, done}
         self.define_vars('target', 'store', 'max_results')
+        self.define_sig(d.PStr('op', 'query_instances')).set_description(
+            "Fragt per get_nxname (Job ohne target) ab, welche Instanz Jobs aus dem Job-Speicher ausfuehrt").r(
+            success='bool', message='str', guid='str')
+        self.define_sig(d.PStr('op', 'instances')).r(success='bool', instances='list', query='dict')
         self.define_sig(d.PStr('op', 'refresh')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'runners')).r(success='bool', runners='dict')
         self.define_sig(d.PStr('op', 'refresh_status')).set_description(
@@ -587,6 +598,8 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             return 'Runner abrufen'
         if job.get('op') == 'get_signatures':
             return 'Signaturen ' + str(job.get('type', ''))
+        if job.get('op') == 'get_nxname':
+            return 'Instanzen abfragen'
         return self.job_label(job)
 
     @staticmethod
@@ -606,6 +619,8 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             self.on_signatures(meta['runner'], result)
         elif kind == 'job':
             self.on_job_result(meta['guid'], result)
+        elif kind == 'nxname':
+            self.on_nxname(meta['guid'], result)
 
     def remote_changed(self):
         """ unter remote_lock: Jobs, deren Antwort verworfen wurde (Timeout), als timeout markieren """
@@ -617,6 +632,146 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         if refresh is not None and refresh['status'] == 'pending' and refresh['guid'] not in self.remote_pending:
             refresh.update(status='timeout', done=time.time())
             self.save_refresh()
+        query = self.instances_query
+        if query is not None and query['status'] == 'pending' and query['guid'] not in self.remote_pending:
+            query.update(status='timeout', done=time.time())
+            self.save_instances()
+        self.save_pending()
+        self.save_jobs()
+
+    # --- Instanzen (get_nxname ohne target) -----------------------------------------------------
+
+    def instances_setting_key(self) -> str:
+        return f'{self.type}.instances'
+
+    def save_instances(self):
+        """ unter remote_lock: bekannte Instanzen und letzte Abfrage speichern (falls Persistence vorhanden) """
+        nw = self.runners_store()
+        if nw is None:
+            return
+        self.ensure_runners_loaded()
+        try:
+            nw.set_setting(self.instances_setting_key(),
+                           json.dumps(dict(instances=self.instances, query=self.instances_query), default=str))
+        except Exception as e:
+            self.error("Instanzen nicht gespeichert: " + str(e))
+
+    def load_instances(self, nw):
+        """ unter remote_lock: gespeicherte Instanzen laden, eine offene Abfrage verfolgt load_pending weiter """
+        try:
+            value = json.loads(nw.setting(self.instances_setting_key(), '') or '{}')
+        except Exception as e:
+            self.error("Instanzen nicht geladen: " + str(e))
+            return
+        if not isinstance(value, dict):
+            return
+        for name, entry in (value.get('instances') or {}).items():
+            if isinstance(entry, dict):
+                self.instances.setdefault(str(name), dict(entry, name=str(name)))
+        if self.instances_query is None and isinstance(value.get('query'), dict) and value['query'].get('guid'):
+            self.instances_query = value['query']
+
+    def execute_query_instances(self, data):
+        """ get_nxname ohne target einstellen, die ausfuehrende Instanz meldet ihren Namen """
+        job = {'type': self.store, 'op': 'get_nxname'}  # den Job-Speicher haben alle beteiligten Instanzen
+        try:
+            guid = self.remote_send(job, to='', kind='nxname')
+        except Exception as e:
+            self.set_remote_error(str(e))
+            return self.fail(str(e))
+        with self.remote_lock:
+            self.instances_query = dict(guid=guid, sent=time.time(), status='pending', done=None)
+            self.save_instances()
+        return self.success('Abfrage gesendet, wartet auf Antwort einer Instanz', guid=guid, ui_reload=True)
+
+    def on_nxname(self, guid: str, result: dict):
+        """ unter remote_lock: Antwort auf get_nxname """
+        name = str(result.get('value') or '') if result.get('success', False) else ''
+        if name:
+            self.instances[name] = dict(name=name, seen=time.time(), guid=guid)
+        query = self.instances_query
+        if query is not None and query['guid'] == guid:
+            query.update(status='done' if name else 'error', done=time.time(),
+                         message='' if name else str(result.get('message', 'keine Antwort')))
+        self.save_instances()
+
+    def execute_instances(self, data):
+        with self.remote_lock:
+            self.ensure_runners_loaded()
+            return self.success(instances=sorted((dict(i) for i in self.instances.values()), key=lambda i: i['name']),
+                                query=dict(self.instances_query) if self.instances_query is not None else None)
+
+    # --- offene Anfragen (guids) speichern, damit Antworten einen Neustart ueberstehen ----------
+
+    def pending_setting_key(self) -> str:
+        return f'{self.type}.pending.{self.target}'
+
+    def save_pending(self):
+        """ unter remote_lock: guids aller offenen Anfragen (Runner, Signaturen, Jobs) mit meta speichern """
+        nw = self.runners_store()
+        if nw is None:
+            return
+        self.ensure_runners_loaded()  # erst laden, sonst ueberschreibt ein frischer Start die gespeicherten guids
+        try:
+            nw.set_setting(self.pending_setting_key(), json.dumps(list(self.remote_pending.values()), default=str))
+        except Exception as e:
+            self.error("Offene Anfragen nicht gespeichert: " + str(e))
+
+    def load_pending(self, nw):
+        """ unter remote_lock: gespeicherte offene Anfragen wieder abfragen (cresult per guid) """
+        try:
+            value = json.loads(nw.setting(self.pending_setting_key(), '') or '[]')
+        except Exception as e:
+            self.error("Offene Anfragen nicht geladen: " + str(e))
+            return
+        for meta in value if isinstance(value, list) else []:
+            if not isinstance(meta, dict) or not meta.get('guid') or meta['guid'] in self.remote_pending:
+                continue
+            self.remote_seq += 1
+            self.remote_pending[meta['guid']] = dict(meta, seq=self.remote_seq, ts=meta.get('ts') or time.time())
+            if meta.get('kind') == 'job':
+                self.restore_job(meta)
+        if self.remote_pending:
+            self.start_remote_poller()
+
+    # --- gesendete Jobs mit Ergebnis (Seite Ergebnisse) speichern ------------------------------
+
+    def jobs_setting_key(self) -> str:
+        return f'{self.type}.jobs.{self.target}'
+
+    def save_jobs(self):
+        """ unter remote_lock: Jobs mit Status und Ergebnis speichern (max_results Eintraege) """
+        nw = self.runners_store()
+        if nw is None:
+            return
+        self.ensure_runners_loaded()  # erst laden, sonst ueberschreibt ein frischer Start die gespeicherten Jobs
+        try:
+            nw.set_setting(self.jobs_setting_key(), json.dumps(list(self.jobs.values()), default=str))
+        except Exception as e:
+            self.error("Ergebnisse nicht gespeichert: " + str(e))
+
+    def load_jobs(self, nw):
+        """ unter remote_lock: gespeicherte Jobs vor die seit dem Start gesendeten setzen """
+        try:
+            value = json.loads(nw.setting(self.jobs_setting_key(), '') or '[]')
+        except Exception as e:
+            self.error("Ergebnisse nicht geladen: " + str(e))
+            return
+        stored = {}
+        for entry in value if isinstance(value, list) else []:
+            if isinstance(entry, dict) and entry.get('guid') and entry['guid'] not in self.jobs:
+                job = entry.get('job') if isinstance(entry.get('job'), dict) else {}
+                stored[str(entry['guid'])] = dict(guid=str(entry['guid']), job=job,
+                                                  label=entry.get('label') or self.job_label(job),
+                                                  status=entry.get('status', 'pending'), sent=entry.get('sent'),
+                                                  done=entry.get('done'), result=entry.get('result'))
+        self.jobs = {**stored, **self.jobs}
+
+    def restore_job(self, meta: dict):
+        """ unter remote_lock: Eintrag eines offenen Jobs (Seite Ergebnisse) aus seiner meta wiederherstellen """
+        job = meta.get('jobdef') if isinstance(meta.get('jobdef'), dict) else {}
+        self.jobs.setdefault(meta['guid'], dict(guid=meta['guid'], job=job, label=self.job_label(job),
+                                                status='pending', sent=meta.get('ts'), done=None, result=None))
 
     # --- Persistenz der erkannten Runner (nweb-Persistence, system__setting) ----------------------
 
@@ -629,6 +784,18 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def runners_setting_key(self) -> str:
         return f'{self.type}.runners.{self.target}'
 
+    def set_target(self, value):
+        """ setvar target: Zustand je Ziel (Runner, Abfrage, Jobs, offene Anfragen) fuer das neue Ziel laden """
+        value = str(value or '')
+        with self.remote_lock:
+            if value == self.target:
+                return
+            self.target = value  # Anfragen fuer das alte Ziel sind unter dessen Schluesseln gespeichert
+            self.remote_runners, self.refresh, self.jobs, self.remote_pending = {}, None, {}, {}
+            self.remote_error = ''
+            self.runners_loaded = False
+            self.ensure_runners_loaded()
+
     def ensure_runners_loaded(self):
         """ unter remote_lock: gespeicherte Runner einmalig laden, neuere Abfragen haben Vorrang """
         if self.runners_loaded:
@@ -637,7 +804,11 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         if nw is None:
             return
         self.runners_loaded = True
+        self.load_jobs(nw)
+        self.load_instances(nw)
+        self.load_pending(nw)
         self.load_refresh(nw)
+        self.remote_changed()  # gespeicherte, aber nicht mehr offene Jobs als timeout markieren, alles speichern
         try:
             value = json.loads(nw.setting(self.runners_setting_key(), '{}') or '{}')
         except Exception as e:
@@ -749,13 +920,28 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         # remote_send nimmt remote_lock, daher im eigenen Thread
         threading.Thread(target=self.request_signatures, args=(names,), daemon=True).start()
 
-    def request_signatures(self, names):
+    def request_signatures(self, names) -> int:
+        """
+          get_signatures je Runner einstellen, ausser es wartet schon eine Anfrage fuer ihn
+          :return: Anzahl eingestellter Jobs
+        """
+        with self.remote_lock:
+            pending = self.pending_signature_runners()
+        count = 0
         for name in names:
+            if name in pending:
+                continue
             try:
                 self.remote_send({'type': name, 'op': 'get_signatures'}, kind='sigs', runner=name)
+                count += 1
             except Exception as e:
                 self.set_remote_error(str(e))
-                return
+                break
+        return count
+
+    def pending_signature_runners(self) -> set:
+        """ unter remote_lock: Runner, fuer die eine Anfrage get_signatures aussteht """
+        return {m.get('runner') for m in self.remote_pending.values() if m.get('kind') == 'sigs'}
 
     def on_signatures(self, name: str, result: dict):
         self.ensure_runners_loaded()
@@ -768,7 +954,10 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         self.save_runners()
 
     def execute_refresh(self, data):
-        """ Runner der Ziel-Instanz (list_runners) und danach deren Signaturen abrufen """
+        """
+          Runner der Ziel-Instanz (list_runners) abrufen, Signaturen bereits bekannter Runner (und runners) gleich
+          mit anfragen; Runner, die erst list_runners liefert, fragt on_runner_list nach
+        """
         try:
             guid = self.remote_send({'type': 'list_runners'}, kind='list')
         except Exception as e:
@@ -776,9 +965,9 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             return self.fail(str(e))
         with self.remote_lock:
             self.set_refresh(guid)
-        if self.extra_runners:
-            threading.Thread(target=self.request_signatures, args=(list(self.extra_runners),), daemon=True).start()
-        return self.success('Abfrage gesendet, wartet auf Antwort')
+            names = sorted(set(self.remote_runners.keys()) | set(self.extra_runners))
+        count = 1 + self.request_signatures(names)
+        return self.success(f'Abfrage gesendet ({count} Jobs), wartet auf Antwort', count=count)
 
     def execute_runners(self, data):
         with self.remote_lock:
@@ -797,13 +986,14 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         with self.remote_lock:
             self.trim_jobs()
         try:
-            guid = self.remote_send(job, kind='job')
+            guid = self.remote_send(job, kind='job', jobdef=job)
         except Exception as e:
             self.set_remote_error(str(e))
             return self.fail(str(e))
         with self.remote_lock:
             self.jobs[guid] = dict(guid=guid, job=job, label=self.job_label(job), status='pending',
                                    sent=time.time(), done=None, result=None)
+            self.save_jobs()
         return self.success(f'{self.job_label(job)} gesendet', guid=guid)
 
     def trim_jobs(self):
@@ -824,10 +1014,12 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
 
     def execute_results(self, data):
         with self.remote_lock:
+            self.ensure_runners_loaded()
             return self.success(results=[dict(j) for j in self.jobs.values()])
 
     def execute_result(self, data):
         with self.remote_lock:
+            self.ensure_runners_loaded()
             job = self.jobs.get(str(data.get('guid', '')))
             if job is None:
                 return self.fail('Unbekannte guid')
@@ -836,6 +1028,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def execute_clear_results(self, data):
         guid = str(data.get('guid') or '')
         with self.remote_lock:
+            self.ensure_runners_loaded()
             if guid:
                 removed = 1 if self.jobs.pop(guid, None) is not None else 0
             else:
@@ -843,6 +1036,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
                 for g in done:
                     del self.jobs[g]
                 removed = len(done)
+            self.save_jobs()
         return self.success(f'{removed} Ergebnis(se) entfernt', ui_reload=True)
 
     # --- Seite: Runner --------------------------------------------------------------------------
@@ -872,11 +1066,13 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def nav(self, p: b.Page, active=None):
         """ obere Navigation, active = Seite (part_*-Methode), die hervorgehoben wird """
         with self.remote_lock:
+            self.ensure_runners_loaded()  # nach einem Neustart offene Anfragen wieder abfragen
             pending = sum(1 for j in self.jobs.values() if j['status'] == 'pending')
             count = len(self.jobs)
         p.nav(("Runner", self.link(self.part_index), "Runner und Signaturen der Ziel-Instanz"),
               (f"Ergebnisse ({count}, {pending} offen)", self.link(self.part_results),
                "Gesendete Jobs mit Status und Ergebnis"),
+              ("Instances", self.link(self.part_instances), "Instanzen, die Jobs aus dem Job-Speicher ausfuehren"),
               active=self.link(active) if active is not None else None)
 
     def part_header(self, p: b.Page):
@@ -973,6 +1169,67 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             attrs['step'] = 'any'
         hint = f"{name}: {ptype}" + ('' if default is not None else ' (Pflicht, leer = nicht senden)')
         p.form_input(name, esc(name), hint=hint, **attrs)
+
+    # --- Seite: Instances -----------------------------------------------------------------------
+
+    def check_instances_query(self):
+        """ beim ersten Aufruf einmal abfragen, eine offene Abfrage sofort im Job-Speicher pruefen """
+        with self.remote_lock:
+            self.ensure_runners_loaded()
+            query = dict(self.instances_query) if self.instances_query is not None else None
+            if query is not None and query['status'] == 'pending' and query['guid'] not in self.remote_pending:
+                self.remote_seq += 1
+                self.remote_pending[query['guid']] = dict(kind='nxname', guid=query['guid'], seq=self.remote_seq,
+                                                          ts=query['sent'], label='Instanzen abfragen')
+                self.start_remote_poller()
+        if query is None:
+            self.execute_query_instances({})
+        elif query['status'] == 'pending':
+            try:
+                self.remote_poll(query['guid'])
+            except Exception as e:
+                self.set_remote_error(f"Abfrage {query['guid']}: {type(e).__name__}: {e}")
+
+    def part_instances(self, p: b.Page, params={}):
+        self.nav(p, self.part_instances)
+        self.part_header(p)
+        self.check_instances_query()
+        with self.remote_lock:
+            query = dict(self.instances_query) if self.instances_query is not None else None
+            rows = sorted((dict(i) for i in self.instances.values()), key=lambda i: i['name'])
+        p.div(self.action_btn(dict(type=self.type, op='query_instances', title="Erneut abfragen"),
+                              hint="Stellt get_nxname ohne target ein, die ausfuehrende Instanz meldet ihren Namen"))
+        self.part_instances_query(p, query)
+        with p.section(h="Instances"):
+            p.grid(rows, self.instance_cols(), params, empty="Noch keine Instanz hat geantwortet.")
+
+    def part_instances_query(self, p: b.Page, query: Optional[dict]):
+        if query is None:
+            return
+        sent = f"Abfrage {esc(query['guid'])} vom {fmt_ts(query['sent'])}"
+        if query['status'] == 'pending':
+            p(w.alert_info(f"{sent} wurde noch von keiner Instanz ausgefuehrt, die Seite prueft erneut."))
+            self.reload_later(p)
+        elif query['status'] == 'timeout':
+            p(w.alert_error(f"{sent}: keine Antwort nach {int(self.timeout)} s."))
+        elif query['status'] == 'error':
+            p(w.alert_error(f"{sent}: {esc(query.get('message', ''))}"))
+        else:
+            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {fmt_ts(query['done'])}")
+
+    def instance_cols(self):
+        col = w.Grid.col
+        return [
+            col('name', "Instanz", html=True, value=lambda e: esc(e['name']) + (' <b>(target)</b>' if e['name'] == self.target else '')),
+            col('seen', "Zuletzt gesehen", value=lambda e: fmt_ts(e.get('seen')), sort=lambda e: e.get('seen') or 0),
+            col('actions', '', html=True, sortable=False, value=self.col_instance_actions),
+        ]
+
+    def col_instance_actions(self, e):
+        if e['name'] == self.target:
+            return ''
+        return self.action_btn(dict(type=self.type, setvar='target', value=e['name'], title="Als Ziel"),
+                               hint=f"{e['name']} als Ziel-Instanz (target) dieses Runners setzen")
 
     # --- Seite: Ergebnisse ----------------------------------------------------------------------
 

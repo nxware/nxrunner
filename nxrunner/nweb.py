@@ -123,6 +123,7 @@ class NWebDir(r.BaseJobExecutor):
       sonst das Original). Klick auf ein Vorschaubild oeffnet es in einer Lightbox (Original ueber page=file,
       Pfeiltasten blaettern, Esc schliesst), der Dateiname ist ein file://-Link (unter der WSL auf den Windows-Pfad).
     """
+    TAGS = ['dir']
     PAGE_SIZE = 50
     THUMB_SIZE = 160
     THUMB_CACHE = 500  # Anzahl Vorschaubilder im Speicher
