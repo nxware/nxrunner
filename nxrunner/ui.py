@@ -14,15 +14,17 @@ from nwebclient import web
 from nwebclient import util as u
 
 from nxrunner import registry
+from nxrunner.mcp import McpSystem
 
 
 def load_resource(name):
     return resources.files('nxrunner').joinpath('resources').joinpath(name).read_text(encoding='utf-8')
 
 
-class NxRunner(r.AutoDispatcher):
+class NxRunner(McpSystem, r.AutoDispatcher):
     """
       Dispatcher von nxrunner mit der neuen Oberflaeche /pysys/ui (Runner-Seiten und Registry).
+      Mit --mcp oder mcp_enable: true zusaetzlich MCP-Server unter /mcp, Verwaltung unter /sys/mcp (nxrunner.mcp).
       op=registry [refresh]          installierte Runner (Entry-Points nweb_runner) mit Status
       op=registry_load name [runner_type] [arg_<param>=...]   Runner aus der Registry laden
       op=registry_install name [runner_type] [directory] [overwrite] [preview] [arg_<param>=...]
@@ -100,9 +102,16 @@ class NxRunner(r.AutoDispatcher):
                 {'title': "Runner-UI", 'url': '/pysys/runner-ui'},
                 {'title': "Registry", 'url': '/pysys/ui?view=registry'},
                 {'title': "Results", 'url': '/pysys/job-results'},
-                {'title': "Proxy", 'url': '/pysys/create-proxy'}
+                {'title': "Proxy", 'url': '/pysys/create-proxy'},
+                *self.ui_mcp_links()
             ]
         }
+
+    def ui_mcp_links(self) -> list:
+        """ MCP-Verwaltung, nur wenn MCP aktiv ist (Freigaben sind von /sys/mcp aus verlinkt) """
+        if not self.mcp_enabled():
+            return []
+        return [{'title': "MCP", 'url': '/sys/mcp'}]
 
     def query_jumplinks(self):
         return [
@@ -304,13 +313,23 @@ class NxRunner(r.AutoDispatcher):
             # Werte aus dem Formular der Registry (runner_type, arg_*) vorbelegen
             extra['install'] = {'entry': entry, 'config_d': u.Args.CONFIG_D,
                                 'values': {k: v for k, v in params.items() if k == 'runner_type' or k.startswith('arg_')}}
+        return self.ui_html(page, **extra)
+
+    def ui_html(self, page=None, **extra) -> str:
+        """ ui.html mit Daten (page: {name, content[, links]} oder {name, error}) """
         data = json.dumps({**self.ui_data(), 'page': page, **extra}, default=str).replace('</', '<\\/')
         js = r.js_functions().replace('</', '<\\/')
         return load_resource('ui.html').replace('__JS__', js).replace('__DATA__', data)
 
+    def render_ui_page(self, title: str, p: base.Page) -> str:
+        """ eigene Seite (z.B. /sys/mcp aus nxrunner.mcp) in der Oberflaeche /pysys/ui anzeigen """
+        return self.ui_html({'name': title, 'content': str(p), 'links': None})
+
     def part_index(self, p: base.Page, params={}):
         super().part_index(p, params)
         p.div(web.a("NxRunner UI", '/pysys/ui'))
+        if self.mcp_enabled():
+            p.div(web.a("MCP", '/sys/mcp'))
 
     def setupRestApp(self, app: "flask.Flask"):  # noqa: F821
         super().setupRestApp(app)
@@ -321,6 +340,7 @@ class NxRunner(r.AutoDispatcher):
         except Exception as e:
             self.error(str(e))
         self.setup_documentation(app)
+        self.setup_mcp(app)
 
     def setup_documentation(self, app):
         """ nxdoc (/documentation/...) einhaengen, wenn installiert; Pakete schaltet PythonRepo frei """

@@ -15,7 +15,7 @@ from nwebclient import dev as d
 from nwebclient.runner import op
 
 from nxrunner.mcp import McpSystem, input_schema, sig_name, tool_name, INVALID_PARAMS, METHOD_NOT_FOUND
-from nxrunner.mcp_approval import APPROVED, DENIED, TIMEOUT, REJECTED
+from nxrunner.mcp_approval import APPROVED, DENIED, TIMEOUT, REJECTED, kv_table
 
 try:
     import flask  # noqa: F401
@@ -226,11 +226,15 @@ class McpApprovalTest(unittest.TestCase):
     def test_approve(self):
         t, box = call_in_thread(self.disp, 'calc__add', {'a': 1, 'b': 2})
         pending = wait_pending(self.disp)
-        self.assertEqual(pending[0].arguments, {'a': 1, 'b': 2})
+        self.assertEqual(pending[0].job, {'a': 1, 'b': 2, 'op': 'add', 'type': 'calc'})
+        self.assertIsNone(pending[0].result)
         self.assertIn('Anfrage 1 genehmigt', self.disp.mcp_decide({'approve': str(pending[0].id)}))
         t.join(5)
         self.assertEqual(box[0]['result']['structuredContent']['sum'], 3)
-        self.assertEqual(self.disp.mcp_approvals().history()[0].decision, APPROVED)
+        done = self.disp.mcp_approvals().history()[0]
+        self.assertEqual(done.decision, APPROVED)
+        self.assertEqual(done.result, {'success': True, 'sum': 3})
+        self.assertIsNotNone(done.executed)
 
     def test_deny(self):
         t, box = call_in_thread(self.disp, 'calc__add', {'a': 1})
@@ -264,9 +268,11 @@ class McpApprovalTest(unittest.TestCase):
         client = app.test_client()
         t, box = call_in_thread(self.disp, 'calc__add', {'a': 7})
         pending = wait_pending(self.disp)
-        page = self.disp.page_mcp({})
+        self.assertRegex(self.disp.page_mcp({}), r'Offene Freigaben: <span>1 <a href="/sys/mcp/pending"')
+        page = client.get('/sys/mcp/pending').get_data(as_text=True)
         self.assertIn('Offene Freigaben (1)', page)
         self.assertIn(f"mcpDecide('approve', {pending[0].id})", page)
+        self.assertIn('<b>a</b></td><td><code>7</code>', page)  # Job als Schluessel/Wert-Tabelle
         data = client.get('/sys/mcp/approvals').get_json()
         self.assertEqual(data['count'], 1)
         resp = client.post('/sys/mcp/approvals', data={'approve': pending[0].id},
@@ -276,7 +282,10 @@ class McpApprovalTest(unittest.TestCase):
         self.assertEqual(data['count'], 0)
         t.join(5)
         self.assertEqual(box[0]['result']['structuredContent']['sum'], 8)
-        self.assertIn('Letzte Entscheidungen', client.get('/sys/mcp/approvals').get_json()['html'])
+        page = client.get('/sys/mcp/pending').get_data(as_text=True)
+        self.assertIn('Letzte Entscheidungen', page)
+        self.assertIn('Ergebnis', page)
+        self.assertIn('<b>sum</b></td><td><code>8</code>', page)
 
     @unittest.skipUnless(HAS_FLASK, 'flask fehlt')
     def test_no_cache(self):
@@ -306,6 +315,24 @@ class McpApprovalTest(unittest.TestCase):
         self.assertTrue(self.disp.mcp_origin_allowed('http://localhost:3000', 'http://pi:7070/'))
         self.assertTrue(self.disp.mcp_origin_allowed('http://pi:7070', 'http://pi:7070/'))
         self.assertFalse(self.disp.mcp_origin_allowed('https://evil.example', 'http://pi:7070/'))
+
+
+class KvTableTest(unittest.TestCase):
+
+    def test_values(self):
+        res = kv_table({'type': 'calc', 'n': 5, 'flag': True, 'none': None, 'nested': {'x': [1, 2]},
+                        'html': '<b>'})
+        self.assertIn('<b>type</b></td><td><span style="white-space: pre-wrap;">calc</span>', res)
+        self.assertIn('<code>5</code>', res)
+        self.assertIn('<code>true</code>', res)
+        self.assertIn('<code>null</code>', res)
+        self.assertIn('{\n  &quot;x&quot;: [\n    1,\n    2\n  ]\n}', res)  # verschachtelt als JSON
+        self.assertIn('&lt;b&gt;', res)
+        self.assertNotIn('<b><', res)
+
+    def test_no_dict(self):
+        self.assertIn('[\n  1\n]', kv_table([1]))
+        self.assertIn('(leer)', kv_table({}))
 
 
 if __name__ == '__main__':

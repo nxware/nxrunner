@@ -148,6 +148,8 @@ __JS__
 <script>
 (() => {
 const DATA = __DATA__;
+// absolute Adresse der Oberflaeche: die Seite wird auch unter anderen Pfaden angezeigt (z.B. /sys/mcp)
+const UI_URL = '/pysys/ui';
 const qs = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let current = null;
@@ -232,13 +234,24 @@ function renderList() {
 function setContent(html) {
   const out = qs('#content');
   out.innerHTML = html;
-  // per innerHTML eingefuegte Scripte werden nicht ausgefuehrt, daher neu erzeugen
-  out.querySelectorAll('script').forEach(old => {
-    const s = document.createElement('script');
-    [...old.attributes].forEach(a => s.setAttribute(a.name, a.value));
-    s.textContent = old.textContent;
+  runScripts([...out.querySelectorAll('script')]);
+}
+
+// per innerHTML eingefuegte Scripte werden nicht ausgefuehrt, daher neu erzeugen. Der Reihe nach:
+// externe Scripte (z.B. showdown.min.js) laden sonst asynchron und der folgende Inline-Code laeuft zu frueh
+function runScripts(scripts) {
+  const old = scripts.shift();
+  if (!old) return;
+  const s = document.createElement('script');
+  [...old.attributes].forEach(a => s.setAttribute(a.name, a.value));
+  s.textContent = old.textContent;
+  if (s.src) {
+    s.onload = s.onerror = () => runScripts(scripts);
     old.replaceWith(s);
-  });
+  } else {
+    old.replaceWith(s);
+    runScripts(scripts);
+  }
 }
 
 // links: HTML aus BaseJobExecutor.part_intern_links, das der Runner mit jeder Seite liefert (intern_links)
@@ -253,7 +266,7 @@ function showError(message) {
 function select(name) {
   current = name;
   renderList();
-  history.pushState(null, '', '?' + new URLSearchParams({[DATA.key]: name}));
+  history.pushState(null, '', UI_URL + '?' + new URLSearchParams({[DATA.key]: name}));
   qs('#error').textContent = '';
   setContent('<div class="muted">L&auml;dt&hellip;</div>');
   // auf dem Handy liegt der Inhalt unter der Liste
@@ -334,7 +347,7 @@ function renderRegistry() {
   setContent('<h2>Registry</h2>'
     + '<div class="reg-tools"><input type="search" id="reg_search" placeholder="Name, Klasse, Paket, Tag suchen&hellip;" value="' + esc(reg.q) + '">'
     + '<span class="muted"><span id="reg_count">' + shown.length + '</span> von ' + items.length + ' Runnern</span>'
-    + '<a href="?view=registry&refresh=1">neu einlesen</a></div>'
+    + '<a href="' + UI_URL + '?view=registry&refresh=1">neu einlesen</a></div>'
     + '<div class="reg-tags">' + tags.map(t => chip(t, t)).join('') + (missing ? chip('!missing', 'Module fehlen (' + missing + ')') : '') + '</div>'
     + '<div id="reg_list">' + (shown.map(regItem).join('') || '<div class="empty">Keine Treffer</div>') + '</div>');
   const search = qs('#reg_search');
@@ -421,7 +434,7 @@ qs('#content').addEventListener('click', ev => {
     // eingegebene Werte auf die Seite zum Installieren mitnehmen
     const q = new URLSearchParams({view: 'install', name: name, runner_type: box.querySelector('[data-field=runner_type]').value.trim()});
     box.querySelectorAll('[data-arg]').forEach(i => { if (i.value.trim() !== '') q.set('arg_' + i.dataset.arg, i.value); });
-    location.href = '?' + q;
+    location.href = UI_URL + '?' + q;
   }
 });
 
@@ -449,7 +462,7 @@ function renderInstall() {
     + '</div>'
     + '<div class="muted">Leere Felder = Standardwert. Werte wie 42, true, None, [1, 2] werden als Python-Werte übergeben.</div>'
     + '<h3>Config</h3><div id="inst_warn"></div><div class="muted" id="inst_path"></div><pre id="inst_preview"></pre>'
-    + '<button data-act="do-install">Installieren</button> <a href="?view=registry">zurück zur Registry</a>'
+    + '<button data-act="do-install">Installieren</button> <a href="' + UI_URL + '?view=registry">zurück zur Registry</a>'
     + '<div class="reg-msg"></div></div>');
   const box = qs('#inst_box');
   const job = preview => {

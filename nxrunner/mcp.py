@@ -4,6 +4,7 @@
     Aktiv nur mit --mcp oder mcp_enable: true. Dann gibt es
       /mcp      JSON-RPC-Endpunkt (Streamable HTTP, nur POST mit JSON-Antwort, kein SSE)
       /sys/mcp  Freischalten der Signaturen je Runner und Einbindungsanleitung
+      /sys/mcp/pending  Jobs, die auf Freigabe warten (Genehmigen/Ablehnen), und letzte Ergebnisse
 
     Freigeschaltete Signaturen stehen in der Config:
 
@@ -30,7 +31,7 @@ from nwebclient import web as w
 from nwebclient import util as u
 from nwebclient.runner import op
 
-from nxrunner.mcp_approval import McpApprovals
+from nxrunner.mcp_approval import McpApprovals, approvals_html
 
 PROTOCOL_VERSION = '2025-06-18'
 PROTOCOL_VERSIONS = ('2025-06-18', '2025-03-26', '2024-11-05')
@@ -56,7 +57,7 @@ MODES = {MODE_OFF: 'aus', MODE_DIRECT: 'direkt', MODE_APPROVE: 'mit Freigabe'}
 
 _approvals_lock = threading.Lock()
 
-# Freigabe-Bereich auf /sys/mcp: Entscheidungen per fetch (Auswahl im Formular bleibt erhalten), alle 3 s aktualisieren
+# Freigabe-Bereich auf /sys/mcp/pending: Entscheidungen per fetch, alle 3 s aktualisieren
 MCP_APPROVALS_JS = """
 window.mcpDecide = function(action, id) {
   const body = new URLSearchParams(); body.set(action, id);
@@ -256,16 +257,26 @@ class McpSystem:
         known = {p.name for p in sig.items if p.name not in SKIP_PARAMS}
         job = {k: v for k, v in sig.job({k: v for k, v in arguments.items() if k in known}).items() if v is not None}
         job[self.key] = runner_type
+        approval = None
         if approve:
-            denied = self.mcp_await_approval(tool, arguments)
-            if denied is not None:
-                return denied
+            approval = self.mcp_await_approval(tool, job)
+            if not approval.approved:
+                return self.mcp_denied_result(tool, approval)
+        result, mcp_res = self.mcp_execute_job(tool, job)
+        if approval is not None:
+            self.mcp_approvals().set_result(approval, result)
+        return mcp_res
+
+    def mcp_execute_job(self, tool, job: dict):
+        """ :return: (Ergebnis fuer die Anzeige, Ergebnis im MCP-Format) """
         try:
             result = self.execute(job)
         except Exception as e:
             self.error(f'MCP {tool}: {e}')
-            return {'content': [{'type': 'text', 'text': f'{type(e).__name__}: {e}'}], 'isError': True}
-        return self.mcp_result(result)
+            message = f'{type(e).__name__}: {e}'
+            return {'success': False, 'message': message}, {'content': [{'type': 'text', 'text': message}],
+                                                            'isError': True}
+        return json_value(result), self.mcp_result(result)
 
     # --- Freigabe ---------------------------------------------------------------------------
 
@@ -288,13 +299,15 @@ class McpSystem:
         except Exception:
             return ''
 
-    def mcp_await_approval(self, tool, arguments: dict):
-        """ wartet auf die Freigabe unter /sys/mcp; :return: None wenn genehmigt, sonst Fehlerergebnis (MCP) """
+    def mcp_await_approval(self, tool, job: dict):
+        """ wartet auf die Freigabe des Jobs unter /sys/mcp/pending; :return: Approval (decision gesetzt) """
         self.info(f'MCP: {tool} wartet auf Freigabe')
-        approval = self.mcp_approvals().request(tool, arguments, self.mcp_client(), self.mcp_approve_timeout())
+        approval = self.mcp_approvals().request(tool, job, self.mcp_client(), self.mcp_approve_timeout())
         self.info(f'MCP: {tool} {approval.decision}')
-        if approval.approved:
-            return None
+        return approval
+
+    @staticmethod
+    def mcp_denied_result(tool, approval) -> dict:
         message = f'Aufruf von {tool} nicht ausgefuehrt: {approval.decision}'
         return {'content': [{'type': 'text', 'text': message}], 'isError': True,
                 'structuredContent': {'success': False, 'message': message, 'approval': approval.decision}}
@@ -406,6 +419,8 @@ class McpSystem:
             app.add_url_rule('/mcp', 'nxrunner_mcp', view_func=self.mcp_http, methods=['GET', 'POST', 'DELETE'])
             app.add_url_rule('/sys/mcp', 'nxrunner_sys_mcp',
                              view_func=self.mcp_page_response, methods=['GET', 'POST'])
+            app.add_url_rule('/sys/mcp/pending', 'nxrunner_sys_mcp_pending',
+                             view_func=self.mcp_pending_response, methods=['GET'])
             app.add_url_rule('/sys/mcp/approvals', 'nxrunner_sys_mcp_approvals',
                              view_func=self.mcp_approvals_response, methods=['GET', 'POST'])
             self.info('MCP-Server unter /mcp, Verwaltung unter /sys/mcp')
@@ -448,27 +463,44 @@ class McpSystem:
         p.prop('Freigeschaltet', str(len(self.mcp_allowed())) +
                (' (nur diese Sitzung, nicht gespeichert)' if self._mcp_unsaved else ''))
         p.prop('Config', html.escape(self.mcp_config_path()))
-        self.part_mcp_approvals(p)
+        count = self.mcp_approvals().open_count()
+        p.prop('Offene Freigaben', f'{count} ' + w.a('anzeigen', '/sys/mcp/pending',
+                                                      hint='Jobs, die auf Freigabe warten, und letzte Ergebnisse'))
         self.part_mcp_signatures(p)
         self.part_mcp_guide(p)
         return self.mcp_render(p)
 
-    def mcp_page_response(self):
+    def page_mcp_pending(self):
+        """ /sys/mcp/pending: Jobs, die auf Freigabe warten, und die letzten Entscheidungen mit Ergebnis """
+        p = base.Page(owner=self)
+        p.h2('MCP-Freigaben')
+        p.prop('Wartezeit', f'{int(self.mcp_approve_timeout())} s, danach wird der Aufruf abgebrochen')
+        p.div(w.a('Zur MCP-Verwaltung', '/sys/mcp', hint='Signaturen freischalten (aus / direkt / mit Freigabe)'))
+        self.part_mcp_approvals(p)
+        return self.mcp_render(p, 'MCP-Freigaben')
+
+    def mcp_html_response(self, page_fn):
         """
-          /sys/mcp ohne Cache, damit nachgeladene Runner auch nach Zurueck/Neuladen erscheinen.
-          /sys/mcp?type=x (Runner-Auswahl der Oberflaeche) -> /pysys/ui?type=x
+          Seite ohne Cache, damit nachgeladene Runner auch nach Zurueck/Neuladen erscheinen.
+          ?type=x (Runner-Auswahl der Oberflaeche) -> /pysys/ui?type=x
         """
         from flask import make_response, redirect, request
         if request.method == 'GET' and request.args.get(self.key):
             return redirect('/pysys/ui?' + request.query_string.decode('utf-8', errors='replace'))
-        resp = make_response(self.page_mcp(self.create_request_params()))
+        resp = make_response(page_fn())
         resp.headers['Cache-Control'] = 'no-store'
         return resp
 
-    def mcp_render(self, p: base.Page):
+    def mcp_page_response(self):
+        return self.mcp_html_response(lambda: self.page_mcp(self.create_request_params()))
+
+    def mcp_pending_response(self):
+        return self.mcp_html_response(self.page_mcp_pending)
+
+    def mcp_render(self, p: base.Page, name='MCP'):
         """ in der neuen nxrunner-Oberflaeche (NxRunner.render_ui_page), sonst als nxui-Seite """
         render = getattr(self, 'render_ui_page', None)
-        return render('MCP', p) if render is not None else p.nxui()
+        return render(name, p) if render is not None else p.nxui()
 
     def mcp_url(self) -> str:
         try:
@@ -508,37 +540,7 @@ class McpSystem:
         p(w.tag('script', MCP_APPROVALS_JS))
 
     def mcp_approvals_html(self, message='') -> str:
-        approvals = self.mcp_approvals()
-        pending, history = approvals.pending(), approvals.history()[:10]
-        res = w.tag('h3', f'Offene Freigaben ({len(pending)})')
-        if message:
-            res += w.alert_info(html.escape(message))
-        if pending:
-            res += w.table(w.tr(''.join(w.tag('th', t) for t in ('Zeit', 'Tool', 'Argumente', 'Client', ''))) +
-                           ''.join(self.mcp_approval_row(a) for a in pending))
-        else:
-            res += w.tag('div', 'Keine offenen Freigaben.')
-        if history:
-            res += w.tag('h3', 'Letzte Entscheidungen')
-            res += w.table(''.join(self.mcp_history_row(a) for a in history))
-        return res
-
-    @staticmethod
-    def mcp_args_text(approval) -> str:
-        text = json.dumps(approval.arguments, ensure_ascii=False, default=str)
-        return html.escape(text if len(text) <= 500 else text[:500] + ' ...')
-
-    def mcp_approval_row(self, a) -> str:
-        buttons = (w.tag('button', 'Genehmigen', type='button', onclick=f"mcpDecide('approve', {a.id})",
-                         title=f'{html.escape(a.tool)} mit diesen Argumenten jetzt ausfuehren') + ' ' +
-                   w.tag('button', 'Ablehnen', type='button', onclick=f"mcpDecide('deny', {a.id})",
-                         title='Aufruf nicht ausfuehren, der Client erhaelt einen Fehler'))
-        return w.tr(w.td(a.created.strftime('%H:%M:%S')) + w.td(html.escape(a.tool)) +
-                    w.td(w.tag('code', self.mcp_args_text(a))) + w.td(html.escape(a.client)) + w.td(buttons))
-
-    def mcp_history_row(self, a) -> str:
-        return w.tr(w.td(a.created.strftime('%H:%M:%S')) + w.td(html.escape(a.tool)) +
-                    w.td(w.tag('code', self.mcp_args_text(a))) + w.td(html.escape(str(a.decision))))
+        return approvals_html(self.mcp_approvals(), message)
 
     # --- Signaturen auf /sys/mcp ----------------------------------------------------------------
 

@@ -17,6 +17,7 @@ from fnmatch import fnmatch
 from typing import List, Optional
 
 from nwebclient import runner as r, base
+from nwebclient.runner import op
 from nwebclient import util as u
 from nwebclient import base as b
 from nwebclient import web as w
@@ -136,6 +137,16 @@ class Projects(r.BaseJobExecutor):
                 p.div(w.a(name, self.link('project', f'name={name}')), title=path)
         self.part_system(p, params)
         p.pre('', id='result')
+
+    @op("Liste der Projekte aus nweb.json:repos, mit with_file nur Projekte in denen diese Datei vorhanden ist",
+        result={'success': 'bool', 'items': 'list'})
+    def projects(self, with_file: str = None):
+        items = []
+        for name, path in self.args.get('repos', {}).items():
+            if with_file and not os.path.exists(os.path.join(path, with_file)):
+                continue
+            items.append({'name': name, 'path': path})
+        return {'success': True, 'items': items}
 
     def execute_pull_all(self, data={}):
         """
