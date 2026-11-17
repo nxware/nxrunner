@@ -1,10 +1,13 @@
 import html
 import json
+import os
+import re
 import time
 import urllib.parse
 from typing import List, Optional
 
 from nwebclient import runner as r, base
+from nwebclient.runner import op
 from nwebclient import util as u
 from nwebclient import base as b
 from nwebclient import web as w
@@ -276,12 +279,20 @@ class Scene(r.BaseJobExecutor):
                 - "4?type=gpio&pin=17&value=0"
 
       Bearbeitung: page_edit (?type=scene&scene=edit)
+        Bilder koennen per Drag & Drop in eine Spur gezogen werden, sie landen lokal in path/images und als
+        Eintrag mit dem Job ?type=<scene>&op=image&file=... (Dauer IMAGE_DURATION s)
 
       @see https://github.com/Zulko/moviepy
     """
 
-    def __init__(self, type='scene', args: u.Args = {}):
+    IMAGE_EXTS = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif',
+                  'webp': 'image/webp', 'bmp': 'image/bmp'}  # ohne svg (koennte Script enthalten)
+
+    IMAGE_DURATION = 5
+
+    def __init__(self, type='scene', args: u.Args = {}, path: str = '~/.cache/nxrunner/scene'):
         super().__init__(type)
+        self.path = os.path.realpath(os.path.expanduser(path))
         self.items: List[Timeline] = []
         self.define_sig(dev.PInt('start', 1)).set_description('Startet alle Timelines im Hintergrund').r(success=bool, message=str)
         self.define_sig(dev.PInt('add', 1)).set_description('Fügt eine neue Timeline hinzu').r(success=bool, message=str, name=str)
@@ -418,6 +429,9 @@ class Scene(r.BaseJobExecutor):
             'type': self.type,
             'data': self.with_data({}),
             'jobs': self.job_suggestions(),
+            'upload': self.dispatcher_link(self.page_upload_image),
+            'img': self.dispatcher_link(self.page_img),
+            'image_duration': self.IMAGE_DURATION,
         }
         p.script('const SCENE_CONFIG = ' + json.dumps(config).replace('</', '<\\/') + ';')
         p.script(EDITOR_JS)
@@ -427,6 +441,69 @@ class Scene(r.BaseJobExecutor):
         return dict(
             timelines=[tl.to_dict() for tl in self.items]
         )
+
+    # --- Bilder (Drag & Drop im Editor) -------------------------------------------------------
+
+    def image_dir(self) -> str:
+        return os.path.join(self.path, 'images')
+
+    def resolve_image(self, file) -> Optional[str]:
+        """ :return: absoluter Pfad, wenn file ein Bild in image_dir ist, sonst None """
+        if not file:
+            return None
+        path = os.path.realpath(os.path.expanduser(str(file)))
+        ext = path.rsplit('.', 1)[-1].lower()
+        if os.path.dirname(path) == self.image_dir() and ext in self.IMAGE_EXTS and os.path.isfile(path):
+            return path
+        return None
+
+    def save_image(self, f) -> Optional[str]:
+        """ speichert einen Flask-Upload (FileStorage) in image_dir, :return: Pfad oder None (kein Bild) """
+        name = re.sub(r'[^\w.\-]', '_', os.path.basename(str(getattr(f, 'filename', '') or '')).strip()) or 'bild'
+        stem, _, ext = name.rpartition('.')
+        if ext.lower() not in self.IMAGE_EXTS:
+            return None
+        os.makedirs(self.image_dir(), exist_ok=True)
+        dst, i = os.path.join(self.image_dir(), name), 1
+        while os.path.exists(dst):
+            dst, i = os.path.join(self.image_dir(), f'{stem}_{i}.{ext}'), i + 1
+        f.save(dst)
+        return dst
+
+    def image_job(self, path: str) -> str:
+        return '?' + urllib.parse.urlencode({'type': self.type, 'op': 'image', 'file': path})
+
+    @op("Bild-Eintrag einer Timeline (Bild aus dem Editor per Drag & Drop)",
+        result={'success': 'bool', 'file': 'str', 'url': 'str'})
+    def image(self, file: str):
+        path = self.resolve_image(file)
+        if path is None:
+            return self.fail('Bild nicht gefunden')
+        return self.success('Bild ' + os.path.basename(path), file=path, url=self.image_url(path))
+
+    def image_url(self, path: str) -> str:
+        return self.dispatcher_link(self.page_img, file=path)
+
+    def page_img(self, params={}):
+        """ liefert ein Bild aus image_dir (Vorschau im Editor) """
+        from flask import send_file
+        path = self.resolve_image(params.get('file'))
+        if path is None:
+            return "404, Bild nicht gefunden", 404
+        return send_file(path, mimetype=self.IMAGE_EXTS[path.rsplit('.', 1)[-1].lower()], max_age=86400)
+
+    def page_upload_image(self, params={}):
+        """ POST (multipart): image, tl, start; legt das Bild als Eintrag in der Timeline tl an, Antwort JSON """
+        from flask import jsonify
+        tl = self.get_timeline(params.get('tl'))
+        if tl is None:
+            return jsonify(self.with_data(self.fail('Timeline nicht gefunden')))
+        dst = self.save_image(params.get('image')) if params.get('image') is not None else None
+        if dst is None:
+            return jsonify(self.with_data(self.fail('Kein Bild (erlaubt: ' + ', '.join(self.IMAGE_EXTS) + ')')))
+        res = tl.add_item({'start': max(0.0, float(params.get('start') or 0)), 'job': self.image_job(dst),
+                           'duration': self.IMAGE_DURATION})
+        return jsonify(self.with_data({**res, 'message': os.path.basename(dst) + ' eingefügt'}))
 
 
 # language=css
@@ -476,6 +553,9 @@ EDITOR_CSS = """
     .scn-item.instant.selected { border-left-color: var(--scn-sel); outline: none; }
     .scn-item.dragging { cursor: grabbing; opacity: .85; }
     .scn-item .t { font-family: monospace; opacity: .8; margin-right: 4px; }
+    .scn-item.image { background-color: #3a3f4d; background-size: auto 100%; background-repeat: repeat-x;
+                      text-shadow: 0 0 3px #000, 0 0 2px #000; }
+    .scn-lane.drop { outline: 2px dashed var(--scn-sel); outline-offset: -2px; background-color: #2f3445; }
     .scn-item .rs { position: absolute; right: 0; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
     .scn-item .rs:hover { background: #fff3; }
     .scn-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #ff5c7a; z-index: 4;
@@ -542,17 +622,59 @@ EDITOR_JS = """
 
     function status(msg, err) { const s = $('scn-status'); s.textContent = msg || ''; s.classList.toggle('err', !!err); }
 
+    function apply(res) {
+        if (res.timelines) { state.data = res; }
+        if (res.success === false) { status(res.message || res.error || 'Fehler', true); }
+        else { status(res.message && res.message !== 'ok' ? res.message : ''); }
+        render();
+        return res;
+    }
+
     function api(data) {
         return fetch(base_url(), post({type: cfg.type, ...data}))
             .then(r => r.json())
-            .then(res => {
-                if (res.timelines) { state.data = res; }
-                if (res.success === false) { status(res.message || res.error || 'Fehler', true); }
-                else { status(res.message && res.message !== 'ok' ? res.message : ''); }
-                render();
-                return res;
-            })
+            .then(apply)
             .catch(e => { status('Verbindungsfehler: ' + e, true); });
+    }
+
+    // Bild-Eintrag: Job ?type=<scene>&op=image&file=..., :return: Dateipfad oder null
+    function imageFile(job) {
+        if (typeof job !== 'string') return null;
+        const q = new URLSearchParams(job.replace(/^\\?/, ''));
+        return q.get('type') === cfg.type && q.get('op') === 'image' ? q.get('file') : null;
+    }
+
+    // Bilder (Dateien) nacheinander hochladen, jedes als eigener Eintrag hinter dem vorherigen
+    function dropImages(tlName, files, start) {
+        const imgs = [...files].filter(f => f.type.startsWith('image/'));
+        if (imgs.length === 0) { status('Nur Bilder können in eine Spur gezogen werden', true); return; }
+        let chain = Promise.resolve();
+        imgs.forEach((f, i) => {
+            const at = start + i * cfg.image_duration;
+            chain = chain.then(() => {
+                const fd = new FormData();
+                fd.append('image', f); fd.append('tl', tlName); fd.append('start', fmt(at));
+                status('Lade ' + f.name + ' hoch …');
+                return fetch(cfg.upload, {method: 'POST', body: fd}).then(r => r.json()).then(apply);
+            });
+        });
+        chain.catch(e => status('Upload fehlgeschlagen: ' + e, true));
+    }
+
+    function initDrop(lane, tl) {
+        const isFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+        lane.addEventListener('dragover', (e) => {
+            if (!isFiles(e)) return;
+            e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; lane.classList.add('drop');
+            const t = snapT((e.clientX - lane.getBoundingClientRect().left) / state.pps);
+            $('scn-time').textContent = fmt(t) + ' s';
+        });
+        lane.addEventListener('dragleave', (e) => { if (e.target === lane) lane.classList.remove('drop'); });
+        lane.addEventListener('drop', (e) => {
+            if (!isFiles(e)) return;
+            e.preventDefault(); lane.classList.remove('drop');
+            dropImages(tl.name, e.dataTransfer.files, snapT((e.clientX - lane.getBoundingClientRect().left) / state.pps));
+        });
     }
 
     function findItem(guid) {
@@ -562,6 +684,8 @@ EDITOR_JS = """
 
     function jobLabel(job) {
         if (!job) return '(leer)';
+        const img = imageFile(job);
+        if (img) return 'Bild: ' + img.split(/[\\\\/]/).pop();
         if (typeof job !== 'string') return JSON.stringify(job);
         const q = new URLSearchParams(job.replace(/^\\?/, ''));
         const type = q.get('type'); q.delete('type'); q.delete('title');
@@ -621,7 +745,8 @@ EDITOR_JS = """
         row.appendChild(head);
 
         const lane = el('div', 'scn-lane'); lane.style.width = w + 'px';
-        lane.title = 'Doppelklick: neuer Eintrag';
+        lane.title = 'Doppelklick: neuer Eintrag, Bilder hierher ziehen: Bild-Eintrag';
+        initDrop(lane, tl);
         lane.addEventListener('dblclick', (e) => {
             if (e.target !== lane) return;
             addItem(tl.name, snapT(e.offsetX / state.pps));
@@ -636,6 +761,11 @@ EDITOR_JS = """
         const d = el('div', 'scn-item' + (it.duration ? '' : ' instant') + (state.selected === it.guid ? ' selected' : ''));
         d.style.left = (it.start * state.pps) + 'px';
         if (it.duration) d.style.width = (it.duration * state.pps) + 'px';
+        const img = imageFile(it.job);
+        if (img) {
+            d.classList.add('image');
+            d.style.backgroundImage = 'url("' + cfg.img + 'file=' + encodeURIComponent(img) + '")';
+        }
         const t = el('span', 't', fmt(it.start));
         d.append(t, document.createTextNode(jobLabel(it.job)));
         d.title = fmt(it.start) + ' s' + (it.duration ? ' – ' + fmt(it.start + it.duration) + ' s' : '') + '\\n' + (it.job || '');
@@ -715,7 +845,7 @@ EDITOR_JS = """
             help.style.marginTop = '12px';
             help.innerHTML = '<b>Bedienung</b><br>Doppelklick in eine Spur: neuer Eintrag<br>Ziehen: Startzeit ändern<br>' +
                 'Rechte Kante ziehen: Dauer ändern<br>Entf: Eintrag löschen<br>&larr; / &rarr;: um ein Rasterschritt verschieben<br>' +
-                'Strg + Mausrad: Zoom';
+                'Strg + Mausrad: Zoom<br>Bild in eine Spur ziehen: Bild-Eintrag';
             box.appendChild(help);
             return;
         }
