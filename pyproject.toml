@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = "Backup System"
-version = "1.0.7"
+version = "1.0.8"
 requires-python = ">=3.10"
 dependencies = ["nwebclient", "waitress", "flask"]
 
@@ -65,6 +65,10 @@ projects = "nxrunner.projects:Projects"
 deployments = "nxrunner.projects:Deployments"
 anemometer_kalib = "nxrunner.app.anemometer:AnemometerKalibrierung"
 anemometer = "nxrunner.app.anemometer:Anemometer"
+videos = "nxrunner.app.videos:Videos"
+video = "nxrunner.app.videos:Video"
+timeline = "nxrunner.animate:Timeline"
+scene = "nxrunner.animate:Scene"
 nwebdir = "nxrunner.nweb:NWebDir"
 google_calendar = "nxrunner.apis.google:CalendarAPI"
 website = "nxrunner.web:WebsiteController"

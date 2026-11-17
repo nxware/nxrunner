@@ -180,7 +180,10 @@ class McpTest(unittest.TestCase):
         self.assertEqual(self.disp.mcp_allowed(), [{'type': 'calc', 'name': 'add'},
                                                    {'type': 'calc', 'name': 'hello', 'approve': True}])
         page = self.disp.page_mcp({})
-        self.assertRegex(page, r'name="sig:calc:hello"[^>]*>.*?<option value="approve" selected>')
+        self.assertRegex(page, r'<input type="radio" value="approve"[^>]*checked="checked"[^>]*name="sig:calc:hello"')
+        self.assertNotRegex(page, r'<input type="radio" value="direct"[^>]*checked="checked"[^>]*name="sig:calc:hello"')
+        self.assertRegex(page, r'<input type="radio" value=""[^>]*checked="checked"[^>]*name="sig:calc:broken"')
+        self.assertNotIn('<select', page)
         tools = {t['name']: t for t in rpc(self.disp, 'tools/list')['result']['tools']}
         self.assertIn('Freigabe', tools['calc__hello']['description'])
         self.assertNotIn('Freigabe', tools['calc__add']['description'])

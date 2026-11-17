@@ -53,7 +53,7 @@ TRUE_VALUES = ('1', 'true', 'yes', 'on')
 
 # Modus einer Signatur auf /sys/mcp: aus, direkt ausfuehren, erst nach Freigabe
 MODE_OFF, MODE_DIRECT, MODE_APPROVE = '', 'direct', 'approve'
-MODES = {MODE_OFF: 'aus', MODE_DIRECT: 'direkt', MODE_APPROVE: 'mit Freigabe'}
+MODES = {MODE_OFF: 'aus', MODE_DIRECT: 'direkt', MODE_APPROVE: 'Freigabe'}
 
 _approvals_lock = threading.Lock()
 
@@ -475,7 +475,7 @@ class McpSystem:
         p = base.Page(owner=self)
         p.h2('MCP-Freigaben')
         p.prop('Wartezeit', f'{int(self.mcp_approve_timeout())} s, danach wird der Aufruf abgebrochen')
-        p.div(w.a('Zur MCP-Verwaltung', '/sys/mcp', hint='Signaturen freischalten (aus / direkt / mit Freigabe)'))
+        p.div(w.a('Zur MCP-Verwaltung', '/sys/mcp', hint='Signaturen freischalten (aus / direkt / Freigabe)'))
         self.part_mcp_approvals(p)
         return self.mcp_render(p, 'MCP-Freigaben')
 
@@ -570,8 +570,8 @@ class McpSystem:
 
     @staticmethod
     def mcp_mode_button(label: str, mode: str, hint: str) -> str:
-        """ Button (type=button, schickt das Formular nicht ab), der alle Auswahlfelder auf mode setzt """
-        js = f"document.querySelectorAll('.mcp_sig').forEach(function(c) {{ c.value = '{mode}'; }});"
+        """ Button (type=button, schickt das Formular nicht ab), der bei allen Signaturen den Radio-Button mode waehlt """
+        js = f"document.querySelectorAll('.mcp_sig').forEach(function(c) {{ c.checked = c.value === '{mode}'; }});"
         return w.tag('button', label, type='button', onclick=js, title=hint)
 
     def part_mcp_runner(self, p: base.Page, runner_type, runner) -> bool:
@@ -586,16 +586,27 @@ class McpSystem:
             p.div(w.table(w.tr(head) + rows))
         return True
 
-    def mcp_mode_select(self, runner_type, name) -> str:
+    MODE_HINTS = {MODE_OFF: 'nicht als MCP-Tool anbieten', MODE_DIRECT: 'Aufruf wird sofort ausgefuehrt',
+                  MODE_APPROVE: 'Aufruf wartet auf Freigabe unter /sys/mcp/pending'}
+
+    def mcp_mode_radios(self, runner_type, name) -> str:
+        """ Radio-Buttons aus / direkt / Freigabe, eine Gruppe je Signatur (name sig:<type>:<name>) """
         current = self.mcp_mode(runner_type, name)
-        options = ''.join(f'<option value="{mode}"{" selected" if mode == current else ""}>{label}</option>'
-                          for mode, label in MODES.items())
-        return w.tag('select', options, name=html.escape(f'sig:{runner_type}:{name}', quote=True), _class='mcp_sig',
-                     title=f'MCP-Tool {tool_name(runner_type, name)}: aus, direkt ausfuehren oder erst nach Freigabe')
+        group = html.escape(f'sig:{runner_type}:{name}', quote=True)
+        tool = tool_name(runner_type, name)
+        radios = []
+        for mode, label in MODES.items():
+            attrs = {'type': 'radio', 'name': group, 'value': mode, '_class': 'mcp_sig'}
+            if mode == current:
+                attrs['checked'] = 'checked'
+            radios.append(w.tag('label', w.input(attrs.pop('name'), **attrs) + ' ' + label,
+                                title=f'{tool}: {self.MODE_HINTS[mode]}'))
+        return w.tag('span', ' '.join(radios), style='white-space: nowrap;')
 
     def mcp_sig_row(self, runner_type, name, sig) -> str:
         params = ', '.join(f'{p.name}: {p.type}' for p in sig.items if p.name not in SKIP_PARAMS)
-        return w.tr(w.td(self.mcp_mode_select(runner_type, name)) + w.td(html.escape(name)) +
+        return w.tr(w.td(self.mcp_mode_radios(runner_type, name), style='white-space: nowrap;') +
+                    w.td(html.escape(name)) +
                     w.td(html.escape(params)) + w.td(html.escape(str(sig.description or ''))))
 
     def part_mcp_guide(self, p: base.Page):
