@@ -8,6 +8,7 @@ import time
 import unittest
 
 from nwebclient import runner as r
+from nwebclient import util as u
 
 from nxrunner import jobstore as js
 
@@ -823,9 +824,9 @@ class RemoteRunnerPersistenceTestCase(unittest.TestCase):
 class FmtTsTestCase(unittest.TestCase):
 
     def test_fmt_ts(self):
-        self.assertEqual(js.fmt_ts(None), '')
-        self.assertEqual(js.fmt_ts(0), '')
-        self.assertRegex(js.fmt_ts(time.time()), r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
+        self.assertEqual(u.format_datetime(None, seconds=True), '')
+        self.assertEqual(u.format_datetime(0, seconds=True), '')
+        self.assertRegex(u.format_datetime(time.time(), seconds=True), r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
 
 
 if __name__ == '__main__':

@@ -71,9 +71,6 @@ def as_bool(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on', 'ja')
 
 
-def fmt_time(ts):
-    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts else '-'
-
 
 def normalize_importance(value, default='info'):
     value = str(value or '').strip().lower()
@@ -478,7 +475,7 @@ class LogFoundation(r.BaseJobExecutor):
 
     def col_state(self, src: LogSource):
         if src.running:
-            return f'<span title="seit {fmt_time(src.started)}">läuft</span>'
+            return f'<span title="seit {u.format_datetime(src.started, seconds=True, empty="-")}">läuft</span>'
         return f'<span title="{esc(src.error)}">gestoppt</span>' + (f' ({esc(src.error)})' if src.error else '')
 
     def col_source_actions(self, src: LogSource):
@@ -489,7 +486,7 @@ class LogFoundation(r.BaseJobExecutor):
     def grid_cols(self):
         col = w.Grid.col
         return [
-            col('created', "Zeit", value=lambda e: fmt_time(e['created'])),
+            col('created', "Zeit", value=lambda e: u.format_datetime(e['created'], seconds=True, empty='-')),
             col('importance', "Stufe", html=True, value=self.col_importance,
                 sort=lambda e: IMPORTANCES.index(e['importance'])),
             col('category', "Kategorie"),

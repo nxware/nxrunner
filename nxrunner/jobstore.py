@@ -1104,14 +1104,14 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
             if not has_runners:
                 p(w.alert_info("Noch keine Runner bekannt, mit \"Runner abrufen\" abfragen."))
             return
-        sent = f"Abfrage {esc(refresh['guid'])} vom {fmt_ts(refresh['sent'])}"
+        sent = f"Abfrage {esc(refresh['guid'])} vom {u.format_datetime(refresh['sent'], seconds=True)}"
         if refresh['status'] == 'pending':
             p(w.alert_info(f"{sent} wurde von {esc(self.target)} noch nicht ausgefuehrt, die Seite prueft erneut."))
             self.reload_later(p)
         elif refresh['status'] == 'timeout':
             p(w.alert_error(f"{sent}: keine Antwort von {esc(self.target)} nach {int(self.timeout)} s."))
         else:
-            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {fmt_ts(refresh['done'])}")
+            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {u.format_datetime(refresh['done'], seconds=True)}")
 
     def reload_later(self, p: b.Page):
         """ Seite nach poll_interval (mind. 2 s) neu laden, solange Antworten ausstehen """
@@ -1206,7 +1206,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def part_instances_query(self, p: b.Page, query: Optional[dict]):
         if query is None:
             return
-        sent = f"Abfrage {esc(query['guid'])} vom {fmt_ts(query['sent'])}"
+        sent = f"Abfrage {esc(query['guid'])} vom {u.format_datetime(query['sent'], seconds=True)}"
         if query['status'] == 'pending':
             p(w.alert_info(f"{sent} wurde noch von keiner Instanz ausgefuehrt, die Seite prueft erneut."))
             self.reload_later(p)
@@ -1215,13 +1215,13 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         elif query['status'] == 'error':
             p(w.alert_error(f"{sent}: {esc(query.get('message', ''))}"))
         else:
-            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {fmt_ts(query['done'])}")
+            p.prop("Letzte Abfrage", f"{sent}, ausgefuehrt {u.format_datetime(query['done'], seconds=True)}")
 
     def instance_cols(self):
         col = w.Grid.col
         return [
             col('name', "Instanz", html=True, value=lambda e: esc(e['name']) + (' <b>(target)</b>' if e['name'] == self.target else '')),
-            col('seen', "Zuletzt gesehen", value=lambda e: fmt_ts(e.get('seen')), sort=lambda e: e.get('seen') or 0),
+            col('seen', "Zuletzt gesehen", value=lambda e: u.format_datetime(e.get('seen'), seconds=True), sort=lambda e: e.get('seen') or 0),
             col('actions', '', html=True, sortable=False, value=self.col_instance_actions),
         ]
 
@@ -1251,7 +1251,7 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
     def result_cols(self):
         col = w.Grid.col
         return [
-            col('sent', "Gesendet", value=lambda e: fmt_ts(e['sent']), sort=lambda e: e['sent']),
+            col('sent', "Gesendet", value=lambda e: u.format_datetime(e['sent'], seconds=True), sort=lambda e: e['sent']),
             col('label', "Job", html=True, value=self.col_label, sort=lambda e: e['label']),
             col('status', "Status", html=True, value=self.col_status),
             col('duration', "Dauer", value=lambda e: f"{e['done'] - e['sent']:.1f} s" if e['done'] else ''),
@@ -1284,8 +1284,8 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         with p.section(h=f"Job {esc(job['label'])}"):
             p.prop("guid", esc(job['guid']))
             p.prop("Status", self.col_status(job))
-            p.prop("Gesendet", fmt_ts(job['sent']))
-            p.prop("Fertig", fmt_ts(job['done']))
+            p.prop("Gesendet", u.format_datetime(job['sent'], seconds=True))
+            p.prop("Fertig", u.format_datetime(job['done'], seconds=True))
             p.div(self.col_actions(job))
             p.h3("Job")
             p.pre(esc(json.dumps(job['job'], indent=2, default=str)))
@@ -1294,6 +1294,3 @@ class RemoteRunner(r.BaseJobExecutor, RemoteJobMixin):
         if job['status'] == 'pending':
             self.reload_later(p)
 
-
-def fmt_ts(ts) -> str:
-    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts else ''

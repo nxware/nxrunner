@@ -54,9 +54,6 @@ def as_bool(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on', 'ja')
 
 
-def fmt_time(ts):
-    return time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)) if ts else '-'
-
 
 class Deployment:
     """ Ein Git-Checkout auf einem SSH-Host """
@@ -447,9 +444,9 @@ class Deployments(r.BaseJobExecutor):
     @staticmethod
     def col_checked(e):
         s = e['status']
-        res = esc(fmt_time(s.get('checked')))
+        res = esc(u.format_datetime(s.get('checked'), empty='-'))
         if s.get('checked') and not s.get('online'):
-            res += f'<br><small title="Stand der angezeigten Version">online: {esc(fmt_time(s.get("last_online")))}</small>'
+            res += f'<br><small title="Stand der angezeigten Version">online: {esc(u.format_datetime(s.get("last_online"), empty="-"))}</small>'
         return res
 
     def col_actions(self, e):
@@ -470,8 +467,8 @@ class Deployments(r.BaseJobExecutor):
                                  ("Update", dep.update_cmd_line()), ("Branch", s.get('branch')),
                                  ("Version", s.get('local')), ("origin", s.get('remote')),
                                  ("Commit", f"{s.get('subject', '')} ({s.get('date', '')})" if s.get('local') else ''),
-                                 ("Status", self.state(s)[1]), ("Geprüft", fmt_time(s.get('checked'))),
-                                 ("Zuletzt online", fmt_time(s.get('last_online'))), ("Fehler", s.get('error'))):
+                                 ("Status", self.state(s)[1]), ("Geprüft", u.format_datetime(s.get('checked'), empty='-')),
+                                 ("Zuletzt online", u.format_datetime(s.get('last_online'), empty='-')), ("Fehler", s.get('error'))):
                 p.prop(title, esc(value or '-'))
             p.div(self.col_actions({'dep': dep}))
         self.part_last_update(p, s.get('last_update'))
@@ -479,7 +476,7 @@ class Deployments(r.BaseJobExecutor):
     def part_last_update(self, p: base.Page, upd):
         if not upd:
             return
-        with p.section(h=f"Letztes Update {fmt_time(upd.get('time'))} ({'ok' if upd.get('ok') else 'Fehler'})"):
+        with p.section(h=f"Letztes Update {u.format_datetime(upd.get('time'), empty='-')} ({'ok' if upd.get('ok') else 'Fehler'})"):
             p.pre(esc(upd.get('output') or ''))
 
     def part_output(self, p: base.Page, params={}):
@@ -528,13 +525,13 @@ class Deployments(r.BaseJobExecutor):
         if not entry:
             return ''
         value = esc(entry.get('value', '')).replace('\n', '<br>')
-        return f'<span title="Stand {esc(fmt_time(entry.get("time")))}">{value}</span>'
+        return f'<span title="Stand {esc(u.format_datetime(entry.get("time"), empty="-"))}">{value}</span>'
 
     @staticmethod
     def col_host_checked(e):
         info = e['info']
-        res = esc(fmt_time(info.get('checked')))
+        res = esc(u.format_datetime(info.get('checked'), empty='-'))
         if info.get('checked') and not info.get('online'):
             res += (f' <span class="badge" title="{esc(info.get("error", ""))}">offline</span>'
-                    f'<br><small title="Stand der angezeigten Werte">online: {esc(fmt_time(info.get("last_online")))}</small>')
+                    f'<br><small title="Stand der angezeigten Werte">online: {esc(u.format_datetime(info.get("last_online"), empty="-"))}</small>')
         return res

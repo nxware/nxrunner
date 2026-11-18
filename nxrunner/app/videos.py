@@ -31,7 +31,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 import mimetypes
 import urllib.parse
 from io import BytesIO
@@ -40,6 +39,7 @@ from pathlib import Path
 from nwebclient import runner as r, base
 from nwebclient.runner import op
 from nwebclient import web as w
+from nwebclient import util as u
 
 
 VIDEO_EXTS = ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'wmv', 'mpg', 'mpeg', 'ts', '3gp']
@@ -66,14 +66,6 @@ BITRATES = {
 
 def is_video_file(path: str) -> bool:
     return os.path.isfile(path) and path.rsplit('.', 1)[-1].lower() in VIDEO_EXTS
-
-
-def format_size(size: int) -> str:
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024:
-            return f'{size:.0f} {unit}'
-        size /= 1024
-    return f'{size:.1f} TB'
 
 
 def parse_time(value) -> float:
@@ -213,7 +205,7 @@ class Video(r.BaseJobExecutor):
                 errors.append(f'{f}: {e}')
         if os.path.isdir(os.path.join(self.path, 'exports')):
             shutil.rmtree(os.path.join(self.path, 'exports'), ignore_errors=True)
-        message = f'{count} Dateien gelöscht ({format_size(size)})'
+        message = f'{count} Dateien gelöscht ({u.format_size(size)})'
         if errors:
             return self.fail(message + ', Fehler: ' + '; '.join(errors), count=count, size=size)
         return self.success(message, count=count, size=size, ui_reload=True)
@@ -343,7 +335,7 @@ class Video(r.BaseJobExecutor):
         size = sum(os.path.getsize(f) for f in files)
         with p.section(h="Cache"):
             p.prop("Verzeichnis", w.s(self.path))
-            p.prop("Belegt", f'{len(files)} Dateien, {format_size(size)}')
+            p.prop("Belegt", f'{len(files)} Dateien, {u.format_size(size)}')
             p(self.action_btn({'type': self.type, 'op': 'clean_files'}, label="Cache leeren",
                               hint="Alle hochgeladenen und exportierten Videos im Cache-Verzeichnis löschen"))
 
@@ -356,7 +348,7 @@ class Video(r.BaseJobExecutor):
     def part_editor(self, p: base.Page, path: str):
         p.h2(w.s(os.path.basename(path)))
         p.prop("Datei", w.s(path))
-        p.prop("Größe", format_size(os.path.getsize(path)))
+        p.prop("Größe", u.format_size(os.path.getsize(path)))
         stream = '/pysys/dispatcher' + self.link(self.page_stream, file=path)
         p('<div style="display: inline-block; max-width: 100%; vertical-align: top;">')  # Leiste so breit wie das Video
         p(f'<video id="nxvideo" src="{w.s(stream)}" controls preload="metadata" '
@@ -662,8 +654,7 @@ class Videos(r.BaseJobExecutor):
     def feed_item(self, path: str, title: str = None) -> str:
         """ Kachel mit Vorschau (spielt stumm beim Darueberfahren), Klick oeffnet den Video-Editor """
         title = title or self.rel(path)
-        meta = format_size(os.path.getsize(path)) + ' · ' + time.strftime('%d.%m.%Y %H:%M',
-                                                                       time.localtime(os.path.getmtime(path)))
+        meta = u.format_size(os.path.getsize(path)) + ' · ' + u.format_date(os.path.getmtime(path))
         video = f'<video src="{w.s(self.stream_link(path))}" muted loop playsinline preload="metadata"></video>'
         hint = w.s("Im Video-Editor öffnen: " + path)
         return (f'<a href="{w.s(self.video_link(path))}" title="{hint}"'
@@ -715,9 +706,9 @@ class Videos(r.BaseJobExecutor):
             w.Grid.col('thumb', "", value=self.browse_thumb, html=True, sortable=False, width='130px'),
             w.Grid.col('name', "Name", value=self.browse_name, html=True, sort=lambda r: r['name'].lower()),
             w.Grid.col('kind', "Typ"),
-            w.Grid.col('size', "Größe", value=lambda r: format_size(r['size']) if r['kind'] == 'Video' else '',
+            w.Grid.col('size', "Größe", value=lambda r: u.format_size(r['size']) if r['kind'] == 'Video' else '',
                        sort=lambda r: r['size']),
-            w.Grid.col('mtime', "Geändert", value=lambda r: time.strftime('%d.%m.%Y %H:%M', time.localtime(r['mtime'])),
+            w.Grid.col('mtime', "Geändert", value=lambda r: u.format_date(r['mtime']),
                        sort=lambda r: r['mtime'])],
             params=params, page_size=50, search=lambda r: r['name'], empty="Keine Videos oder Verzeichnisse",
             count="{shown} / {total} Einträge")
