@@ -60,7 +60,7 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
         self.instance_name = nx.get_name()
         self.result_index = False  # Index auf nweb.results.guid angelegt
         self.ticker_interval = int(args.get('mongo_job_cron', self.ticker_interval))
-        self.ticker_interval_jiggle = args.get('mongo_job_jiggle', False))
+        self.ticker_interval_jiggle = args.get('mongo_job_jiggle', False)
         if 'mongo_job_cron' in args:
             self.ticker = self.periodic(self.ticker_interval, self.tick)
 

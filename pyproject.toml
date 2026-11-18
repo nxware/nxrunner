@@ -32,6 +32,7 @@ include = [ "nxrunner/**/*.py", "nxrunner/resources/*" ]
 [project.entry-points.nweb_runner]
 mongo = "nxrunner.db.mongo:MongoDB"
 smb = "nxrunner.fs:Smb"
+browse = "nxrunner.fs:Browse"
 pihole_api = "nxrunner.apis:PiHoleApi"
 trello = "nxrunner.apis:Trello"
 audio_convert = "nxrunner.audio:Convert"
