@@ -397,8 +397,21 @@ class Scene(r.BaseJobExecutor):
         p.div(f"{len(self.items)} Timelines &middot; {count} Einträge &middot; Dauer {self.get_duration():g} s")
         for tl in self.items:
             p.prop(tl.type, f"{len(tl.items)} Einträge, {tl.get_duration():g} s")
-        p.div(self.action_btn(dict(title="Start", type=self.type, start=1)) + ' ' +
-              w.a("Bearbeiten", self.dispatcher_link(self.page_edit)))
+        p.div(self.action_btn(dict(title="Start", type=self.type, start=1), hint="Alle Timelines starten") + ' ' +
+              w.a("Bearbeiten", self.dispatcher_link(self.page_edit), hint="Scene im Timeline-Editor bearbeiten"))
+        self.part_cache(p)
+
+    def part_cache(self, p: base.Page):
+        files = [f for f in self.cache_files() if os.path.isfile(f)]
+        used = self.used_images()
+        size = sum(os.path.getsize(f) for f in files)
+        with p.section(h="Cache"):
+            p.prop("Verzeichnis", w.s(self.path))
+            p.prop("Belegt", f'{len(files)} Dateien, {u.format_size(size)}, davon {len(used)} in Timelines verwendet')
+            p(self.action_btn({'type': self.type, 'op': 'clean_files'}, label="Cache leeren",
+                              hint="Nicht mehr verwendete Bilder im Cache-Verzeichnis löschen"))
+            p(self.action_btn({'type': self.type, 'op': 'clean_files', 'keep_used': 0}, label="Alles löschen",
+                              hint="Alle Bilder löschen, auch die in Timelines verwendeten (Einträge zeigen dann kein Bild)"))
 
     def job_suggestions(self) -> List[dict]:
         """ Direkt aufrufbare Signaturen aller geladenen Runner als Vorschlaege fuer Jobs """
@@ -469,6 +482,47 @@ class Scene(r.BaseJobExecutor):
             dst, i = os.path.join(self.image_dir(), f'{stem}_{i}.{ext}'), i + 1
         f.save(dst)
         return dst
+
+    def cache_files(self) -> list:
+        """ alle Dateien in path (hochgeladene Bilder) """
+        files = []
+        if os.path.isdir(self.path):
+            for root, dirs, names in os.walk(self.path):
+                files += [os.path.join(root, n) for n in names]
+        return files
+
+    def used_images(self) -> set:
+        """ Pfade der Bilder, auf die ein Eintrag einer Timeline verweist """
+        res = set()
+        for tl in self.items:
+            for item in tl.items:
+                job = item.job if isinstance(item.job, str) else ''
+                q = urllib.parse.parse_qs(job.lstrip('?'))
+                if q.get('type') == [self.type] and q.get('op') == ['image'] and q.get('file'):
+                    res.add(os.path.realpath(q['file'][0]))
+        return res
+
+    @op("Leert den Cache (Bilder in path), keep_used: in Timelines verwendete Bilder behalten",
+        result={'success': 'bool', 'message': 'str', 'count': 'int', 'size': 'int', 'kept': 'int'})
+    def clean_files(self, keep_used: bool = True):
+        keep_used = str(keep_used).lower() not in ('0', 'false', 'no', '')
+        used = self.used_images() if keep_used else set()
+        count, size, kept, errors = 0, 0, 0, []
+        for f in self.cache_files():
+            if os.path.realpath(f) in used:
+                kept += 1
+                continue
+            try:
+                file_size = os.path.getsize(f)
+                os.remove(f)
+                size += file_size
+                count += 1
+            except OSError as e:
+                errors.append(f'{f}: {e}')
+        message = f'{count} Dateien gelöscht ({u.format_size(size)})' + (f', {kept} verwendete behalten' if kept else '')
+        if errors:
+            return self.fail(message + ', Fehler: ' + '; '.join(errors), count=count, size=size, kept=kept)
+        return self.success(message, count=count, size=size, kept=kept, ui_reload=True)
 
     def image_job(self, path: str) -> str:
         return '?' + urllib.parse.urlencode({'type': self.type, 'op': 'image', 'file': path})
