@@ -650,7 +650,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
 
     def test_on_runner_list(self):
         self.runner.extra_runners = ['extra']
-        self.runner.request_signatures = lambda names: None
+        self.runner.request_signatures = lambda names: 0
         with self.runner.remote_lock:
             self.runner.on_runner_list({'names': ['b', 'a']})
         self.assertEqual(sorted(self.runner.remote_runners.keys()), ['a', 'b', 'extra'])
@@ -659,7 +659,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
         self.assertIn('nix', self.runner.remote_error)
 
     def test_on_runner_list_empty(self):
-        self.runner.request_signatures = lambda names: None
+        self.runner.request_signatures = lambda names: 0
         with self.runner.remote_lock:
             self.runner.on_runner_list({'names': []})
         self.assertIn('meldet keine Runner', self.runner.remote_error)
@@ -689,7 +689,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
         """ Ergebnis liegt im Speicher: die Seite holt es per guid ab, ohne auf den Poll-Thread zu warten """
         from nwebclient import base as b
         self.runner.extra_runners = ['store']
-        self.runner.request_signatures = lambda names: None
+        self.runner.request_signatures = lambda names: 0
         self.runner.execute({'op': 'refresh'})
         guid = self.runner.refresh['guid']
         self.assertIn(guid, self.store.results)
@@ -707,7 +707,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
         self.assertEqual(self.runner.execute({'op': 'refresh_status'})['refresh']['status'], 'pending')
         guid = self.runner.refresh['guid']
         self.store.results[guid] = (time.time() - 1, self.store.results[guid][1])
-        self.runner.request_signatures = lambda names: None
+        self.runner.request_signatures = lambda names: 0
         self.assertEqual(self.runner.execute({'op': 'refresh_status'})['refresh']['status'], 'done')
 
     def test_refresh_survives_restart(self):
@@ -719,7 +719,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
         guid = self.runner.refresh['guid']
         self.assertEqual(json.loads(settings.values['remote_runner.refresh.local'])['guid'], guid)
         restarted = TestRemoteRunner(target='local', store='store')
-        restarted.request_signatures = lambda names: None
+        restarted.request_signatures = lambda names: 0
         create_root(self.store, self.rec, restarted).nweb = settings
         self.store.results[guid] = (time.time() - 1, self.store.results[guid][1])
         restarted.check_refresh()
@@ -749,7 +749,7 @@ class RemoteRunnerTestCase(unittest.TestCase):
     def test_refresh_shows_runners(self):
         from nwebclient import base as b
         self.runner.extra_runners = ['store']
-        self.runner.request_signatures = lambda names: None
+        self.runner.request_signatures = lambda names: 0
         self.runner.execute({'op': 'refresh'})
         self.poll_all()
         p = b.Page()

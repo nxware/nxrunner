@@ -652,7 +652,7 @@ class Projects(r.BaseJobExecutor):
         f"FROM {CODESERVER_BASE_IMAGE}\n"
         "USER root\n"
         "RUN apt-get update && apt-get install -y --no-install-recommends "
-        "python3 python3-pip python3-venv python-is-python3 && rm -rf /var/lib/apt/lists/*\n"
+        "python3 python3-pip python3-venv python-is-python3 openssh-client curl nano unzip && rm -rf /var/lib/apt/lists/*\n"
         # eingebundene Repos gehoeren einem anderen Nutzer, sonst meldet git 'dubious ownership'
         "RUN git config --system --add safe.directory '*'\n"
         "USER openvscode-server\n"

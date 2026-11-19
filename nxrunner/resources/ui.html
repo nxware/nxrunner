@@ -256,7 +256,17 @@ function runScripts(scripts) {
 
 // links: HTML aus BaseJobExecutor.part_intern_links, das der Runner mit jeder Seite liefert (intern_links)
 function setRunnerContent(name, html, links) {
-  setContent(html + (links || ''));
+  setContent(html + uiLinks(links || ''));
+}
+
+// Links auf den Dispatcher (V1, /pysys/dispatcher?type=x&x=page) auf die neue Oberflaeche umstellen
+function uiLinks(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  t.content.querySelectorAll('a[href^="/pysys/dispatcher?"]').forEach(a => {
+    a.setAttribute('href', UI_URL + a.getAttribute('href').slice('/pysys/dispatcher'.length));
+  });
+  return t.innerHTML;
 }
 
 function showError(message) {

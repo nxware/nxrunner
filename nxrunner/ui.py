@@ -98,14 +98,27 @@ class NxRunner(McpSystem, r.AutoDispatcher):
             'classes': classes,
             'favorites': self.ui_favorites(),
             'links': [
-                {'title': "Dispatcher", 'url': '/pysys/runner'},
-                {'title': "Runner-UI", 'url': '/pysys/runner-ui'},
                 {'title': "Registry", 'url': '/pysys/ui?view=registry'},
-                {'title': "Results", 'url': '/pysys/job-results'},
-                {'title': "Proxy", 'url': '/pysys/create-proxy'},
+                {'title': "V1", 'url': '/pysys/runner'},
+                *self.ui_jumplinks(),
                 *self.ui_mcp_links()
             ]
         }
+
+    A_RE = re.compile(r'<a\s[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>', re.S | re.I)
+
+    def ui_jumplinks(self) -> list:
+        """ query_jumplinks (HTML aus web.a) als {title, url}; relative Links (?type=...) gehen an den Dispatcher """
+        res = []
+        for link in self.query_jumplinks():
+            m = self.A_RE.search(str(link))
+            if m is None:
+                continue
+            url = html.unescape(m.group(1))
+            if url.startswith('?'):
+                url = '/pysys/dispatcher' + url
+            res.append({'title': html.unescape(re.sub(r'<[^>]+>', '', m.group(2))).strip(), 'url': url})
+        return res
 
     def ui_mcp_links(self) -> list:
         """ MCP-Verwaltung, nur wenn MCP aktiv ist (Freigaben sind von /sys/mcp aus verlinkt) """
