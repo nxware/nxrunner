@@ -109,10 +109,9 @@ class Projects(r.BaseJobExecutor):
         return self.success('loaded', ui_reload=True)
 
     def part_project(self, p: base.Page, params={}):
+        self.nav(p)
         name = params['name']
         p(self.onParentClass(r.LazyDispatcher, lambda d: self.on_parent_project(d, name), ''))
-        p.hr()
-        p.div(w.a("Projects", self.link('index')))
 
     def on_parent_project(self, d: r.LazyDispatcher, name):
         if d.support_type(name):
@@ -120,14 +119,19 @@ class Projects(r.BaseJobExecutor):
         else:
             return self.action_btn({'title': "Load", 'type': self.type, 'load': name})
 
+    def nav(self, p: base.Page, active=None):
+        """ obere Navigation aller Projects-Seiten, active = Titel der aktuellen Seite """
+        p.nav(("Projects", self.link(self.part_index), "Uebersicht der Projekte aus nweb.json:repos"),
+              ("Grid", self.link(self.part_grid), "Alle Projekte filterbar nach Name, Tag und Art"),
+              ("Git Actions", self.link(self.part_gitactions), "Git-Status, Remotes, up und pull je Projekt"),
+              ("Search", self.link(self.part_search), "Suche nach Dateinamen oder Inhalten"),
+              ("Graph", self.link(self.part_graph), "Abhaengigkeiten zwischen den Projekten"),
+              ("CodeServer", self.link(self.part_codeserver), "VS Code im Browser mit allen Projekten im Workspace"),
+              active=active)
+
     def part_index(self, p: base.Page, params={}):
         repos = self.args.get('repos', {})
-        p.nav(
-            w.a("Grid", self.link(self.part_grid)),
-            w.a("Git Actions", self.link(self.part_gitactions)),
-            w.a("Search", self.link(self.part_search)),
-            w.a("Graph", self.link(self.part_graph))
-        )
+        self.nav(p, "Projects")
         p.right(self.action_btn(dict(title="Pull All", type=self.type, op='pull_all')))
         p("Zeigt die in der nweb.json:repos definierten Projekte an.")
 
@@ -271,6 +275,7 @@ class Projects(r.BaseJobExecutor):
         """
         Liste aller Projekte, filterbar nach Name/Pfad (q), Tag (tag) und Projektart (kind)
         """
+        self.nav(p, "Grid")
         projects = self.expand_projects()
         products = {project.type: self.product_type(project) for project in projects}
 
@@ -352,6 +357,7 @@ class Projects(r.BaseJobExecutor):
         """
         Git-Projekte mit Status und Remotes, Aktionen up (commit & push) und pull je Projekt
         """
+        self.nav(p, "Git Actions")
         projects = [project for project in self.expand_projects() if isinstance(project, GitRepo)]
         remotes = {project.type: self.project_remotes(project) for project in projects}
         web = {project.type: self.project_web(project) for project in projects}
@@ -444,6 +450,7 @@ class Projects(r.BaseJobExecutor):
         """
         Suche in allen Projekten, nach Dateinamen (mode=name) oder Inhalten (mode=content)
         """
+        self.nav(p, "Search")
         q = params.get('q', '')
         mode = params.get('mode', 'name')
         use_exclude_filter = _exclude_filter_param(params)
@@ -547,6 +554,7 @@ class Projects(r.BaseJobExecutor):
         Repos mit ihren Abhaengigkeiten (props['depends']). Pfeile zeigen auf die Abhaengigkeit,
         Projekte ohne Abhaengigkeiten stehen unten, Repos ohne jede Verbindung werden darunter aufgelistet.
         """
+        self.nav(p, "Graph")
         graph = self.dependency_graph(self.expand_projects())
         nodes = graph['nodes']
         used = {d for n in nodes.values() for d in n['depends']}
@@ -630,11 +638,241 @@ class Projects(r.BaseJobExecutor):
         if len(isolated) > 0:
             p.h3("Ohne Abhaengigkeiten")
             p.div(', '.join(w.a(w.s(name), f'?type={w.s(name)}') for name in isolated))
-        p.div(w.a("Projects", self.link('index')))
 
     def part_system(self, p: base.Page, params={}):
         p.prop("~/dev", (Path.home() / 'dev').exists())
         p.prop("~/repos", (Path.home() / 'repos').exists())
+
+    CODESERVER_NAME = 'devprojects'
+    CODESERVER_BASE_IMAGE = 'gitpod/openvscode-server'
+    CODESERVER_IMAGE_NAME = 'nxrunner/codeserver-python'
+    # Extensions aus Open VSX, die beim Image-Build installiert werden
+    CODESERVER_EXTENSIONS = ['ms-python.python', 'ms-python.debugpy']
+    CODESERVER_DOCKERFILE = (
+        f"FROM {CODESERVER_BASE_IMAGE}\n"
+        "USER root\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends "
+        "python3 python3-pip python3-venv python-is-python3 && rm -rf /var/lib/apt/lists/*\n"
+        # eingebundene Repos gehoeren einem anderen Nutzer, sonst meldet git 'dubious ownership'
+        "RUN git config --system --add safe.directory '*'\n"
+        "USER openvscode-server\n"
+        "RUN for ext in " + ' '.join(CODESERVER_EXTENSIONS) + "; do "
+        "${OPENVSCODE_SERVER_ROOT}/bin/openvscode-server --install-extension $ext; done\n")
+
+    @property
+    def codeserver_image(self) -> str:
+        """ Image-Tag mit Hash des Dockerfiles, Aenderungen am Dockerfile fuehren so automatisch zu einem Neubau """
+        import hashlib
+        digest = hashlib.sha1(self.CODESERVER_DOCKERFILE.encode('utf-8')).hexdigest()[:12]
+        return f'{self.CODESERVER_IMAGE_NAME}:{digest}'
+
+    CODESERVER_WORKSPACE = '/home/workspace'  # zugleich HOME im openvscode-server-Image
+    CODESERVER_WORKSPACE_FILE = 'projects.code-workspace'
+    CODESERVER_SETTINGS = {'workbench.colorTheme': 'Default Dark Modern'}
+
+    def codeserver_repos(self) -> dict:
+        """ Name -> absoluter Host-Pfad, nur Repos aus nweb.json:repos deren Ordner existiert """
+        res = {}
+        for name, path in self.args.get('repos', {}).items():
+            path = os.path.abspath(os.path.expanduser(path))
+            if os.path.isdir(path):
+                res[name] = path
+        return res
+
+    @staticmethod
+    def codeserver_dir() -> str:
+        """ Ordner auf dem Host fuer erzeugte Dateien des CodeServers (Workspace-Datei, Extension) """
+        folder = os.path.join(os.path.expanduser('~'), '.nxrunner', 'codeserver')
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    CODESERVER_HOST = 'host.docker.internal'  # Adresse des Hosts im Container (extra_hosts host-gateway)
+
+    @staticmethod
+    def request_port() -> Optional[int]:
+        """ Port der aktuellen HTTP-Anfrage an nxrunner, None ausserhalb einer Anfrage """
+        try:
+            from flask import request, has_request_context
+            from urllib.parse import urlsplit as split
+            return split(request.host_url).port if has_request_context() else None
+        except (ImportError, ValueError):
+            return None
+
+    def codeserver_host_api_url(self) -> str:
+        """
+        Adresse von nxrunner aus Sicht des Containers (fuer das Terminalprofil "Host"): Arg codeserver_nxrunner_url,
+        sonst http://host.docker.internal mit Arg codeserver_nxrunner_port bzw. dem Port der aktuellen Anfrage
+        """
+        if self.args.get('codeserver_nxrunner_url'):
+            return str(self.args['codeserver_nxrunner_url'])
+        port = self.args.get('codeserver_nxrunner_port') or self.request_port() or 7070
+        return f'http://{self.CODESERVER_HOST}:{port}'
+
+    def codeserver_settings(self) -> dict:
+        settings = dict(self.CODESERVER_SETTINGS)
+        settings['nxrunner.hostApiUrl'] = self.codeserver_host_api_url()
+        settings['nxrunner.hostTerminalType'] = self.args.get('codeserver_terminal', 'terminal')
+        return settings
+
+    def codeserver_workspace_file(self, repos: dict) -> str:
+        """ schreibt die .code-workspace-Datei (alle Repos als Ordner, Settings) und gibt den Host-Pfad zurueck """
+        path = os.path.join(self.codeserver_dir(), self.CODESERVER_WORKSPACE_FILE)
+        data = {'folders': [{'name': name, 'path': name} for name in repos.keys()],
+                'settings': self.codeserver_settings()}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        return path
+
+    def codeserver_volumes(self) -> dict:
+        """ Host-Pfad -> Bind im docker-py-Format (ohne ':cached', das nur Docker Desktop auf macOS kennt) """
+        repos = self.codeserver_repos()
+        res = {path: {'bind': f'{self.CODESERVER_WORKSPACE}/{name}', 'mode': 'rw'} for name, path in repos.items()}
+        if repos:
+            ws = self.codeserver_workspace_file(repos)
+            res[ws] = {'bind': f'{self.CODESERVER_WORKSPACE}/{self.CODESERVER_WORKSPACE_FILE}', 'mode': 'rw'}
+        gitconfig = self.codeserver_gitconfig()
+        if gitconfig is not None:
+            res[gitconfig] = {'bind': f'{self.CODESERVER_WORKSPACE}/.gitconfig', 'mode': 'ro'}
+        ssh = self.codeserver_ssh()
+        if ssh is not None:
+            res[ssh] = {'bind': self.CODESERVER_SSH_HOST, 'mode': 'ro'}
+        vsix = self.codeserver_hostterminal_vsix()
+        if vsix is not None:
+            res[vsix] = {'bind': self.CODESERVER_HOSTTERMINAL, 'mode': 'ro'}
+        return res
+
+    CODESERVER_HOSTTERMINAL = f'{CODESERVER_WORKSPACE}/.nxrunner-hostterminal.vsix'
+
+    def codeserver_hostterminal_vsix(self) -> Optional[str]:
+        """ baut die Extension "Host Terminal" (Terminalprofil Host mit der Shell des Hosts), abschaltbar per
+            Arg codeserver_hostterminal=false """
+        if str(self.args.get('codeserver_hostterminal', True)).lower() in ('false', '0', 'no'):
+            return None
+        from nxrunner.projects.hostterminal import build_vsix
+        return build_vsix(os.path.join(self.codeserver_dir(), 'hostterminal.vsix'))
+
+    def codeserver_command(self, volumes: dict) -> list:
+        """ Argumente fuer openvscode-server: eingebundene Extension vor dem Serverstart installieren """
+        if not any(v['bind'] == self.CODESERVER_HOSTTERMINAL for v in volumes.values()):
+            return []
+        return ['--install-extension', self.CODESERVER_HOSTTERMINAL, '--start-server']
+
+    CODESERVER_SSH_HOST = f'{CODESERVER_WORKSPACE}/.ssh-host'
+
+    def codeserver_host_file(self, arg: str, name: str, is_dir: bool = False) -> Optional[str]:
+        """ Datei/Ordner aus dem Home des Hosts, abschaltbar per Arg (z.B. codeserver_ssh=false) """
+        if str(self.args.get(arg, True)).lower() in ('false', '0', 'no'):
+            return None
+        path = os.path.join(os.path.expanduser('~'), name)
+        exists = os.path.isdir(path) if is_dir else os.path.isfile(path)
+        return path if exists else None
+
+    def codeserver_ssh(self) -> Optional[str]:
+        """ ~/.ssh des Hosts, wird schreibgeschuetzt nach ~/.ssh-host eingebunden und beim Start kopiert """
+        return self.codeserver_host_file('codeserver_ssh', '.ssh', is_dir=True)
+
+    def codeserver_setup_ssh(self, container):
+        """ kopiert ~/.ssh-host nach ~/.ssh und setzt die Rechte, die ssh verlangt (Bind-Mounts haben oft 777) """
+        script = (f'mkdir -p ~/.ssh && cp -r {self.CODESERVER_SSH_HOST}/. ~/.ssh/ '
+                  '&& chmod 700 ~/.ssh && find ~/.ssh -type f -exec chmod 600 {} +')
+        return container.exec_run(['sh', '-c', script])
+
+    def codeserver_gitconfig(self) -> Optional[str]:
+        """ ~/.gitconfig des Hosts (schreibgeschuetzt im Container), abschaltbar per Arg codeserver_gitconfig=false """
+        return self.codeserver_host_file('codeserver_gitconfig', '.gitconfig')
+
+    def codeserver_port(self) -> int:
+        return int(self.args.get('codeserver_port', 3000))
+
+    def codeserver_url(self) -> str:
+        return (f'http://127.0.0.1:{self.codeserver_port()}/'
+                f'?workspace={self.CODESERVER_WORKSPACE}/{self.CODESERVER_WORKSPACE_FILE}')
+
+    def ensure_codeserver_image(self, d, rebuild: bool = False):
+        """ baut das CodeServer-Image (openvscode-server + Python), falls es fehlt oder rebuild gesetzt ist """
+        import io
+        import docker.errors
+        if not rebuild:
+            try:
+                d.client.images.get(self.codeserver_image)
+                return
+            except docker.errors.ImageNotFound:
+                pass
+        d.client.images.build(fileobj=io.BytesIO(self.CODESERVER_DOCKERFILE.encode('utf-8')),
+                              tag=self.codeserver_image, pull=True, rm=True)
+
+    @staticmethod
+    def docker():
+        from nxbot.linux import Docker
+        return Docker()
+
+    @op("Startet einen CodeServer (openvscode-server im Docker) mit allen Projekten aus nweb.json:repos "
+        "im Workspace und Python im Container, Port aus Arg codeserver_port (Standard 3000). "
+        "Das Image wird beim ersten Start gebaut, rebuild baut es neu",
+        result={'success': 'bool', 'url': 'str'})
+    def start_codeserver(self, rebuild: bool = False):
+        d = self.docker()
+        if not d.is_running(self.CODESERVER_NAME):
+            volumes = self.codeserver_volumes()
+            if not volumes:
+                return self.fail("Keine vorhandenen Repos in nweb.json:repos")
+            self.ensure_codeserver_image(d, rebuild)
+            self.remove_codeserver_container(d)
+            # direkt docker-py: Docker.run wandelt Dict-Volumes in 'host:ziel'-Strings um
+            container = d.client.containers.run(self.codeserver_image, self.codeserver_command(volumes),
+                                                detach=True, name=self.CODESERVER_NAME,
+                                                ports={'3000/tcp': self.codeserver_port()}, volumes=volumes,
+                                                extra_hosts={self.CODESERVER_HOST: 'host-gateway'})
+            if self.codeserver_ssh() is not None:
+                self.codeserver_setup_ssh(container)
+        return self.success('CodeServer laeuft', url=self.codeserver_url(), ui_reload=True)
+
+    @op("Stoppt und entfernt den CodeServer-Container der Projekte", result={'success': 'bool'})
+    def stop_codeserver(self):
+        self.remove_codeserver_container(self.docker())
+        return self.success('CodeServer gestoppt', ui_reload=True)
+
+    def remove_codeserver_container(self, d):
+        container = d.get_container(self.CODESERVER_NAME)
+        if container is not None:
+            if container.status == 'running':
+                container.stop()
+            container.remove()
+
+    def part_codeserver(self, p: base.Page, params={}):
+        """
+        VS Code im Browser (openvscode-server) mit allen Projekten als Ordner unter /home/workspace
+        """
+        self.nav(p, "CodeServer")
+        try:
+            running = self.docker().is_running(self.CODESERVER_NAME)
+        except Exception as e:
+            p(w.alert_error(w.s(f"Docker nicht erreichbar: {e}")))
+            return
+        with p.section(h="CodeServer"):
+            p.prop("Status", "laeuft" if running else "gestoppt")
+            p.prop("Container", self.CODESERVER_NAME)
+            if running:
+                p.div(w.a("Visual Studio Code oeffnen",
+                          dict(href=self.codeserver_url(), target='_blank', rel='noopener'),
+                          hint="Workspace mit allen Projekten in neuem Fenster oeffnen"))
+                p(self.action_btn({'title': "Stop", 'type': self.type, 'op': 'stop_codeserver'},
+                                  hint="Container stoppen und entfernen, beim naechsten Start werden neue Repos eingebunden"))
+            else:
+                p(self.action_btn({'title': "Start", 'type': self.type, 'op': 'start_codeserver'},
+                                  hint="openvscode-server mit allen Projekten im Workspace starten "
+                                       "(baut beim ersten Mal das Image mit Python)"))
+                p(self.action_btn({'title': "Rebuild & Start", 'type': self.type, 'op': 'start_codeserver',
+                                   'rebuild': True},
+                                  hint="Image (openvscode-server + Python) neu bauen und starten"))
+        with p.section(h="Workspace"):
+            for name, host in self.codeserver_repos().items():
+                p.prop(f'{self.CODESERVER_WORKSPACE}/{name}', host)
+            p.prop("~/.gitconfig", self.codeserver_gitconfig() or "nicht eingebunden")
+            p.prop("~/.ssh", self.codeserver_ssh() or "nicht eingebunden")
+            p.prop("Host Terminal", f"Terminalprofil Host -> {self.codeserver_host_api_url()} "
+                                    f"(Runner {self.args.get('codeserver_terminal', 'terminal')})")
+        p.pre('', id='result')
 
 
 class GitlabCi(r.BaseJobExecutor):

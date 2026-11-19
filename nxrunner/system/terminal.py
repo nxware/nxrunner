@@ -4,6 +4,8 @@ Terminal (VT100) im Runner.
 Startet eine Shell in einem Pseudo-Terminal (Linux: pty, Windows: pywinpty, sonst Pipes) und wertet die Ausgabe mit
 pyte als VT100-/xterm-Terminal aus. part_index zeigt den Bildschirm an und fragt ihn regelmaessig ab, unter dem
 Terminal ist ein Eingabefeld fuer Textbefehle.
+page_vt100 (?type=terminal&terminal=vt100) ist eine Vollbild-Terminalemulation mit xterm.js, die die Rohausgabe
+(Op output) im Browser auswertet und jede Taste direkt sendet, z.B. fuer einen iframe (CodeServer).
 
     Config (runners):
         terminal: nxrunner.system.terminal:Terminal()
@@ -18,6 +20,8 @@ Terminal ist ein Eingabefeld fuer Textbefehle.
         {"type": "terminal", "op": "restart"}
         {"type": "terminal", "op": "get_terminal", "wait_time": 0}     Bildschirm als Text (value) mit cursor
         {"type": "terminal", "op": "exec", "cmd": "ls", "wait_time": 1}   Befehl senden, warten, Bildschirm als Text mit cursor
+        {"type": "terminal", "op": "output", "pos": 0, "session": 1, "wait": 2}  Rohausgabe ab pos (Long-Poll)
+        {"type": "terminal", "op": "resize", "cols": 120, "rows": 40}
 """
 import codecs
 import json
@@ -51,6 +55,11 @@ class Terminal(r.BaseJobExecutor):
         'ctrl_c': '\x03', 'ctrl_d': '\x04', 'ctrl_z': '\x1a', 'ctrl_l': '\x0c',
     }
 
+    RAW_LIMIT = 256 * 1024  # Zeichen Rohausgabe, die fuer die VT100-Ansicht vorgehalten werden
+    XTERM_CDN = 'https://cdn.jsdelivr.net/npm/'
+    XTERM_FILES = ['@xterm/xterm@5.5.0/lib/xterm.min.js', '@xterm/addon-fit@0.10.0/lib/addon-fit.min.js']
+    XTERM_CSS = '@xterm/xterm@5.5.0/css/xterm.min.css'
+
     def __init__(self, type='terminal', shell=None, cols=100, rows=30, cwd=None):
         """
         :param shell: Befehl der Shell, Standard $SHELL bzw. /bin/bash, unter Windows %COMSPEC%
@@ -68,6 +77,10 @@ class Terminal(r.BaseJobExecutor):
         self.define_sig(d.PStr('op', 'key'), d.PStr('key', 'ctrl_c')).r(success='bool', message='str')
         self.define_sig(d.PStr('op', 'restart')).r(success='bool', message='str')
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)  # signalisiert neue Ausgabe (Long-Poll von output)
+        self.raw_text = ''    # Rohausgabe fuer die VT100-Ansicht
+        self.raw_start = 0    # absolute Position von raw_text[0]
+        self.session = 0      # wird bei jedem Start erhoeht, die VT100-Ansicht setzt sich dann zurueck
         self.screen = None
         self.stream = None
         self.version = 0
@@ -92,6 +105,10 @@ class Terminal(r.BaseJobExecutor):
         self.stream = pyte.Stream(self.screen)
         self.exit_code = None
         self.error = ''
+        with self.lock:
+            self.raw_start += len(self.raw_text)
+            self.raw_text = ''
+            self.session += 1
         args = shlex.split(self.shell, posix=os.name != 'nt')
         env = dict(os.environ, TERM='xterm', COLUMNS=str(self.cols), LINES=str(self.rows))
         try:
@@ -110,10 +127,7 @@ class Terminal(r.BaseJobExecutor):
         threading.Thread(target=self.read_loop, daemon=True, name='terminal-' + self.type).start()
 
     def start_pty(self, args, env):
-        import fcntl
         import pty
-        import struct
-        import termios
         pid, fd = pty.fork()
         if pid == 0:
             try:
@@ -122,9 +136,19 @@ class Terminal(r.BaseJobExecutor):
                 os.execvpe(args[0], args, env)
             finally:
                 os._exit(127)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', self.rows, self.cols, 0, 0))
         self.mode, self.proc, self.fd = 'pty', pid, fd
+        self.set_winsize(self.cols, self.rows)
         self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+    def set_winsize(self, cols: int, rows: int):
+        """ Groesse des Pseudo-Terminals setzen (pty/winpty), bei Pipes ohne Wirkung """
+        if self.mode == 'pty':
+            import fcntl
+            import struct
+            import termios
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+        elif self.mode == 'winpty':
+            self.proc.setwinsize(rows, cols)
 
     def start_winpty(self, args):
         from winpty import PtyProcess
@@ -163,11 +187,22 @@ class Terminal(r.BaseJobExecutor):
                 break
             with self.lock:
                 self.stream.feed(text)
+                self.append_raw(text)
                 self.version += 1
+                self.changed.notify_all()
         self.exit_code = self.wait()
         with self.lock:
             self.running = False
             self.version += 1
+            self.changed.notify_all()
+
+    def append_raw(self, text: str):
+        """ Rohausgabe anhaengen und auf RAW_LIMIT kuerzen (Aufruf mit self.lock) """
+        self.raw_text += text
+        cut = len(self.raw_text) - self.RAW_LIMIT
+        if cut > 0:
+            self.raw_text = self.raw_text[cut:]
+            self.raw_start += cut
 
     def wait(self):
         try:
@@ -279,13 +314,68 @@ class Terminal(r.BaseJobExecutor):
         time.sleep(float(wait_time))
         return self.screen_result()
 
+    def raw_since(self, pos: int, session: int) -> dict:
+        """ Rohausgabe ab pos, reset=True wenn der Client neu aufbauen muss (Neustart, Puffer gekuerzt) """
+        end = self.raw_start + len(self.raw_text)
+        reset = session != self.session or pos < self.raw_start or pos > end
+        data = self.raw_text if reset else self.raw_text[pos - self.raw_start:]
+        return dict(data=data, pos=end, reset=reset, session=self.session, running=self.running,
+                    exit_code=self.exit_code, mode=self.mode)
+
+    @op("Rohausgabe des Terminals ab Position pos (fuer Terminalemulation im Browser), wartet bis zu wait "
+        "Sekunden auf neue Ausgabe. reset=True: Client muss das Terminal leeren und data komplett ausgeben",
+        result={'success': 'bool', 'data': 'str', 'pos': 'int', 'reset': 'bool', 'session': 'int',
+                'running': 'bool'})
+    def output(self, pos: int = -1, session: int = -1, wait: float = 0):
+        if not self.running and self.screen is None:
+            self.start()
+        pos, session, wait = int(pos), int(session), min(max(float(wait), 0), 10)
+        with self.changed:
+            if wait > 0 and self.running and session == self.session:
+                self.changed.wait_for(lambda: self.raw_start + len(self.raw_text) != pos or not self.running,
+                                      timeout=wait)
+            res = self.raw_since(pos, session)
+        if self.error:
+            res['error'] = 'Shell konnte nicht gestartet werden: ' + self.error
+        return self.success('ok', **res)
+
+    @op("Groesse des Terminals aendern (Spalten und Zeilen), gilt fuer alle Ansichten",
+        result={'success': 'bool', 'cols': 'int', 'rows': 'int'})
+    def resize(self, cols: int = 100, rows: int = 30):
+        cols, rows = min(max(int(cols), 10), 500), min(max(int(rows), 2), 200)
+        with self.lock:
+            self.cols, self.rows = cols, rows
+            if self.screen is not None:
+                self.screen.resize(rows, cols)
+        if self.running:
+            try:
+                self.set_winsize(cols, rows)
+            except OSError as e:
+                return self.fail(str(e))
+        return self.success('ok', cols=cols, rows=rows)
+
     # --- Seite ----------------------------------------------------------------------------------
 
     def part_index(self, p: b.Page, params={}):
         if not self.running and self.screen is None:
             self.start()
         error = 'Shell konnte nicht gestartet werden: ' + self.error if self.error else ''
-        terminal_page(p, self.type, error)
+        vt100 = (f'<a href="{self.dispatcher_link(self.page_vt100)}" target="_blank" rel="noopener" '
+                 'title="Vollbild-Terminalemulation (xterm.js) in neuem Fenster">VT100-Ansicht</a>')
+        terminal_page(p, self.type, error, buttons=vt100)
+
+    def page_vt100(self, params={}):
+        """ Vollbild-Terminalemulation (xterm.js) ohne Navigation, z.B. fuer einen iframe """
+        p = b.Page(owner=self)
+        p['title'] = 'Terminal ' + self.type
+        p.style(self.XTERM_CDN + self.XTERM_CSS)
+        p.style('html, body { height: 100%; background: #1e1e1e; overflow: hidden; } '
+                '#vt100 { height: 100%; box-sizing: border-box; padding: 4px; }')
+        p('<div id="vt100"></div>')
+        for js in self.XTERM_FILES:
+            p.script(self.XTERM_CDN + js)
+        p.script(resource('vt100.js').replace('__TYPE__', json.dumps(self.type)))
+        return p.render('blank_page')
 
 
 def terminal_page(p: b.Page, runner_type: str, error='', title='Terminal', buttons=''):

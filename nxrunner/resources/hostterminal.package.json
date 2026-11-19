@@ -1,0 +1,31 @@
+{
+  "name": "hostterminal",
+  "publisher": "nxrunner",
+  "version": "0.0.2",
+  "displayName": "Host Terminal",
+  "description": "Terminal des Hosts ueber den nxrunner-Terminal-Runner als VS-Code-Terminalprofil",
+  "engines": {"vscode": "^1.63.0"},
+  "main": "./extension.js",
+  "activationEvents": ["onTerminalProfile:nxrunner.hostTerminal", "onCommand:nxrunner.openHostTerminal"],
+  "contributes": {
+    "terminal": {
+      "profiles": [{"id": "nxrunner.hostTerminal", "title": "Host", "icon": "remote"}]
+    },
+    "commands": [{"command": "nxrunner.openHostTerminal", "title": "Host Terminal oeffnen"}],
+    "configuration": {
+      "title": "Host Terminal",
+      "properties": {
+        "nxrunner.hostApiUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Adresse von nxrunner aus Sicht des Containers, z.B. http://host.docker.internal:7070"
+        },
+        "nxrunner.hostTerminalType": {
+          "type": "string",
+          "default": "terminal",
+          "description": "Name (type) des Terminal-Runners in nxrunner"
+        }
+      }
+    }
+  }
+}

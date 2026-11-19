@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "terminal-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "nwebclient.runner", "--rest", "--port", "7171", "--executor", "nxrunner.system.terminal:Terminal"],
+      "port": 7171
+    }
+  ]
+}
