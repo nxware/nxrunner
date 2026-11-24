@@ -585,6 +585,8 @@ class MeshtasticBot(r.BaseJobExecutor):
 
     def _connect(self, target, factory):
         from pubsub import pub
+        if self.iface is not None:
+            self.disconnect()
         self.target = target
         self.connect_error = None
         try:
@@ -608,6 +610,29 @@ class MeshtasticBot(r.BaseJobExecutor):
     def connect_ble(self, address):
         from meshtastic.ble_interface import BLEInterface
         return self._connect(f"BLE {address}", lambda: BLEInterface(address))
+
+    def disconnect(self):
+        """ Verbindung zum Geraet schliessen """
+        iface, self.iface = self.iface, None
+        if iface is None:
+            return self.fail("Nicht verbunden")
+        try:
+            from pubsub import pub
+            if pub.isSubscribed(self.onReceive, "meshtastic.receive"):
+                pub.unsubscribe(self.onReceive, "meshtastic.receive")
+        except Exception as e:
+            self.error(f"unsubscribe: {e}")
+        try:
+            iface.close()
+        except Exception as e:
+            self.error(f"Trennen von {self.target} fehlgeschlagen: {e}")
+        self.info(f"Getrennt von {self.target}")
+        self.target = None
+        self.connect_error = None
+        return self.success()
+
+    def execute_disconnect(self, data):
+        return self.disconnect()
 
     def is_connected(self) -> bool:
         if self.iface is None:
@@ -837,8 +862,17 @@ class MeshtasticBot(r.BaseJobExecutor):
         if active:
             p.script("setTimeout(() => location.reload(), 10000);")
 
+    TARGET_PREFIX = {'connect_serial': 'Serial', 'connect_tcp': 'TCP', 'connect_ble': 'BLE'}
+
     def connect_btn(self, op: str, target: str):
+        if self.iface is not None and self.target == f"{self.TARGET_PREFIX[op]} {target}":
+            return w.badge("verbunden" if self.is_connected() else "verbindet...",
+                           kind='success' if self.is_connected() else 'warn')
         return self.action_btn({'type': self.type, op: target, 'title': "Verbinden"}, hint=f"Mit {target} verbinden")
+
+    def disconnect_btn(self):
+        return self.action_btn({'type': self.type, 'op': 'disconnect', 'title': "Trennen"},
+                               hint=f"Verbindung zu {self.target} trennen")
 
     def _device_list(self, p: base.Page, finder, empty_msg: str, header: list, row):
         try:
@@ -854,6 +888,11 @@ class MeshtasticBot(r.BaseJobExecutor):
     def part_devices(self, p: base.Page, params={}):
         self.nav(p, "Devices")
         scan = params.get('scan')
+        with p.section(h="Verbundenes Gerät"):
+            self.part_status(p)
+            if self.iface is not None:
+                p.prop("Empfangene Pakete", self.receive_count)
+                p(self.disconnect_btn())
         with p.section(h="Serial"):
             self._device_list(p, self.find_devices, "Kein Meshtastic-Gerät an einem seriellen Port gefunden.",
                               ['Port', ''], lambda port: [w.s(port), self.connect_btn('connect_serial', port)])

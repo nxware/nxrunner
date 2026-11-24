@@ -40,6 +40,10 @@ class FakeIface:
         self.nodes = {}
         self.sent = []
         self.drop = False
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def sendData(self, data, destinationId='^all', portNum=None, **kw):
         assert len(data) <= m.MAX_PAYLOAD, len(data)
@@ -159,6 +163,26 @@ class MeshJobTestCase(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual([], self.rec_b.jobs)
         self.assertEqual([], self.ib.sent)
+
+    def test_devices_shows_connection_and_disconnect(self):
+        from nwebclient import base
+        self.a.target = 'TCP meshnode'
+        self.a.find_devices = lambda: []
+        p = base.Page()
+        self.a.part_devices(p)
+        html = str(p)
+        self.assertIn('Verbundenes Gerät', html)
+        self.assertIn('meshnode', html)
+        self.assertIn('Trennen', html)
+        res = self.a.execute(dict(type='mb', op='disconnect'))
+        self.assertTrue(res['success'], res)
+        self.assertTrue(self.ia.closed)
+        self.assertIsNone(self.a.iface)
+        self.assertFalse(self.a.is_connected())
+        p = base.Page()
+        self.a.part_devices(p)
+        self.assertNotIn('Trennen', str(p))
+        self.assertFalse(self.a.execute(dict(type='mb', op='disconnect'))['success'])
 
     def test_pages_render(self):
         from nwebclient import base

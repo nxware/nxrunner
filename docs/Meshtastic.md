@@ -41,7 +41,7 @@ Alle Knoten, die sich gegenseitig Jobs schicken sollen, brauchen **dieselbe Schl
 | Messages | die letzten 25 empfangenen Textnachrichten (Port 1) |
 | Jobs | Job an einen Knoten senden, gesendete Jobs mit Ergebnissen, empfangene Jobs |
 | Bilder | Bild hochladen und senden, empfangene Bilder mit Vorschau während der Übertragung |
-| Devices | Meshtastic-Geräte an seriellen Ports, per mDNS im Netz und per Bluetooth LE |
+| Devices | verbundenes Gerät mit Trennen-Button; Meshtastic-Geräte an seriellen Ports, per mDNS im Netz und per Bluetooth LE |
 | GPIO | Remote Hardware (in Arbeit) |
 
 ## Jobs
@@ -52,7 +52,8 @@ Alle Knoten, die sich gegenseitig Jobs schicken sollen, brauchen **dieselbe Schl
 | `{type: mb, op: send, dest: "!a1b2c3d4", job: {...}}` | Job verschlüsselt an einen Knoten senden, `dest: "^all"` an alle |
 | `{type: mb, op: d, ref: <id>, r: {...}}` | Ergebnis eines entfernt ausgeführten Jobs (kommt über das Mesh zurück) |
 | `{type: mb, op: send_image, data: "<Base64>", dest: "!a1b2c3d4", quality: 30}` | Bild senden (Port 256, Kennung `nI`), `data` auch als Data-URL |
-| `{type: mb, connect_serial: "/dev/ttyACM0"}` | verbinden, ebenso `connect_tcp`, `connect_ble` |
+| `{type: mb, connect_serial: "/dev/ttyACM0"}` | verbinden, ebenso `connect_tcp`, `connect_ble` (eine bestehende Verbindung wird vorher getrennt) |
+| `{type: mb, op: disconnect}` | Verbindung trennen |
 
 `op: send` liefert `id` (Nachrichten-ID), `fragments` (Anzahl Pakete) und `size` (Byte verschlüsselt). Das
 Senden läuft im Hintergrund, das Ergebnis erscheint auf der Seite *Jobs* und als Event `on_result`
