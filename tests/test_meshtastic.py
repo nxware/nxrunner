@@ -41,9 +41,13 @@ class FakeIface:
         self.sent = []
         self.drop = False
         self.closed = False
+        self.texts = []
 
     def close(self):
         self.closed = True
+
+    def sendText(self, text, destinationId='^all', **kw):
+        self.texts.append((text, destinationId))
 
     def sendData(self, data, destinationId='^all', portNum=None, **kw):
         assert len(data) <= m.MAX_PAYLOAD, len(data)
@@ -71,6 +75,10 @@ def wait_for(cond, timeout=5.0):
 
 
 class MeshJobTestCase(unittest.TestCase):
+
+    def tearDown(self):
+        for bot in (self.a, self.b):
+            bot._periodic_stop.set()
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -183,6 +191,68 @@ class MeshJobTestCase(unittest.TestCase):
         self.a.part_devices(p)
         self.assertNotIn('Trennen', str(p))
         self.assertFalse(self.a.execute(dict(type='mb', op='disconnect'))['success'])
+
+    def add_periodic(self, bot=None, **kw):
+        res = (bot or self.a).execute(dict(type='mb', op='add_periodic', **kw))
+        self.assertTrue(res['success'], res)
+        return (bot or self.a)._periodic_item(res['id'])
+
+    def test_periodic_text(self):
+        item = self.add_periodic(interval='600', mode='text', text='Hallo Mesh', dest='!00000002')
+        res = self.a.execute(dict(type='mb', op='run_periodic', id=item['id']))
+        self.assertTrue(res['success'], res)
+        self.assertEqual([('Hallo Mesh', '!00000002')], self.ia.texts)
+        self.assertEqual(1, item['count'])
+
+    def test_periodic_job_field(self):
+        item = self.add_periodic(interval=60, mode='job', job_type='rec', job_op='status', job_key='message',
+                                 text='Status: {value}!')
+        self.assertTrue(self.a.execute(dict(type='mb', op='run_periodic', id=item['id']))['success'])
+        self.assertEqual('Status: ok!', self.ia.texts[-1][0])
+        self.assertEqual({'type': 'rec', 'op': 'status'}, self.rec_a.jobs[-1])
+        # ohne {value} wird der Wert angehaengt, Zahlen als JSON
+        item = self.add_periodic(interval=60, mode='job', job_type='rec', job_op='status', job_key='success')
+        self.a.run_periodic_item(item)
+        self.assertEqual('true', self.ia.texts[-1][0])
+        # fehlendes Feld: Fehler merken, nichts senden
+        item = self.add_periodic(interval=60, mode='job', job_type='rec', job_op='status', job_key='nope')
+        sent = len(self.ia.texts)
+        self.assertFalse(self.a.run_periodic_item(item)['success'])
+        self.assertIn('nope', item['last_error'])
+        self.assertEqual(sent, len(self.ia.texts))
+
+    def test_periodic_validation_toggle_remove(self):
+        self.assertFalse(self.a.execute(dict(type='mb', op='add_periodic', interval=5, text='x'))['success'])
+        self.assertFalse(self.a.execute(dict(type='mb', op='add_periodic', interval=60, text=''))['success'])
+        self.assertFalse(self.a.execute(dict(type='mb', op='add_periodic', interval=60, mode='job'))['success'])
+        item = self.add_periodic(interval=60, text='x')
+        self.a.execute(dict(type='mb', op='toggle_periodic', id=item['id']))
+        self.assertFalse(item['active'])
+        self.a.execute(dict(type='mb', op='remove_periodic', id=item['id']))
+        self.assertEqual([], self.a.periodic_items)
+
+    def test_periodic_scheduled_and_saved(self):
+        path = os.path.join(self.tmp, 'auto.json')
+        self.a.automations_file = path
+        item = self.add_periodic(interval=60, text='tick')
+        item['next'] = 0  # sofort faellig
+        self.assertTrue(wait_for(lambda: item['count'] >= 1, timeout=3))
+        self.assertEqual('tick', self.ia.texts[0][0])
+        self.assertGreater(item['next'], time.time() + 50)
+        loaded = m.MeshtasticBot(automations_file=path)
+        self.assertEqual([('tick', 60.0)], [(i['text'], i['interval']) for i in loaded.periodic_items])
+        loaded._periodic_stop.set()
+
+    def test_automations_page(self):
+        from nwebclient import base
+        self.add_periodic(interval=3600, mode='job', job_type='rec', job_op='status', job_key='message')
+        p = base.Page()
+        self.a.part_automations(p)
+        html = str(p)
+        self.assertIn('Periodic', html)
+        self.assertIn('1 h', html)
+        self.assertIn('mb_periodic_type', html)
+        self.assertIn('rec', html)
 
     def test_pages_render(self):
         from nwebclient import base

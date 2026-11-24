@@ -30,6 +30,7 @@ Alle Knoten, die sich gegenseitig Jobs schicken sollen, brauchen **dieselbe Schl
 | `image_resend_timeout` | 20 | Sekunden ohne neues Bildpaket, danach prüft der Empfänger, ob er nachfordert |
 | `image_min_complete` | 0.9 | Anteil des lückenlosen Anfangs, ab dem nichts nachgefordert wird |
 | `image_max_rounds` | 3 | maximale Nachforderungen je Bild (Empfänger) bzw. je Bild und Anfrager (Sender) |
+| `automations_file` | – | JSON-Datei für die Automations (periodische Nachrichten), ohne Angabe nur im Speicher |
 
 > Der Typ hieß früher `meshtastic`. Bestehende Konfigurationen und Jobs mit `type: meshtastic` auf `mb` umstellen.
 
@@ -41,6 +42,7 @@ Alle Knoten, die sich gegenseitig Jobs schicken sollen, brauchen **dieselbe Schl
 | Messages | die letzten 25 empfangenen Textnachrichten (Port 1) |
 | Jobs | Job an einen Knoten senden, gesendete Jobs mit Ergebnissen, empfangene Jobs |
 | Bilder | Bild hochladen und senden, empfangene Bilder mit Vorschau während der Übertragung |
+| Automations | Periodic: Textnachrichten in festem Intervall senden, Inhalt fester Text oder Feld eines Jobs |
 | Devices | verbundenes Gerät mit Trennen-Button; Meshtastic-Geräte an seriellen Ports, per mDNS im Netz und per Bluetooth LE |
 | GPIO | Remote Hardware (in Arbeit) |
 
@@ -54,10 +56,30 @@ Alle Knoten, die sich gegenseitig Jobs schicken sollen, brauchen **dieselbe Schl
 | `{type: mb, op: send_image, data: "<Base64>", dest: "!a1b2c3d4", quality: 30}` | Bild senden (Port 256, Kennung `nI`), `data` auch als Data-URL |
 | `{type: mb, connect_serial: "/dev/ttyACM0"}` | verbinden, ebenso `connect_tcp`, `connect_ble` (eine bestehende Verbindung wird vorher getrennt) |
 | `{type: mb, op: disconnect}` | Verbindung trennen |
+| `{type: mb, op: add_periodic, interval: 600, dest: "^all", mode: text, text: "Hallo"}` | periodische Nachricht anlegen (siehe Automations) |
+| `{type: mb, op: run_periodic, id: "<id>"}` | periodische Nachricht sofort senden, ebenso `toggle_periodic` (pausieren/fortsetzen), `remove_periodic` |
 
 `op: send` liefert `id` (Nachrichten-ID), `fragments` (Anzahl Pakete) und `size` (Byte verschlüsselt). Das
 Senden läuft im Hintergrund, das Ergebnis erscheint auf der Seite *Jobs* und als Event `on_result`
 (`ref`, `src`, `r`).
+
+## Automations
+
+Seite *Automations*, Abschnitt **Periodic**: Textnachrichten (Port 1) in festem Takt senden.
+
+| Feld | Bedeutung |
+|---|---|
+| `interval` | Sekunden, mindestens 10 |
+| `dest` | Ziel, `!id` oder `^all` |
+| `mode` | `text`: fester Text; `job`: Wert aus dem Ergebnis eines Jobs |
+| `text` | bei `text` die Nachricht; bei `job` optionale Vorlage, `{value}` wird durch den Wert ersetzt (ohne `{value}` angehängt) |
+| `job_type`, `job_op`, `job_key` | Job und Feld des Ergebnisses, Auswahl über die Job-Auswahl (`ui_form_job`) wie im Dashboard; ohne `job_key` das ganze Ergebnis als JSON |
+
+Beispiel: `mode: job, job_type: sensor, job_op: read, job_key: temperature, text: "Temp {value} °C"`.
+
+Ein Thread prüft jede Sekunde, was fällig ist. Texte werden auf 200 Zeichen gekürzt. Ohne Verbindung oder bei
+fehlendem Feld wird nichts gesendet; der Fehler steht in der Spalte *Zuletzt*. Mit `automations_file` bleiben
+die Einträge über einen Neustart erhalten.
 
 ## Port 256 und Kennungen
 

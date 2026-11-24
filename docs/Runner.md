@@ -438,6 +438,8 @@ Renesas FS3000 Luftstromsensor (I2C-Adresse `0x28`). Varianten `1005` (0 - 7,23 
 | `op=set_range range` | Kennlinie `1005` oder `1015` wählen |
 | `op=setaction jobdef var` | alle 0,5 s einen Job mit der Geschwindigkeit (m/s) in `var` ausführen |
 
+Seite `page_flow`: Vollbild-Anzeige nur mit dem Flow-Wert (auch mobil), aktualisiert sich alle 0,5 s per SSE (`page_flow_stream`, Ereignisse `flow` und `error_msg`). Gemessen wird nur, solange eine Anzeige verbunden ist.
+
 ### ElrsDisplay
 
 `nxrunner.hw.elrs:ElrsDisplay(args={})`

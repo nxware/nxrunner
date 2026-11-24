@@ -4,6 +4,7 @@ Meshtastic-Knoten (verschoben aus nxbot.network)
     Config (runners):
         mb: nxrunner.devices.meshtastic:MeshtasticBot(port="/dev/ttyACM0")
         mb: nxrunner.devices.meshtastic:MeshtasticBot(host="192.168.178.50")
+        mb: nxrunner.devices.meshtastic:MeshtasticBot(port="/dev/ttyACM0", automations_file="mb_automations.json")
 
 Jobs ueber das Mesh (Port 256 mit Kennung nJ, siehe docs/Meshtastic.md):
     {type: mb, op: send, dest: '!a1b2c3d4', job: {type: ..., ...}}
@@ -14,6 +15,7 @@ Job {type: mb, op: d, ref: <id>, r: <ergebnis>} zurueck.
 import base64
 import hashlib
 import json
+import os
 import secrets
 import struct
 import threading
@@ -43,6 +45,8 @@ PROTO_VERSION = 1                   # 1 = raw deflate + Fernet (CryptRunner)
 FRAGMENT_HEADER = struct.Struct('<BHBB')   # Version, Nachrichten-ID, Index, Anzahl
 FRAGMENT_DATA = MAX_PAYLOAD - len(JOB_MAGIC) - FRAGMENT_HEADER.size
 FRAGMENT_TIMEOUT = 300              # s, unvollstaendige Nachrichten verwerfen
+MIN_PERIODIC_INTERVAL = 10          # s, kuerzestes Intervall periodischer Nachrichten (Funkzeit)
+MAX_TEXT = 200                      # Zeichen, laengere periodische Nachrichten werden gekuerzt
 MAX_JOBS = 25                       # gemerkte gesendete/empfangene Jobs
 
 IMAGE_PORT = PRIVATE_PORT
@@ -155,7 +159,7 @@ class MeshtasticBot(r.BaseJobExecutor):
 
     def __init__(self, host=None, port=None, max_fragments=16, max_age=600, fragment_delay=0.5,
                  image_quality=30, max_image_fragments=200, image_resend_timeout=20, image_min_complete=0.9,
-                 image_max_rounds=3):
+                 image_max_rounds=3, automations_file=None):
         """
         :param max_fragments: maximale Pakete je Nachricht (Job oder Ergebnis)
         :param max_age: s, aeltere Nachrichten (Fernet-Zeitstempel des Senders) werden verworfen, None = aus
@@ -166,6 +170,7 @@ class MeshtasticBot(r.BaseJobExecutor):
         :param image_resend_timeout: s ohne neues Paket, nach denen ein unvollstaendiges Bild geprueft wird
         :param image_min_complete: Anteil des lueckenlosen Anfangs (0-1), ab dem nichts nachgefordert wird
         :param image_max_rounds: maximale Nachforderungen je Bild (Empfaenger) bzw. je Bild und Anfrager (Sender)
+        :param automations_file: JSON-Datei fuer die Automations (periodische Nachrichten), None = nur im Speicher
         """
         super().__init__('mb')
         self.iface = None
@@ -190,6 +195,11 @@ class MeshtasticBot(r.BaseJobExecutor):
         self.sent_images = OrderedDict()        # img_id -> dict(time, dest, jpeg, size, fragments, sent)
         self.received_images = OrderedDict()    # (from, img_id) -> dict(time, src, count, parts, done)
         self._lock = threading.Lock()
+        self.automations_file = automations_file
+        self.periodic_items = []                # dict(id, interval, mode, text, job_type, job_op, job_key, dest, ...)
+        self._periodic_thread = None
+        self._periodic_stop = threading.Event()
+        self.load_automations()
         self.define_vars('receive_count')
         self.define_event('on_message')
         self.define_event('on_result')
@@ -202,11 +212,163 @@ class MeshtasticBot(r.BaseJobExecutor):
         if host is not None:
             self.connect_tcp(host)
 
-    def sendText(self, message):
+    def sendText(self, message, dest='^all'):
         if not self.is_connected():
             return self.fail("Nicht verbunden")
-        self.iface.sendText(message)
+        self.iface.sendText(message, destinationId=dest or '^all')
         return self.success()
+
+    # --- Automations: periodische Nachrichten -------------------------------------------------------
+
+    def load_automations(self):
+        if not self.automations_file or not os.path.exists(self.automations_file):
+            return
+        try:
+            with open(self.automations_file, encoding='utf-8') as f:
+                items = json.load(f).get('periodic', [])
+        except (OSError, ValueError) as e:
+            self.error(f"Automations aus {self.automations_file} nicht lesbar: {e}")
+            return
+        now = time.time()
+        for item in items:
+            item.update(next=now + float(item['interval']), last=None, last_text=None, last_error=None, count=0)
+        self.periodic_items = items
+        if items:
+            self._start_periodic()
+
+    def save_automations(self):
+        if not self.automations_file:
+            return
+        keep = ('id', 'interval', 'mode', 'text', 'job_type', 'job_op', 'job_key', 'dest', 'active')
+        with self._lock:
+            items = [{k: item.get(k) for k in keep} for item in self.periodic_items]
+        try:
+            with open(self.automations_file, 'w', encoding='utf-8') as f:
+                json.dump({'periodic': items}, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            self.error(f"Automations nicht speicherbar: {e}")
+
+    def _start_periodic(self):
+        """ ein Thread fuer alle periodischen Nachrichten, prueft jede Sekunde, was faellig ist """
+        if self._periodic_thread is not None and self._periodic_thread.is_alive():
+            return
+        self._periodic_stop.clear()
+        self._periodic_thread = threading.Thread(target=self._periodic_loop, name='mb_periodic', daemon=True)
+        self._periodic_thread.start()
+
+    def _periodic_loop(self):
+        while not self._periodic_stop.wait(1):
+            now = time.time()
+            with self._lock:
+                due = [item for item in self.periodic_items if item.get('active', True) and item['next'] <= now]
+                for item in due:
+                    item['next'] = now + float(item['interval'])
+            for item in due:
+                self.run_periodic_item(item)
+
+    def _periodic_item(self, item_id):
+        with self._lock:
+            return next((item for item in self.periodic_items if item['id'] == item_id), None)
+
+    def periodic_job(self, item) -> dict:
+        """ Job-Daten: job_op ist das Label einer direkt aufrufbaren Signatur (siehe ui_form_job), sonst op """
+        dispatcher = self.getParentClass(r.LazyDispatcher)
+        if dispatcher is not None:
+            try:
+                runner = dispatcher.get_runner(item['job_type'])
+                for sig in getattr(runner, 'signatures', None) or []:
+                    if sig.is_direct_callable() and sig.label() == item['job_op']:
+                        return {**sig.job(), 'type': item['job_type']}
+            except Exception:
+                pass
+        return {'type': item['job_type'], 'op': item['job_op']}
+
+    def periodic_text(self, item) -> str:
+        """ Text der Nachricht: fest oder {value} im Text durch das Feld job_key des Job-Ergebnisses ersetzt """
+        if item['mode'] != 'job':
+            return item['text']
+        result = self.getRoot().execute(self.periodic_job(item))
+        if item.get('job_key'):
+            if not isinstance(result, dict) or item['job_key'] not in result:
+                raise ValueError(f"Feld {item['job_key']} fehlt im Ergebnis: {self.short_text(result)}")
+            value = result[item['job_key']]
+        else:
+            value = result
+        if not isinstance(value, str):
+            value = json.dumps(value, default=str, ensure_ascii=False)
+        template = item.get('text') or '{value}'
+        return template.replace('{value}', value) if '{value}' in template else f"{template} {value}"
+
+    @staticmethod
+    def short_text(value, limit=80) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+        return text if len(text) <= limit else text[:limit] + '…'
+
+    def run_periodic_item(self, item):
+        try:
+            text = self.periodic_text(item)[:MAX_TEXT]
+            res = self.sendText(text, item.get('dest'))
+            error = None if res.get('success') else res.get('message', 'Fehler')
+        except Exception as e:
+            text, error = None, str(e)
+        with self._lock:
+            item.update(last=datetime.now(), last_text=text, last_error=error)
+            if error is None:
+                item['count'] = item.get('count', 0) + 1
+        if error is not None:
+            self.error(f"Periodische Nachricht {item['id']}: {error}")
+            return self.fail(error)
+        return self.success(f"gesendet: {text}", text=text)
+
+    def execute_add_periodic(self, data):
+        try:
+            interval = float(data.get('interval') or 0)
+        except ValueError:
+            return self.fail("interval muss eine Zahl (Sekunden) sein")
+        if interval < MIN_PERIODIC_INTERVAL:
+            return self.fail(f"Intervall mindestens {MIN_PERIODIC_INTERVAL} s")
+        mode = data.get('mode') or 'text'
+        if mode not in ('text', 'job'):
+            return self.fail("mode muss text oder job sein")
+        item = dict(id=secrets.token_hex(4), interval=interval, mode=mode, text=str(data.get('text') or '').strip(),
+                    job_type=str(data.get('job_type') or '').strip(), job_op=str(data.get('job_op') or '').strip(),
+                    job_key=str(data.get('job_key') or '').strip(), dest=str(data.get('dest') or '^all').strip(),
+                    active=True, next=time.time() + interval, last=None, last_text=None, last_error=None, count=0)
+        if mode == 'text' and not item['text']:
+            return self.fail("Text fehlt")
+        if mode == 'job' and not (item['job_type'] and item['job_op']):
+            return self.fail("Job (Type und Aufruf) auswählen")
+        with self._lock:
+            self.periodic_items.append(item)
+        self.save_automations()
+        self._start_periodic()
+        return self.success("Periodische Nachricht angelegt", id=item['id'], ui_reload=True)
+
+    def execute_remove_periodic(self, data):
+        item = self._periodic_item(data.get('id'))
+        if item is None:
+            return self.fail("Unbekannte id")
+        with self._lock:
+            self.periodic_items.remove(item)
+        self.save_automations()
+        return self.success("entfernt", ui_reload=True)
+
+    def execute_toggle_periodic(self, data):
+        item = self._periodic_item(data.get('id'))
+        if item is None:
+            return self.fail("Unbekannte id")
+        with self._lock:
+            item['active'] = not item.get('active', True)
+            item['next'] = time.time() + float(item['interval'])
+        self.save_automations()
+        return self.success("aktiv" if item['active'] else "pausiert", ui_reload=True)
+
+    def execute_run_periodic(self, data):
+        """ Nachricht sofort senden (zum Testen), der Takt bleibt """
+        item = self._periodic_item(data.get('id'))
+        if item is None:
+            return self.fail("Unbekannte id")
+        return {**self.run_periodic_item(item), 'ui_reload': True}
 
     @staticmethod
     def portnum(packet):
@@ -720,6 +882,7 @@ class MeshtasticBot(r.BaseJobExecutor):
               ("Messages", self.link(self.part_messages), f"Die letzten {MAX_MESSAGES} empfangenen Nachrichten"),
               ("Jobs", self.link(self.part_jobs), f"Verschlüsselte Jobs über Port {JOB_PORT}"),
               ("Bilder", self.link(self.part_images), f"Bilder über Port {IMAGE_PORT} senden und empfangen"),
+              ("Automations", self.link(self.part_automations), "Periodische Nachrichten"),
               ("Devices", self.link(self.part_devices), "Verfügbare Meshtastic-Geräte"),
               ("GPIO", self.link(self.part_gpios), "Remote Hardware"),
               active=active)
@@ -863,6 +1026,72 @@ class MeshtasticBot(r.BaseJobExecutor):
             p.script("setTimeout(() => location.reload(), 10000);")
 
     TARGET_PREFIX = {'connect_serial': 'Serial', 'connect_tcp': 'TCP', 'connect_ble': 'BLE'}
+
+    PERIODIC_FORM = 'mb_periodic'
+
+    @staticmethod
+    def format_interval(seconds: float) -> str:
+        seconds = int(seconds)
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600} h"
+        if seconds % 60 == 0:
+            return f"{seconds // 60} min"
+        return f"{seconds} s"
+
+    def periodic_row(self, item) -> list:
+        if item['mode'] == 'job':
+            source = f"Job {w.s(item['job_type'])}/{w.s(item['job_op'])}" + \
+                     (f".{w.s(item['job_key'])}" if item['job_key'] else '') + \
+                     (f" – Text {w.s(item['text'])}" if item['text'] else '')
+        else:
+            source = w.s(item['text'])
+        if item.get('last') is None:
+            last = '-'
+        elif item.get('last_error'):
+            last = item['last'].strftime('%H:%M:%S') + ' ' + w.badge("Fehler", kind='error') + \
+                   ' ' + w.s(item['last_error'])
+        else:
+            last = item['last'].strftime('%H:%M:%S') + ' ' + w.s(item['last_text'])
+        active = item.get('active', True)
+        buttons = ' '.join(self.action_btn({'type': self.type, 'op': op, 'id': item['id'], 'title': title})
+                           for op, title in (('run_periodic', "Jetzt senden"),
+                                             ('toggle_periodic', "Pausieren" if active else "Fortsetzen"),
+                                             ('remove_periodic', "Löschen")))
+        interval = self.format_interval(item['interval'])
+        if not active:
+            interval += ' ' + w.badge("pausiert", kind='default')
+        return [interval, w.s(item['dest']), source, last, item.get('count', 0), buttons]
+
+    def part_automations(self, p: base.Page, params={}):
+        self.nav(p, "Automations")
+        f = self.PERIODIC_FORM
+        with p.section(h="Periodic"):
+            p.div(f"Sendet eine Textnachricht in festem Takt (mindestens {MIN_PERIODIC_INTERVAL} s). "
+                  "Inhalt: fester Text oder ein Feld aus dem Ergebnis eines Jobs; im Text wird {value} durch "
+                  "den Wert ersetzt (ohne {value} wird er angehängt).")
+            if not self.is_connected():
+                p(w.alert_warn("Kein Gerät verbunden, Nachrichten werden erst nach dem Verbinden gesendet."))
+            with self._lock:
+                items = [dict(item) for item in self.periodic_items]
+            if items:
+                p(w.table([['Intervall', 'Ziel', 'Inhalt', 'Zuletzt', 'Gesendet', '']] +
+                          [self.periodic_row(item) for item in items]))
+            else:
+                p(w.alert_info("Noch keine periodischen Nachrichten."))
+        with p.section(h="Periodische Nachricht anlegen"):
+            toggle = (f"document.getElementById('{f}_jobbox').style.display = "
+                      f"this.value === 'job' ? '' : 'none';")
+            p.form_input('interval', "Intervall (s)", id=f'{f}_interval', value='600', type='number',
+                         min=str(MIN_PERIODIC_INTERVAL))
+            p.form_input('dest', "Ziel (!id oder ^all)", id=f'{f}_dest', value='^all')
+            p.form_select('mode', "Inhalt", {'text': "fester Text", 'job': "Feld eines Jobs"}, 'text',
+                          id=f'{f}_mode', onchange=toggle)
+            p.form_input('text', "Text", id=f'{f}_text', placeholder="z.B. Temperatur: {value} °C",
+                         hint="Bei Feld eines Jobs optional, {value} = Wert")
+            p(w.div(self.ui_form_job(f), id=f'{f}_jobbox', style='display: none;'))
+            p(self.action_btn_parametric("Anlegen", dict(
+                type=self.type, op='add_periodic', interval=f'#{f}_interval', dest=f'#{f}_dest', mode=f'#{f}_mode',
+                text=f'#{f}_text', job_type=f'#{f}_type', job_op=f'#{f}_op', job_key=f'#{f}_key')))
 
     def connect_btn(self, op: str, target: str):
         if self.iface is not None and self.target == f"{self.TARGET_PREFIX[op]} {target}":

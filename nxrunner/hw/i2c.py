@@ -438,6 +438,11 @@ class FS3000(r.BaseJobExecutor):
         self.jobdef = None
         self.jobdef_var_name = None
         self.last = None
+        import threading
+        self.flow_channel = None
+        self.flow_thread = None
+        self.flow_lock = threading.Lock()
+        self.flow_wanted = 0
 
     # ------------------------------------------------------------------
     # low level
@@ -558,7 +563,9 @@ class FS3000(r.BaseJobExecutor):
                               label=f"FS3000-{rng}", hint=f"Kennlinie der Variante FS3000-{rng} verwenden"))
         p.ul([
             w.a("Aktualisieren", self.link(self.part_index)),
-            w.a("Bind", self.link(self.part_bind))
+            w.a("Bind", self.link(self.part_bind)),
+            w.a("Anzeige", self.dispatcher_link(self.page_flow),
+                hint="Vollbild-Anzeige nur mit dem Flow-Wert, live per SSE")
         ])
 
     def part_bind(self, p: b.Page, params={}):
@@ -572,3 +579,104 @@ class FS3000(r.BaseJobExecutor):
             jobdef='#f_def',
             var='#f_var'
         ), hint="Job alle 0,5 s mit der aktuellen Geschwindigkeit ausfuehren"))
+
+    # ------------------------------------------------------------------
+    # flow-anzeige (SSE)
+    # ------------------------------------------------------------------
+
+    FLOW_INTERVAL = 0.5
+
+    FLOW_CSS = """
+        :root { --bg: #fff; --fg: #111; --muted: #777; --ok: #2a9d4b; --err: #d43a2a; }
+        @media (prefers-color-scheme: dark) { :root { --bg: #000; --fg: #eee; --muted: #888; } }
+        html, body { height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+               font-family: system-ui, sans-serif; font-variant-numeric: tabular-nums;
+               -webkit-user-select: none; user-select: none; }
+        #flow_value { font-size: min(34vw, 45vh); font-weight: 700; line-height: 1; }
+        #flow_unit { font-size: min(8vw, 10vh); color: var(--muted); }
+        #flow_sub { font-size: min(5vw, 6vh); color: var(--muted); margin-top: 2vh; }
+        #flow_state { position: fixed; top: 12px; right: 12px; width: 14px; height: 14px;
+                      border-radius: 50%; background: var(--err); }
+        #flow_state.ok { background: var(--ok); }
+        #flow_back { position: fixed; top: 8px; left: 12px; padding: 4px 6px; font-size: 15px;
+                     color: var(--muted); text-decoration: none; opacity: .6; }
+        #flow_back:hover, #flow_back:focus { opacity: 1; }
+        body.stale #flow_value { opacity: .35; }
+    """
+
+    def page_flow(self, params={}):
+        """ Vollbild-Seite nur mit dem Flow-Wert, Aktualisierung per SSE (page_flow_stream) """
+        p = b.Page(owner=self)
+        p['title'] = "FS3000 Flow"
+        p.add_meta('<meta name="theme-color" content="#000">')
+        p('<style>' + self.FLOW_CSS + '</style>')
+        p(w.a("&#8249; Zurück", self.dispatcher_link(self.part_index), hint="Zurück zur FS3000-Seite")
+          .replace('<a ', '<a id="flow_back" ', 1))
+        p('<div id="flow_state" title="Verbindung zum Sensor"></div>')
+        p('<div id="flow_value">-</div>')
+        p('<div id="flow_unit">m/s</div>')
+        p('<div id="flow_sub">&nbsp;</div>')
+        p('<script>' + self._flow_js(self.dispatcher_link(self.page_flow_stream)) + '</script>')
+        return p.render('blank_page')
+
+    @staticmethod
+    def _flow_js(url: str) -> str:
+        import json
+        return """
+          var val = document.getElementById('flow_value'), sub = document.getElementById('flow_sub');
+          var state = document.getElementById('flow_state');
+          var es = new EventSource(""" + json.dumps(url) + """);
+          es.onopen = function() { state.className = 'ok'; };
+          es.onerror = function() { state.className = ''; document.body.classList.add('stale'); };
+          es.addEventListener('flow', function(e) {
+            var d = JSON.parse(e.data);
+            document.body.classList.remove('stale');
+            state.className = 'ok';
+            val.textContent = d.mps.toFixed(2);
+            sub.textContent = d.kmh.toFixed(1) + ' km/h';
+          });
+          es.addEventListener('error_msg', function(e) {
+            document.body.classList.add('stale');
+            state.className = '';
+            sub.textContent = JSON.parse(e.data);
+          });
+        """
+
+    def page_flow_stream(self, params={}):
+        """ SSE-Stream mit den Ereignissen flow (Messwerte) und error_msg (Lesefehler) """
+        self.start_flow_publisher()
+        first = [('flow', self.last)] if self.last else []
+        return self.flow_channel.response(first_events=first)
+
+    def start_flow_publisher(self):
+        import threading
+        import time
+        from nwebclient.sse import SseChannel
+        with self.flow_lock:
+            self.flow_wanted = time.time()
+            if self.flow_channel is None:
+                self.flow_channel = SseChannel(max_queue=20)
+            if self.flow_thread is None:
+                self.flow_thread = threading.Thread(target=self.flow_loop, daemon=True, name='fs3000_flow')
+                self.flow_thread.start()
+
+    def flow_loop(self):
+        """ misst, solange Clients verbunden sind bzw. kuerzlich einer angefragt hat (Neuverbinden) """
+        import time
+        while True:
+            with self.flow_lock:
+                if self.flow_channel.client_count > 0:
+                    self.flow_wanted = time.time()
+                elif time.time() - self.flow_wanted > 10:
+                    self.flow_thread = None
+                    return
+            if self.flow_channel.client_count > 0:
+                self.publish_flow()
+            time.sleep(self.FLOW_INTERVAL)
+
+    def publish_flow(self):
+        try:
+            self.flow_channel.publish('flow', self.measure(3))
+        except Exception as e:
+            self.flow_channel.publish('error_msg', str(e))
