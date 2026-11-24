@@ -3,6 +3,7 @@ from nwebclient import base as b
 from nwebclient import util as u
 from nwebclient import dev as d
 from nwebclient import web as w
+from nwebclient.runner import op
 
 
 class JoystickM5(r.BaseJobExecutor):
@@ -400,3 +401,174 @@ class AS5600(r.BaseJobExecutor):
             jobdef='#a_def',
             var='#a_var'
         )))
+
+
+class FS3000(r.BaseJobExecutor):
+    """
+      Renesas FS3000 Luftstromsensor (12 Bit, I2C-Adresse 0x28 an Bus 1).
+      Varianten: 1005 (0 - 7,23 m/s) und 1015 (0 - 15 m/s), Rohwerte 409 (0 m/s) bis 3686 (Endwert).
+      op=read [samples]              Luftgeschwindigkeit (m/s, km/h, mph) und Rohwert, gemittelt
+      op=set_range range             Variante 1005 oder 1015 setzen
+      op=setaction jobdef var        alle 0,5 s einen Job mit der Geschwindigkeit (m/s) in var ausfuehren
+    """
+
+    MODULES = ["smbus2"]
+
+    FS3000_ADDR = 0x28
+
+    RAW_MIN = 409
+    RAW_MAX = 3686
+
+    # Kennlinien laut Datenblatt (Rohwert -> m/s)
+    CURVES = {
+        "1005": ([409, 915, 1522, 2066, 2523, 2908, 3256, 3572, 3686],
+                 [0.0, 1.07, 2.01, 3.0, 3.97, 4.96, 5.98, 6.99, 7.23]),
+        "1015": ([409, 1203, 1597, 1908, 2187, 2400, 2629, 2801, 3006, 3178, 3309, 3563, 3686],
+                 [0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 13.0, 15.0])
+    }
+
+    def __init__(self, bus=1, range="1005", address=FS3000_ADDR):
+        super().__init__("fs3000")
+        from smbus2 import SMBus
+
+        self.bus = SMBus(int(bus))
+        self.address = int(address)
+        self.range = str(range) if str(range) in self.CURVES else "1005"
+        self.ticker = None
+        self.jobdef = None
+        self.jobdef_var_name = None
+        self.last = None
+
+    # ------------------------------------------------------------------
+    # low level
+    # ------------------------------------------------------------------
+
+    def read_frame(self):
+        """ 5 Byte: Checksumme, Daten High, Daten Low, generische Checksumme, generische Daten """
+        from smbus2 import i2c_msg
+        msg = i2c_msg.read(self.address, 5)
+        self.bus.i2c_rdwr(msg)
+        return list(msg)
+
+    @staticmethod
+    def check_frame(frame):
+        """ Summe aller 5 Byte muss (mod 256) 0 ergeben """
+        return (sum(frame) & 0xFF) == 0
+
+    def read_raw(self):
+        frame = self.read_frame()
+        if not self.check_frame(frame):
+            raise ValueError(f"FS3000 Checksumme falsch: {frame}")
+        return ((frame[1] << 8) | frame[2]) & 0x0FFF
+
+    def read_raw_avg(self, samples=1):
+        import time
+        values = []
+        for i in range(max(1, int(samples))):
+            values.append(self.read_raw())
+            if i + 1 < samples:
+                time.sleep(0.01)
+        return sum(values) / len(values)
+
+    # ------------------------------------------------------------------
+    # umrechnung
+    # ------------------------------------------------------------------
+
+    def raw_to_mps(self, raw):
+        xs, ys = self.CURVES[self.range]
+        if raw <= xs[0]:
+            return 0.0
+        if raw >= xs[-1]:
+            return ys[-1]
+        for i in range(1, len(xs)):
+            if raw <= xs[i]:
+                t = (raw - xs[i - 1]) / (xs[i] - xs[i - 1])
+                return ys[i - 1] + t * (ys[i] - ys[i - 1])
+        return ys[-1]
+
+    def get_mps(self, samples=1):
+        return self.raw_to_mps(self.read_raw_avg(samples))
+
+    def measure(self, samples=1):
+        raw = self.read_raw_avg(samples)
+        mps = self.raw_to_mps(raw)
+        self.last = {
+            "raw": round(raw, 1),
+            "mps": round(mps, 3),
+            "kmh": round(mps * 3.6, 2),
+            "mph": round(mps * 2.23694, 2),
+            "range": self.range,
+            "max_mps": self.CURVES[self.range][1][-1]
+        }
+        return self.last
+
+    # ------------------------------------------------------------------
+    # operations
+    # ------------------------------------------------------------------
+
+    @op("Luftgeschwindigkeit (mps, kmh, mph) und Rohwert, gemittelt ueber samples Messungen",
+        result={'success': 'bool', 'message': 'str', 'raw': 'float', 'mps': 'float', 'kmh': 'float',
+                'mph': 'float', 'range': 'str', 'max_mps': 'float'})
+    def read(self, samples: int = 5):
+        try:
+            return self.success(**self.measure(int(samples)))
+        except Exception as e:
+            return self.fail(str(e))
+
+    @op("Variante setzen: 1005 (0 - 7,23 m/s) oder 1015 (0 - 15 m/s)",
+        result={'success': 'bool', 'message': 'str'})
+    def set_range(self, range: str = "1005"):
+        range = str(range)
+        if range not in self.CURVES:
+            return self.fail(f"Unbekannte Variante {range}, erlaubt: {', '.join(self.CURVES)}")
+        self.range = range
+        return self.success(f"Variante {range}", ui_reload=True)
+
+    @op("Alle 0,5 s den Job jobdef mit der Geschwindigkeit (m/s) in var ausfuehren",
+        result={'success': 'bool', 'message': 'str'})
+    def setaction(self, jobdef: str, var: str):
+        self.jobdef = u.load_to_dict(jobdef)
+        self.jobdef_var_name = var
+        if self.ticker is None:
+            self.ticker = self.periodic(0.5, self.tick)
+        return self.success()
+
+    def tick(self):
+        if self.jobdef is not None:
+            data = {self.jobdef_var_name: round(self.get_mps(3), 3), **self.jobdef}
+            self.owner().execute(data)
+
+    # ------------------------------------------------------------------
+    # html ui
+    # ------------------------------------------------------------------
+
+    def part_index(self, p: b.Page, params={}):
+        try:
+            m = self.measure(5)
+            p.ul([
+                f"Geschwindigkeit: {m['mps']:.2f} m/s ({m['kmh']:.1f} km/h)",
+                f"Rohwert: {m['raw']} ({self.RAW_MIN} - {self.RAW_MAX})",
+                f"Variante: FS3000-{m['range']} (max. {m['max_mps']} m/s)",
+                f"I2C-Adresse: 0x{self.address:02X}"
+            ])
+        except Exception as e:
+            p(f"Fehler beim Lesen: {e}")
+        for rng in self.CURVES:
+            p(self.action_btn(dict(type=self.type, op='set_range', range=rng),
+                              label=f"FS3000-{rng}", hint=f"Kennlinie der Variante FS3000-{rng} verwenden"))
+        p.ul([
+            w.a("Aktualisieren", self.link(self.part_index)),
+            w.a("Bind", self.link(self.part_bind))
+        ])
+
+    def part_bind(self, p: b.Page, params={}):
+        p("Set Actions")
+        p("Luftgeschwindigkeit (m/s)")
+        p.form_input("Jobdef", "f_def")
+        p.form_input("Varname", "f_var")
+        p(self.action_btn_parametric("Bind", dict(
+            type=self.type,
+            op='setaction',
+            jobdef='#f_def',
+            var='#f_var'
+        ), hint="Job alle 0,5 s mit der aktuellen Geschwindigkeit ausfuehren"))
