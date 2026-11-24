@@ -33,7 +33,8 @@ MAX_MESSAGES = 25
 # Jobs und Bilder laufen auf PRIVATE_APP (256): eigene Portnummern (z.B. 370) kennt die Android-App nicht, sie
 # sendet und liest sie als Port 0. Eine 2-Byte-Kennung am Paketanfang trennt Jobs, Bilder und andere private Apps.
 PRIVATE_PORT = 256
-PORT_NAMES = {'PRIVATE_APP': PRIVATE_PORT}
+TEXT_PORT = 1  # TEXT_MESSAGE_APP
+PORT_NAMES = {'TEXT_MESSAGE_APP': TEXT_PORT, 'PRIVATE_APP': PRIVATE_PORT}
 MAX_PAYLOAD = 227                   # 233 Byte Data-Protobuf (DATA_PAYLOAD_LEN) abzueglich Portnummer und Laengenfeld
 
 JOB_PORT = PRIVATE_PORT
@@ -240,7 +241,7 @@ class MeshtasticBot(r.BaseJobExecutor):
                 elif payload.startswith(IMAGE_MAGIC):
                     self.receive_image_fragment(packet)
                 # sonst: andere private App auf Port 256
-            elif pn == 'TEXT_MESSAGE_APP':
+            elif pn == TEXT_PORT:
                 message = packet['decoded']['payload'].decode('utf-8')
                 from_id = packet.get('fromId')
                 self.last = message

@@ -1,3 +1,4 @@
+import types
 """
 Unittests fuer nxrunner.devices.meshtastic (Jobs ueber Port 370), ohne Funkhardware
 
@@ -299,6 +300,14 @@ class MeshImageTestCase(unittest.TestCase):
                          self.ib)
         self.assertEqual(0, len(self.b.received_images))
         self.assertTrue(all(len(f) <= 227 for f in self.ia.sent))
+
+    def test_text_message_listed(self):
+        # echte Pakete enthalten zusaetzlich 'raw' (MeshPacket mit numerischem Port)
+        raw = types.SimpleNamespace(decoded=types.SimpleNamespace(portnum=1))
+        for packet in ({'decoded': {'portnum': 'TEXT_MESSAGE_APP', 'payload': b'hallo'}, 'fromId': '!00000001', 'raw': raw},
+                       {'decoded': {'portnum': 'TEXT_MESSAGE_APP', 'payload': b'welt'}, 'fromId': '!00000001'}):
+            self.b.onReceive(packet, self.ib)
+        self.assertEqual(['welt', 'hallo'], [msg['text'] for msg in self.b.messages])
 
     def test_to_ranges(self):
         self.assertEqual([(2, 3), (9, 1)], m.to_ranges([2, 3, 4, 9]))
