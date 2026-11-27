@@ -2,7 +2,10 @@
 Videos aus einem Verzeichnis anzeigen, beschneiden und komprimiert herunterladen.
 
 Videos, zeigt die Videos eines Verzeichnisses:
-    Navigation: Index (Videos im Hauptverzeichnis), Browse (Verzeichnisse, werden erst beim Oeffnen gelesen), Videos (Video-Runner mit Upload)
+    Navigation: Index (Videos im Hauptverzeichnis), Browse (Verzeichnisse, werden erst beim Oeffnen gelesen),
+                Videos (alle in Index und Browse gefundenen Videos, mit Link zum Upload im Video-Runner)
+                Die Liste der gefundenen Videos liegt in der nweb-Persistence (system__setting nxrunner.<type>.found),
+                ohne Persistence nur im Speicher.
     Ein ausgewaehltes Video wird im Video-Runner geoeffnet. Fehlt dieser im Dispatcher, wird er angelegt.
 
     Config (runners):
@@ -26,6 +29,7 @@ Video, Editor fuer ein einzelnes Video:
 
     Benoetigt ffmpeg im PATH.
 """
+import json
 import os
 import re
 import shutil
@@ -580,6 +584,8 @@ class Videos(r.BaseJobExecutor):
         super().__init__(type)
         self.path = os.path.realpath(os.path.expanduser(path))
         self.video_type = video
+        self.found = set()  # in Index/Browse gefundene Videos, in der nweb-Persistence gespeichert (wenn verfuegbar)
+        self.found_loaded = False
 
     # --- Video-Runner -------------------------------------------------------------------------
 
@@ -622,6 +628,64 @@ class Videos(r.BaseJobExecutor):
         except OSError:
             return []
 
+    # --- Gefundene Videos (nweb-Persistence, system__setting) ---------------------------------
+
+    def found_store(self):
+        """ lokale nweb-Persistence mit setting/set_setting oder None """
+        root = self.getRoot()
+        nw = getattr(root, 'nweb', None) if root is not None else None
+        return nw if nw is not None and hasattr(nw, 'set_setting') and hasattr(nw, 'setting') else None
+
+    def found_setting_key(self) -> str:
+        return f'nxrunner.{self.type}.found'
+
+    def load_found(self):
+        """ gespeicherte Liste einmalig laden (nur wenn sie zum selben Hauptverzeichnis gehoert) """
+        if self.found_loaded:
+            return
+        nw = self.found_store()
+        if nw is None:
+            return
+        self.found_loaded = True
+        try:
+            value = json.loads(nw.setting(self.found_setting_key(), '{}') or '{}')
+        except Exception as e:
+            self.error('Gefundene Videos nicht geladen: ' + str(e))
+            return
+        if isinstance(value, dict) and value.get('path') == self.path:
+            self.found.update(os.path.join(self.path, rel) for rel in value.get('videos', []))
+
+    def save_found(self):
+        nw = self.found_store()
+        if nw is None:
+            return
+        value = {'path': self.path, 'videos': sorted(self.rel(f) for f in self.found)}
+        try:
+            nw.set_setting(self.found_setting_key(), json.dumps(value))
+        except Exception as e:
+            self.error('Gefundene Videos nicht gespeichert: ' + str(e))
+
+    def remember(self, paths):
+        """ merkt sich gefundene Videos fuer die Seite Videos, speichert nur bei Aenderungen """
+        self.load_found()
+        paths = {os.path.realpath(f) for f in paths}
+        if not paths <= self.found:
+            self.found.update(paths)
+            self.save_found()
+
+    def found_videos(self) -> list:
+        """ gemerkte Videos, die es noch gibt (geloeschte fallen heraus) """
+        self.load_found()
+        existing = {f for f in self.found if os.path.isfile(f)}
+        if existing != self.found:
+            self.found = existing
+            self.save_found()
+        return list(self.found)
+
+    @op("In Index/Browse gefundene Videos (Pfade relativ zu path)", result={'success': 'bool', 'videos': 'list'})
+    def list_found(self):
+        return self.success('ok', videos=sorted(self.rel(f) for f in self.found_videos()))
+
     @op("Liste der Videos in dir (relativ zu path, nicht rekursiv)", result={'success': 'bool', 'videos': 'list'})
     def list_videos(self, dir: str = ''):
         return self.success('ok', videos=[self.rel(f) for f in self.dir_videos(self.resolve_dir(dir))])
@@ -632,7 +696,7 @@ class Videos(r.BaseJobExecutor):
         self.video_runner()
         p.nav(("Index", self.link(self.part_index), "Videos im Hauptverzeichnis"),
               ("Browse", self.link(self.part_browse), "Verzeichnisse durchsuchen"),
-              ("Videos", self.video_link(), "Video-Editor mit Upload"),
+              ("Videos", self.link(self.part_videos), "Alle bisher in Index und Browse gefundenen Videos"),
               active=active)
 
     FEED_CSS = (".nxfeed { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }"
@@ -692,7 +756,18 @@ class Videos(r.BaseJobExecutor):
         if not os.path.isdir(self.path):
             p.div("Verzeichnis nicht gefunden: " + w.s(self.path), style='color: #c33;')
             return
-        self.part_feed(p, self.dir_videos(self.path), params)
+        videos = self.dir_videos(self.path)
+        self.remember(videos)
+        self.part_feed(p, videos, params)
+
+    def part_videos(self, p: base.Page, params={}):
+        self.nav(p, "Videos")
+        videos = self.found_videos()
+        p.div(f"{len(videos)} Videos, die in Index und Browse gefunden wurden (Ordner werden erst beim Öffnen "
+              "über Browse gelesen). " + w.a("Video hochladen", self.video_link(),
+                                            hint="Video-Editor ohne Video öffnen: Upload eines eigenen Videos"),
+              style='margin-bottom: 10px;')
+        self.part_feed(p, videos, params)
 
     def part_browse(self, p: base.Page, params={}):
         self.nav(p, "Browse")
@@ -728,6 +803,7 @@ class Videos(r.BaseJobExecutor):
                     continue
                 st = e.stat()
                 rows.append({'name': e.name, 'kind': kind, 'path': e.path, 'size': st.st_size, 'mtime': st.st_mtime})
+        self.remember(r['path'] for r in rows if r['kind'] == 'Video')
         return sorted(rows, key=lambda r: (r['kind'] != 'Verzeichnis', r['name'].lower()))
 
     def thumb_link(self, path: str) -> str:

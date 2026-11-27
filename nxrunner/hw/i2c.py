@@ -3,6 +3,7 @@ from nwebclient import base as b
 from nwebclient import util as u
 from nwebclient import dev as d
 from nwebclient import web as w
+from nwebclient.runner import op
 
 
 class I2CBase(r.BaseJobExecutor):
@@ -378,3 +379,282 @@ class AS5600(I2CBase):
             jobdef='#a_def',
             var='#a_var'
         )))
+
+
+class FS3000(r.BaseJobExecutor):
+    """
+      Renesas FS3000 Luftstromsensor (12 Bit, I2C-Adresse 0x28 an Bus 1).
+      Varianten: 1005 (0 - 7,23 m/s) und 1015 (0 - 15 m/s), Rohwerte 409 (0 m/s) bis 3686 (Endwert).
+      op=read [samples]              Luftgeschwindigkeit (m/s, km/h, mph) und Rohwert, gemittelt
+      op=set_range range             Variante 1005 oder 1015 setzen
+      op=setaction jobdef var        alle 0,5 s einen Job mit der Geschwindigkeit (m/s) in var ausfuehren
+    """
+
+    MODULES = ["smbus2"]
+
+    FS3000_ADDR = 0x28
+
+    RAW_MIN = 409
+    RAW_MAX = 3686
+
+    # Kennlinien laut Datenblatt (Rohwert -> m/s)
+    CURVES = {
+        "1005": ([409, 915, 1522, 2066, 2523, 2908, 3256, 3572, 3686],
+                 [0.0, 1.07, 2.01, 3.0, 3.97, 4.96, 5.98, 6.99, 7.23]),
+        "1015": ([409, 1203, 1597, 1908, 2187, 2400, 2629, 2801, 3006, 3178, 3309, 3563, 3686],
+                 [0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 13.0, 15.0])
+    }
+
+    def __init__(self, bus=1, range="1005", address=FS3000_ADDR):
+        super().__init__("fs3000")
+        from smbus2 import SMBus
+
+        self.bus = SMBus(int(bus))
+        self.address = int(address)
+        self.range = str(range) if str(range) in self.CURVES else "1005"
+        self.ticker = None
+        self.jobdef = None
+        self.jobdef_var_name = None
+        self.last = None
+        import threading
+        self.flow_channel = None
+        self.flow_thread = None
+        self.flow_lock = threading.Lock()
+        self.flow_wanted = 0
+
+    # ------------------------------------------------------------------
+    # low level
+    # ------------------------------------------------------------------
+
+    def read_frame(self):
+        """ 5 Byte: Checksumme, Daten High, Daten Low, generische Checksumme, generische Daten """
+        from smbus2 import i2c_msg
+        msg = i2c_msg.read(self.address, 5)
+        self.bus.i2c_rdwr(msg)
+        return list(msg)
+
+    @staticmethod
+    def check_frame(frame):
+        """ Summe aller 5 Byte muss (mod 256) 0 ergeben """
+        return (sum(frame) & 0xFF) == 0
+
+    def read_raw(self):
+        frame = self.read_frame()
+        if not self.check_frame(frame):
+            raise ValueError(f"FS3000 Checksumme falsch: {frame}")
+        return ((frame[1] << 8) | frame[2]) & 0x0FFF
+
+    def read_raw_avg(self, samples=1):
+        import time
+        values = []
+        for i in range(max(1, int(samples))):
+            values.append(self.read_raw())
+            if i + 1 < samples:
+                time.sleep(0.01)
+        return sum(values) / len(values)
+
+    # ------------------------------------------------------------------
+    # umrechnung
+    # ------------------------------------------------------------------
+
+    def raw_to_mps(self, raw):
+        xs, ys = self.CURVES[self.range]
+        if raw <= xs[0]:
+            return 0.0
+        if raw >= xs[-1]:
+            return ys[-1]
+        for i in range(1, len(xs)):
+            if raw <= xs[i]:
+                t = (raw - xs[i - 1]) / (xs[i] - xs[i - 1])
+                return ys[i - 1] + t * (ys[i] - ys[i - 1])
+        return ys[-1]
+
+    def get_mps(self, samples=1):
+        return self.raw_to_mps(self.read_raw_avg(samples))
+
+    def measure(self, samples=1):
+        raw = self.read_raw_avg(samples)
+        mps = self.raw_to_mps(raw)
+        self.last = {
+            "raw": round(raw, 1),
+            "mps": round(mps, 3),
+            "kmh": round(mps * 3.6, 2),
+            "mph": round(mps * 2.23694, 2),
+            "range": self.range,
+            "max_mps": self.CURVES[self.range][1][-1]
+        }
+        return self.last
+
+    # ------------------------------------------------------------------
+    # operations
+    # ------------------------------------------------------------------
+
+    @op("Luftgeschwindigkeit (mps, kmh, mph) und Rohwert, gemittelt ueber samples Messungen",
+        result={'success': 'bool', 'message': 'str', 'raw': 'float', 'mps': 'float', 'kmh': 'float',
+                'mph': 'float', 'range': 'str', 'max_mps': 'float'})
+    def read(self, samples: int = 5):
+        try:
+            return self.success(**self.measure(int(samples)))
+        except Exception as e:
+            return self.fail(str(e))
+
+    @op("Variante setzen: 1005 (0 - 7,23 m/s) oder 1015 (0 - 15 m/s)",
+        result={'success': 'bool', 'message': 'str'})
+    def set_range(self, range: str = "1005"):
+        range = str(range)
+        if range not in self.CURVES:
+            return self.fail(f"Unbekannte Variante {range}, erlaubt: {', '.join(self.CURVES)}")
+        self.range = range
+        return self.success(f"Variante {range}", ui_reload=True)
+
+    @op("Alle 0,5 s den Job jobdef mit der Geschwindigkeit (m/s) in var ausfuehren",
+        result={'success': 'bool', 'message': 'str'})
+    def setaction(self, jobdef: str, var: str):
+        self.jobdef = u.load_to_dict(jobdef)
+        self.jobdef_var_name = var
+        if self.ticker is None:
+            self.ticker = self.periodic(0.5, self.tick)
+        return self.success()
+
+    def tick(self):
+        if self.jobdef is not None:
+            data = {self.jobdef_var_name: round(self.get_mps(3), 3), **self.jobdef}
+            self.owner().execute(data)
+
+    # ------------------------------------------------------------------
+    # html ui
+    # ------------------------------------------------------------------
+
+    def part_index(self, p: b.Page, params={}):
+        try:
+            m = self.measure(5)
+            p.ul([
+                f"Geschwindigkeit: {m['mps']:.2f} m/s ({m['kmh']:.1f} km/h)",
+                f"Rohwert: {m['raw']} ({self.RAW_MIN} - {self.RAW_MAX})",
+                f"Variante: FS3000-{m['range']} (max. {m['max_mps']} m/s)",
+                f"I2C-Adresse: 0x{self.address:02X}"
+            ])
+        except Exception as e:
+            p(f"Fehler beim Lesen: {e}")
+        for rng in self.CURVES:
+            p(self.action_btn(dict(type=self.type, op='set_range', range=rng),
+                              label=f"FS3000-{rng}", hint=f"Kennlinie der Variante FS3000-{rng} verwenden"))
+        p.ul([
+            w.a("Aktualisieren", self.link(self.part_index)),
+            w.a("Bind", self.link(self.part_bind)),
+            w.a("Anzeige", self.dispatcher_link(self.page_flow),
+                hint="Vollbild-Anzeige nur mit dem Flow-Wert, live per SSE")
+        ])
+
+    def part_bind(self, p: b.Page, params={}):
+        p("Set Actions")
+        p("Luftgeschwindigkeit (m/s)")
+        p.form_input("Jobdef", "f_def")
+        p.form_input("Varname", "f_var")
+        p(self.action_btn_parametric("Bind", dict(
+            type=self.type,
+            op='setaction',
+            jobdef='#f_def',
+            var='#f_var'
+        ), hint="Job alle 0,5 s mit der aktuellen Geschwindigkeit ausfuehren"))
+
+    # ------------------------------------------------------------------
+    # flow-anzeige (SSE)
+    # ------------------------------------------------------------------
+
+    FLOW_INTERVAL = 0.5
+
+    FLOW_CSS = """
+        :root { --bg: #fff; --fg: #111; --muted: #777; --ok: #2a9d4b; --err: #d43a2a; }
+        @media (prefers-color-scheme: dark) { :root { --bg: #000; --fg: #eee; --muted: #888; } }
+        html, body { height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+               font-family: system-ui, sans-serif; font-variant-numeric: tabular-nums;
+               -webkit-user-select: none; user-select: none; }
+        #flow_value { font-size: min(34vw, 45vh); font-weight: 700; line-height: 1; }
+        #flow_unit { font-size: min(8vw, 10vh); color: var(--muted); }
+        #flow_sub { font-size: min(5vw, 6vh); color: var(--muted); margin-top: 2vh; }
+        #flow_state { position: fixed; top: 12px; right: 12px; width: 14px; height: 14px;
+                      border-radius: 50%; background: var(--err); }
+        #flow_state.ok { background: var(--ok); }
+        #flow_back { position: fixed; top: 8px; left: 12px; padding: 4px 6px; font-size: 15px;
+                     color: var(--muted); text-decoration: none; opacity: .6; }
+        #flow_back:hover, #flow_back:focus { opacity: 1; }
+        body.stale #flow_value { opacity: .35; }
+    """
+
+    def page_flow(self, params={}):
+        """ Vollbild-Seite nur mit dem Flow-Wert, Aktualisierung per SSE (page_flow_stream) """
+        p = b.Page(owner=self)
+        p['title'] = "FS3000 Flow"
+        p.add_meta('<meta name="theme-color" content="#000">')
+        p('<style>' + self.FLOW_CSS + '</style>')
+        p(w.a("&#8249; Zurück", self.dispatcher_link(self.part_index), hint="Zurück zur FS3000-Seite")
+          .replace('<a ', '<a id="flow_back" ', 1))
+        p('<div id="flow_state" title="Verbindung zum Sensor"></div>')
+        p('<div id="flow_value">-</div>')
+        p('<div id="flow_unit">m/s</div>')
+        p('<div id="flow_sub">&nbsp;</div>')
+        p('<script>' + self._flow_js(self.dispatcher_link(self.page_flow_stream)) + '</script>')
+        return p.render('blank_page')
+
+    @staticmethod
+    def _flow_js(url: str) -> str:
+        import json
+        return """
+          var val = document.getElementById('flow_value'), sub = document.getElementById('flow_sub');
+          var state = document.getElementById('flow_state');
+          var es = new EventSource(""" + json.dumps(url) + """);
+          es.onopen = function() { state.className = 'ok'; };
+          es.onerror = function() { state.className = ''; document.body.classList.add('stale'); };
+          es.addEventListener('flow', function(e) {
+            var d = JSON.parse(e.data);
+            document.body.classList.remove('stale');
+            state.className = 'ok';
+            val.textContent = d.mps.toFixed(2);
+            sub.textContent = d.kmh.toFixed(1) + ' km/h';
+          });
+          es.addEventListener('error_msg', function(e) {
+            document.body.classList.add('stale');
+            state.className = '';
+            sub.textContent = JSON.parse(e.data);
+          });
+        """
+
+    def page_flow_stream(self, params={}):
+        """ SSE-Stream mit den Ereignissen flow (Messwerte) und error_msg (Lesefehler) """
+        self.start_flow_publisher()
+        first = [('flow', self.last)] if self.last else []
+        return self.flow_channel.response(first_events=first)
+
+    def start_flow_publisher(self):
+        import threading
+        import time
+        from nwebclient.sse import SseChannel
+        with self.flow_lock:
+            self.flow_wanted = time.time()
+            if self.flow_channel is None:
+                self.flow_channel = SseChannel(max_queue=20)
+            if self.flow_thread is None:
+                self.flow_thread = threading.Thread(target=self.flow_loop, daemon=True, name='fs3000_flow')
+                self.flow_thread.start()
+
+    def flow_loop(self):
+        """ misst, solange Clients verbunden sind bzw. kuerzlich einer angefragt hat (Neuverbinden) """
+        import time
+        while True:
+            with self.flow_lock:
+                if self.flow_channel.client_count > 0:
+                    self.flow_wanted = time.time()
+                elif time.time() - self.flow_wanted > 10:
+                    self.flow_thread = None
+                    return
+            if self.flow_channel.client_count > 0:
+                self.publish_flow()
+            time.sleep(self.FLOW_INTERVAL)
+
+    def publish_flow(self):
+        try:
+            self.flow_channel.publish('flow', self.measure(3))
+        except Exception as e:
+            self.flow_channel.publish('error_msg', str(e))

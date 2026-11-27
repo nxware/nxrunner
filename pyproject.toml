@@ -1,7 +1,7 @@
 [project]
 name = "nxrunner"
 description = "Backup System"
-version = "1.0.9"
+version = "1.0.10"
 requires-python = ">=3.10"
 dependencies = ["nwebclient", "waitress", "flask"]
 
@@ -38,6 +38,7 @@ trello = "nxrunner.apis:Trello"
 audio_convert = "nxrunner.audio:Convert"
 joystick = "nxrunner.hw.i2c:JoystickM5"
 as5600 = "nxrunner.hw.i2c:AS5600"
+fs3000 = "nxrunner.hw.i2c:FS3000"
 elrs_display = "nxrunner.hw.elrs:ElrsDisplay"
 nweb_jobs = "nxrunner.jobstore:NWebJobRunner"
 direct_job_store = "nxrunner.jobstore:DirectJobStore"
@@ -58,7 +59,7 @@ nimbot_b1 = "nxrunner.devices.nimbot:NimbotB1"
 dashboard_cyd = "nxrunner.devices:DashboardCYD"
 m5_multi = "nxrunner.devices.esp_m5:EspM5"
 esp_home = "nxrunner.devices.esphome:EspHome"
-meshtastic = "nxrunner.devices.meshtastic:MeshtasticBot"
+mb = "nxrunner.devices.meshtastic:MeshtasticBot"
 crowpanel = "nxrunner.devices.epaper:EspEPaperDashboard"
 
 network_manager = "nxrunner.network.networkmanager:NetworkManager"

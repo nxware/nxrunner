@@ -23,6 +23,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `nfile` | `nxrunner.system:NFile` | Dateien von Laufwerken indexieren und durchsuchen | |
 | `backup` | `nxrunner.system:Backup` | Inkrementelle Backups aus Quellen in Ziele | (`paramiko`, `smbprotocol`) |
 | `crypt` | `nxrunner.system:CryptRunner` | Verschlüsselte Jobs (Fernet) entschlüsseln und ausführen | `cryptography` |
+| `mb` | `nxrunner.devices.meshtastic:MeshtasticBot` | Meshtastic-Knoten, verschlüsselte Jobs über das Mesh ([Meshtastic.md](Meshtastic.md)) | `meshtastic` |
 | `log` | `nxrunner.system:LogFoundation` | Logs entgegennehmen (Job, SSH, MQTT, Befehl) und darstellen | (`paho-mqtt`) |
 | `smb` | `nxrunner.fs:Smb` | Zugriff auf SMB-/Windows-Freigaben | `smbprotocol` |
 | `mongo` | `nxrunner.db.mongo:MongoDB` | MongoDB: einfügen, suchen, Dateien sammeln | `pymongo` |
@@ -31,6 +32,7 @@ Registrierte Runner (Entry-Points `nweb_runner` in `pyproject.toml`, ladbar übe
 | `m5_multi` | `nxrunner.devices.esp_m5:EspM5` | M5StickS3 mit Firmware esp_m5_multi (Werte und Aktionen) | `requests` |
 | `nimbot_b1` | `nxrunner.devices.nimbot:NimbotB1` | Etikettendrucker Niimbot B1 per Bluetooth | `pillow`, `bleak` |
 | `joystick` | `nxrunner.hw.i2c:JoystickM5` | M5Stack Joystick 2 per I2C | `smbus2` |
+| `fs3000` | `nxrunner.hw.i2c:FS3000` | Renesas FS3000 Luftstromsensor per I2C | `smbus2` |
 | `elrs_display` | `nxrunner.hw.elrs:ElrsDisplay` | Kanalwerte eines ExpressLRS-Empfängers, Bindings auf Jobs | |
 | `audio_convert` | `nxrunner.audio:Convert` | WAV nach MP3 konvertieren | `pydub` (+ ffmpeg) |
 | `pihole_api` | `nxrunner.apis:PiHoleApi` | Statistik eines Pi-hole 6 | `pihole6api` |
@@ -423,6 +425,20 @@ M5Stack Joystick 2 (Unit, I2C-Adresse `0x63` an Bus 1): Achsen, Taster und RGB-L
 | `op=read` | X/Y (8 und 16 Bit), Taster (0 = gedrückt), Firmware, Adresse |
 | `op=rgb r g b` | Farbe der LED setzen |
 | `op=setaction jobdef x_var` | alle 0,5 s einen Job mit dem X-Wert in `x_var` ausführen |
+
+### FS3000
+
+`nxrunner.hw.i2c:FS3000(bus=1, range="1005")`, type `fs3000`, benötigt `smbus2`
+
+Renesas FS3000 Luftstromsensor (I2C-Adresse `0x28`). Varianten `1005` (0 - 7,23 m/s) und `1015` (0 - 15 m/s).
+
+| Job | Beschreibung |
+|---|---|
+| `op=read [samples=5]` | Geschwindigkeit `mps`, `kmh`, `mph` und Rohwert `raw`, gemittelt |
+| `op=set_range range` | Kennlinie `1005` oder `1015` wählen |
+| `op=setaction jobdef var` | alle 0,5 s einen Job mit der Geschwindigkeit (m/s) in `var` ausführen |
+
+Seite `page_flow`: Vollbild-Anzeige nur mit dem Flow-Wert (auch mobil), aktualisiert sich alle 0,5 s per SSE (`page_flow_stream`, Ereignisse `flow` und `error_msg`). Gemessen wird nur, solange eine Anzeige verbunden ist.
 
 ### ElrsDisplay
 
