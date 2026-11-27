@@ -111,5 +111,68 @@ class DbBrowserTest(unittest.TestCase):
         self.assertIn('delete_row', str(p))
 
 
+class FakeDB:
+    """ wie nweb.DB: haelt die Verbindung in connection, hat dml und cursor, aber kein commit/rollback """
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def cursor(self):
+        return self.connection.cursor()
+
+    def dml(self, sql, vals=[]):
+        self.connection.dml(sql, vals) if isinstance(self.connection, FakeDB) else self.connection.execute(sql, vals)
+
+
+class FakeRoot:
+    def __init__(self, nweb):
+        self.nweb = nweb
+
+
+class DbBrowserNwebTest(unittest.TestCase):
+
+    def browser(self, nweb):
+        db = DbBrowser(':nweb:')
+        db.getRoot = lambda: FakeRoot(nweb)
+        return db
+
+    def test_nweb_connection(self):
+        conn = create_db()
+        db = self.browser(FakeDB(conn))
+        self.assertIs(db.conn, conn)
+        self.assertEqual(db.dialect.name, 'sqlite')
+        self.assertIn('person', db.table_names())
+
+    def test_nweb_nested_db(self):
+        """ NWeb(cfg, DB(...)): connection ist selbst ein DB-Objekt """
+        conn = create_db()
+        self.assertIs(self.browser(FakeDB(FakeDB(conn))).conn, conn)
+
+    def test_dialect_probe_sqlite(self):
+        """ unbekannte Connection-Klasse (Wrapper um sqlite3): Erkennung per sqlite_master """
+        conn = create_db()
+
+        class WrappedConn:
+            def cursor(self):
+                return conn.cursor()
+
+            def commit(self):
+                conn.commit()
+
+            def rollback(self):
+                conn.rollback()
+
+        db = DbBrowser(WrappedConn())
+        self.assertEqual(db.dialect.name, 'sqlite')
+        self.assertEqual(db.dialect.paramstyle, 'qmark')
+        self.assertIn('person', db.table_names())
+
+    def test_nweb_missing(self):
+        db = self.browser(None)
+        with self.assertRaises(RuntimeError):
+            db.list_objects()
+        self.assertFalse(db.sql('SELECT 1')['success'])
+
+
 if __name__ == '__main__':
     unittest.main()

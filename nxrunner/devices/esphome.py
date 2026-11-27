@@ -33,6 +33,8 @@ from nwebclient import util as u
 from nwebclient import web as w
 from nwebclient import dev as d
 
+from nxrunner.system import is_wsl
+
 
 def load_esphome_yaml(yml_file_path: str | Path) -> dict:
     """
@@ -207,10 +209,7 @@ class EspHome(r.BaseJobExecutor):
 
     @staticmethod
     def is_wsl() -> bool:
-        try:
-            return 'microsoft' in Path('/proc/version').read_text().lower()
-        except OSError:
-            return False
+        return is_wsl()
 
     @staticmethod
     def local_ip() -> str:

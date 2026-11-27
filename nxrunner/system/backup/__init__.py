@@ -14,9 +14,11 @@ from nwebclient import util as u
 
 from nxrunner.system.backup.sources import SOURCES, create_source
 from nxrunner.system.backup.destinations import DESTINATIONS, create_destination
+from nxrunner.db.nwebtable import NwebTableMixin
+from nxrunner.system.progress_js import POLL_STATUS_JS
 
 
-class Backup(r.BaseJobExecutor):
+class Backup(NwebTableMixin, r.BaseJobExecutor):
     """
       Backup-System aus Quellen und Zielen, gespeichert in der nweb-Persistence (Arg DB).
 
@@ -75,7 +77,6 @@ class Backup(r.BaseJobExecutor):
 
     def __init__(self, type='backup', check_interval=60):
         super().__init__(type)
-        self.tables_created = False
         self.run_thread = None
         self.status = {}
         self.nfile = None
@@ -105,15 +106,7 @@ class Backup(r.BaseJobExecutor):
 
     # --- nweb-Persistence ---
 
-    def nweb(self):
-        nw = getattr(self.getRoot(), 'nweb', None)
-        if nw is None:
-            raise RuntimeError('nweb-Persistence nicht verfuegbar (Arg DB setzen)')
-        if not self.tables_created:
-            self.create_tables(nw)
-        return nw
-
-    def create_tables(self, nw):
+    def create_table(self, nw):
         nw.dml("""CREATE TABLE IF NOT EXISTS backup_source (
             source_id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind varchar(32) NOT NULL,
@@ -190,7 +183,6 @@ class Backup(r.BaseJobExecutor):
             message text DEFAULT NULL
         )""")
         nw.dml("CREATE INDEX IF NOT EXISTS backup_run_source ON backup_run (source_id, started)")
-        self.tables_created = True
 
     @staticmethod
     def add_column(nw, table, column_ddl):
@@ -481,7 +473,7 @@ class Backup(r.BaseJobExecutor):
 
     def run_due(self):
         """ Vom Scheduler aufgerufen, sichert alle faelligen Ziele von Quellen, die erreichbar sind """
-        if getattr(self.getRoot(), 'nweb', None) is None or self.is_running():
+        if not self.nweb_available() or self.is_running():
             return []
         nw = self.nweb()
         now = int(time.time())
@@ -1372,8 +1364,7 @@ class Backup(r.BaseJobExecutor):
 
     def js_progress(self):
         """ JS-Handler: fragt per op=status den Fortschritt ab, bis das Backup fertig ist """
-        return """
-        var backup_timer = null;
+        return POLL_STATUS_JS + self.js_progress_render() + """
         var backup_type = %s;
         var backup_cancel_requested = false;
         function backup_cancel(btn) {
@@ -1384,54 +1375,52 @@ class Backup(r.BaseJobExecutor):
         }
         function backup_progress(result) {
           if (result && result.success === false) { show_error(result); return; }
-          if (backup_timer !== null) return;
-          var poll = function() {
-            exec_job({type: backup_type, op: 'status'}, function(s) {
-              var $p = document.getElementById('backup_progress');
-              if ($p === null) { clearInterval(backup_timer); backup_timer = null; return; }
-              var v = s.value || {};
-              // aufgeklappte Fehler bleiben beim Aktualisieren offen
-              var opened = [].map.call($p.querySelectorAll('details[open] summary'), function(e) { return e.textContent; });
-              $p.innerHTML = '';
-              if (v.state) {
-                var row = document.createElement('div');
-                var text = ' ' + v.source + ' -> ' + v.destination + ': ' + v.state + ', ' + v.count + ' Dateien, '
-                  + v.copied + ' kopiert, ' + v.skipped + ' unverändert, ' + v.failed + ' Fehler';
-                if (v.elapsed !== undefined) text += ', ' + v.elapsed + ' s';
-                if (v.duration !== undefined) text += ', ' + v.duration + ' s';
-                if (v.current) text += ', ' + v.current;
-                if (v.message) text += ' - ' + v.message;
-                row.textContent = text;
-                if (v.state === 'running') row.prepend(document.createElement('progress'));
-                $p.appendChild(row);
-                (v.errors || []).forEach(function(e) {
-                  // aufklappbar: Datei und Meldung, darunter errno/Dateinamen und Traceback
-                  var err = document.createElement('details');
-                  var summary = document.createElement('summary');
-                  summary.textContent = (e.file ? e.file + ': ' : '') + e.error;
-                  var pre = document.createElement('pre');
-                  pre.textContent = ['errno', 'filename', 'filename2'].filter(function(k) { return e[k] !== undefined; })
-                    .map(function(k) { return k + ': ' + e[k] + '\\n'; }).join('') + (e.trace || '');
-                  err.open = opened.indexOf(summary.textContent) >= 0;
-                  err.appendChild(summary);
-                  err.appendChild(pre);
-                  $p.appendChild(err);
-                });
-              }
-              if (s.running) {
-                var btn = document.createElement('button');
-                btn.textContent = backup_cancel_requested ? 'Wird abgebrochen …' : 'Abbrechen';
-                btn.disabled = backup_cancel_requested;
-                btn.onclick = function() { backup_cancel(btn); };
-                $p.appendChild(btn);
-              }
-              if (!s.running) {
-                clearInterval(backup_timer); backup_timer = null;
-                setTimeout(function() { location.reload(); }, 2000);
-              }
-            });
-          };
-          backup_timer = setInterval(poll, 1000);
-          poll();
+          nx_poll_status(backup_type, 'backup_progress', backup_render, 2000);
         }
         """ % json.dumps(self.type)
+
+    @staticmethod
+    def js_progress_render():
+        """ JS: Status-Zeile, aufklappbare Fehler und Abbrechen-Button in das Element $p schreiben """
+        return """
+        function backup_render($p, s) {
+          var v = s.value || {};
+          // aufgeklappte Fehler bleiben beim Aktualisieren offen
+          var opened = [].map.call($p.querySelectorAll('details[open] summary'), function(e) { return e.textContent; });
+          $p.innerHTML = '';
+          if (v.state) {
+            var row = document.createElement('div');
+            var text = ' ' + v.source + ' -> ' + v.destination + ': ' + v.state + ', ' + v.count + ' Dateien, '
+              + v.copied + ' kopiert, ' + v.skipped + ' unverändert, ' + v.failed + ' Fehler';
+            if (v.elapsed !== undefined) text += ', ' + v.elapsed + ' s';
+            if (v.duration !== undefined) text += ', ' + v.duration + ' s';
+            if (v.current) text += ', ' + v.current;
+            if (v.message) text += ' - ' + v.message;
+            row.textContent = text;
+            if (v.state === 'running') row.prepend(document.createElement('progress'));
+            $p.appendChild(row);
+            (v.errors || []).forEach(function(e) { $p.appendChild(backup_error_details(e, opened)); });
+          }
+          if (s.running) {
+            var btn = document.createElement('button');
+            btn.textContent = backup_cancel_requested ? 'Wird abgebrochen …' : 'Abbrechen';
+            btn.disabled = backup_cancel_requested;
+            btn.title = 'Laufendes Backup abbrechen';
+            btn.onclick = function() { backup_cancel(btn); };
+            $p.appendChild(btn);
+          }
+        }
+        function backup_error_details(e, opened) {
+          // aufklappbar: Datei und Meldung, darunter errno/Dateinamen und Traceback
+          var err = document.createElement('details');
+          var summary = document.createElement('summary');
+          summary.textContent = (e.file ? e.file + ': ' : '') + e.error;
+          var pre = document.createElement('pre');
+          pre.textContent = ['errno', 'filename', 'filename2'].filter(function(k) { return e[k] !== undefined; })
+            .map(function(k) { return k + ': ' + e[k] + '\\n'; }).join('') + (e.trace || '');
+          err.open = opened.indexOf(summary.textContent) >= 0;
+          err.appendChild(summary);
+          err.appendChild(pre);
+          return err;
+        }
+        """

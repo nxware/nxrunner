@@ -5,7 +5,31 @@ from nwebclient import dev as d
 from nwebclient import web as w
 
 
-class JoystickM5(r.BaseJobExecutor):
+class I2CBase(r.BaseJobExecutor):
+    """
+      Basis fuer I2C-Geraete an einem SMBus: Bus oeffnen, Register-Bloecke lesen und schreiben.
+      Unterklassen setzen ADDR (7-Bit-Adresse des Geraets).
+    """
+    # TODO mit nxbot abgleichen
+
+    MODULES = ["smbus2"]
+
+    ADDR = None
+
+    def __init__(self, type, bus=1):
+        super().__init__(type)
+        from smbus2 import SMBus
+
+        self.bus = SMBus(int(bus))
+
+    def read_bytes(self, reg, length):
+        return self.bus.read_i2c_block_data(self.ADDR, reg, length)
+
+    def write_bytes(self, reg, data):
+        self.bus.write_i2c_block_data(self.ADDR, reg, data)
+
+
+class JoystickM5(I2CBase):
     """
       M5Stack Joystick 2 (Unit, I2C-Adresse 0x63 an Bus 1): Achsen, Taster und RGB-LED.
       op=read                        X/Y (8 und 16 Bit), Taster (0 = gedrueckt), Firmware, Adresse
@@ -13,9 +37,7 @@ class JoystickM5(r.BaseJobExecutor):
       op=setaction jobdef x_var      alle 0,5 s einen Job mit dem X-Wert in x_var ausfuehren
     """
 
-    MODULES = ["smbus2"]
-
-    JOYSTICK_ADDR = 0x63
+    JOYSTICK_ADDR = ADDR = 0x63
 
     JOYSTICK2_ADC_VALUE_12BITS_REG = 0x00
     JOYSTICK2_ADC_VALUE_8BITS_REG = 0x10
@@ -30,9 +52,6 @@ class JoystickM5(r.BaseJobExecutor):
 
     def __init__(self):
         super().__init__("joystick")
-        from smbus2 import SMBus
-
-        self.bus = SMBus(1)
         self.ticker = None
         self.jobdef = None
         self.jobdef_x_name = None
@@ -53,24 +72,6 @@ class JoystickM5(r.BaseJobExecutor):
             d.PStr("x_var")
         ).set_description("Alle 0,5 s den Job jobdef mit dem X-Wert (8 Bit) in x_var ausfuehren").r(
             success='bool', message='str')
-
-    # ------------------------------------------------------------------
-    # low level
-    # ------------------------------------------------------------------
-
-    def read_bytes(self, reg, length):
-        return self.bus.read_i2c_block_data(
-            self.JOYSTICK_ADDR,
-            reg,
-            length
-        )
-
-    def write_bytes(self, reg, data):
-        self.bus.write_i2c_block_data(
-            self.JOYSTICK_ADDR,
-            reg,
-            data
-        )
 
     # ------------------------------------------------------------------
     # joystick values
@@ -226,7 +227,7 @@ class JoystickM5(r.BaseJobExecutor):
         )))
 
 
-class AS5600(r.BaseJobExecutor):
+class AS5600(I2CBase):
     """
       AS5600 Magnet-Drehwinkelsensor (12 Bit, I2C-Adresse 0x36 an Bus 1).
       op=read                        Winkel (roh, skaliert, Grad), Magnetstatus, AGC, Magnitude
@@ -234,9 +235,7 @@ class AS5600(r.BaseJobExecutor):
       op=setaction jobdef var        alle 0,5 s einen Job mit dem Winkel (Grad) in var ausfuehren
     """
 
-    MODULES = ["smbus2"]
-
-    AS5600_ADDR = 0x36
+    AS5600_ADDR = ADDR = 0x36
 
     AS5600_ZMCO_REG = 0x00
     AS5600_ZPOS_REG = 0x01
@@ -254,34 +253,13 @@ class AS5600(r.BaseJobExecutor):
     STATUS_MD = 0x20  # Magnet erkannt
 
     def __init__(self, bus=1):
-        super().__init__("as5600")
-        from smbus2 import SMBus
-
-        self.bus = SMBus(int(bus))
+        super().__init__("as5600", bus)
         self.ticker = None
         self.jobdef = None
         self.jobdef_var_name = None
 
         self.define_sig(d.PStr("op", "read"))
         self.define_sig(d.PStr("op", "setzero"))
-
-    # ------------------------------------------------------------------
-    # low level
-    # ------------------------------------------------------------------
-
-    def read_bytes(self, reg, length):
-        return self.bus.read_i2c_block_data(
-            self.AS5600_ADDR,
-            reg,
-            length
-        )
-
-    def write_bytes(self, reg, data):
-        self.bus.write_i2c_block_data(
-            self.AS5600_ADDR,
-            reg,
-            data
-        )
 
     def read_12bit(self, reg):
         data = self.read_bytes(reg, 2)

@@ -14,9 +14,11 @@ from nwebclient import dev as d
 
 
 from nxrunner.system import Wsl
+from nxrunner.db.nwebtable import NwebTableMixin
+from nxrunner.system.progress_js import POLL_STATUS_JS
 
 
-class NFile(r.BaseJobExecutor):
+class NFile(NwebTableMixin, r.BaseJobExecutor):
     """
       Indexiert die Dateien von Laufwerken in der Tabelle nfile der nweb-Persistence.
 
@@ -57,7 +59,6 @@ class NFile(r.BaseJobExecutor):
     def __init__(self, type='nfile', search_limit=200):
         super().__init__(type)
         self.search_limit = int(search_limit)
-        self.table_created = False
         self.index_thread = None
         self.index_status = {}
         self.volume_cache = None  # (zeitpunkt, volumes)
@@ -86,14 +87,6 @@ class NFile(r.BaseJobExecutor):
 
     # --- nweb-Persistence ---
 
-    def nweb(self):
-        nw = getattr(self.getRoot(), 'nweb', None)
-        if nw is None:
-            raise RuntimeError('nweb-Persistence nicht verfuegbar (Arg DB setzen)')
-        if not self.table_created:
-            self.create_table(nw)
-        return nw
-
     def create_table(self, nw):
         nw.dml(f"""CREATE TABLE IF NOT EXISTS {self.TABLE} (
             nfile_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +99,6 @@ class NFile(r.BaseJobExecutor):
         )""")
         nw.dml(f"CREATE INDEX IF NOT EXISTS {self.TABLE}_name ON {self.TABLE} (name)")
         nw.dml(f"CREATE INDEX IF NOT EXISTS {self.TABLE}_drive ON {self.TABLE} (drive)")
-        self.table_created = True
 
     @staticmethod
     def sql(nw, sql):
@@ -116,15 +108,8 @@ class NFile(r.BaseJobExecutor):
     # --- Laufwerke ---
 
     def wsl(self) -> Wsl:
-        d = self.getParentClass(r.LazyDispatcher)
-        if d is not None:
-            runners = d.byTag('wsl')
-            if len(runners) > 0:
-                return runners[0]
-            runner = d.get_runner('wsl')
-            if isinstance(runner, Wsl):
-                return runner
-        return Wsl()
+        """ Wsl-Runner des Dispatchers (Tag wsl), sonst eine eigene Instanz """
+        return Wsl.of(self)
 
     @staticmethod
     def read_drive_name(mountpoint):
@@ -580,42 +565,31 @@ class NFile(r.BaseJobExecutor):
 
     def js_progress(self):
         """ JS-Handler: fragt per op=status den Fortschritt ab, bis die Indexierung fertig ist """
-        return """
-        var nfile_timer = null;
+        return POLL_STATUS_JS + """
+        function nfile_render($p, s) {
+          $p.innerHTML = '';
+          Object.keys(s.value || {}).forEach(function(name) {
+            var v = s.value[name];
+            var row = document.createElement('div');
+            var text = ' ' + name + (v.path ? '/' + v.path : '') + ': ' + v.state;
+            if (v.count !== undefined) text += ', ' + v.count + ' Dateien';
+            if (v.state === 'running' && v.expected > 0) text += ' (ca. ' + Math.min(99, Math.round(100 * v.count / v.expected)) + '%% von ' + v.expected + ')';
+            if (v.elapsed !== undefined) text += ', ' + v.elapsed + ' s';
+            if (v.duration !== undefined) text += ', ' + v.duration + ' s';
+            if (v.state === 'running' && v.dir) text += ', ' + v.dir;
+            if (v.message) text += ', ' + v.message;
+            row.textContent = text;
+            if (v.state === 'running') {
+              var bar = document.createElement('progress');
+              if (v.expected > 0) { bar.max = v.expected; bar.value = Math.min(v.count, v.expected); }
+              row.prepend(bar);
+            }
+            $p.appendChild(row);
+          });
+        }
         function nfile_progress(result) {
           if (result && result.success === false) { show_error(result); return; }
-          if (nfile_timer !== null) return;
-          var poll = function() {
-            exec_job({type: %s, op: 'status'}, function(s) {
-              var $p = document.getElementById('nfile_progress');
-              if ($p === null) { clearInterval(nfile_timer); nfile_timer = null; return; }
-              $p.innerHTML = '';
-              Object.keys(s.value || {}).forEach(function(name) {
-                var v = s.value[name];
-                var row = document.createElement('div');
-                var text = ' ' + name + (v.path ? '/' + v.path : '') + ': ' + v.state;
-                if (v.count !== undefined) text += ', ' + v.count + ' Dateien';
-                if (v.state === 'running' && v.expected > 0) text += ' (ca. ' + Math.min(99, Math.round(100 * v.count / v.expected)) + '%% von ' + v.expected + ')';
-                if (v.elapsed !== undefined) text += ', ' + v.elapsed + ' s';
-                if (v.duration !== undefined) text += ', ' + v.duration + ' s';
-                if (v.state === 'running' && v.dir) text += ', ' + v.dir;
-                if (v.message) text += ', ' + v.message;
-                row.textContent = text;
-                if (v.state === 'running') {
-                  var bar = document.createElement('progress');
-                  if (v.expected > 0) { bar.max = v.expected; bar.value = Math.min(v.count, v.expected); }
-                  row.prepend(bar);
-                }
-                $p.appendChild(row);
-              });
-              if (!s.running) {
-                clearInterval(nfile_timer); nfile_timer = null;
-                setTimeout(function() { location.reload(); }, 1500);
-              }
-            });
-          };
-          nfile_timer = setInterval(poll, 1000);
-          poll();
+          nx_poll_status(%s, 'nfile_progress', nfile_render, 1500);
         }
         """ % json.dumps(self.type)
 

@@ -13,6 +13,7 @@ from nwebclient import dev as d
 from nwebclient.runner import op
 
 from nxrunner.jobstore import RemoteJobMixin
+from nxrunner.db.nwebtable import NwebTableMixin
 
 
 class Smb(r.BaseJobExecutor):
@@ -260,7 +261,7 @@ class Browse(r.BaseJobExecutor, BrowseView):
         return send_file(path, as_attachment=True, download_name=os.path.basename(path))
 
 
-class BrowseRemote(r.BaseJobExecutor, RemoteJobMixin, BrowseView):
+class BrowseRemote(NwebTableMixin, r.BaseJobExecutor, RemoteJobMixin, BrowseView):
     """
       Browse einer anderen Instanz ueber einen Job-Speicher (wie RemoteRunner): Verzeichnisse (listdir) und
       Dateiinfos (fileinfo) werden als Job an den Browse-Runner remote_type auf target gesendet.
@@ -284,6 +285,7 @@ class BrowseRemote(r.BaseJobExecutor, RemoteJobMixin, BrowseView):
 
     TAGS = ['remote']
     TABLE = 'browse_remote_job'
+    NWEB_REQUIRED = False  # ohne Persistence nur im Speicher
     REMOTE_ARGS = {'listdir': 'dir', 'fileinfo': 'file'}
 
     def __init__(self, type='browse_remote', target='', store='mongodb', remote_type='browse', poll_interval=10,
@@ -300,7 +302,6 @@ class BrowseRemote(r.BaseJobExecutor, RemoteJobMixin, BrowseView):
         self.requests = {}  # (op, arg) -> letzte Anfrage {guid, op, arg, status, sent, done, result}
         self.done = {}      # (op, arg) -> letzte erfolgreiche Anfrage (bleibt beim Aktualisieren sichtbar)
         self.loaded = False
-        self.table_created = False
         self.define_vars('target', 'store', 'remote_type')
 
     def set_target(self, value):
@@ -312,16 +313,6 @@ class BrowseRemote(r.BaseJobExecutor, RemoteJobMixin, BrowseView):
             self.loaded = False
 
     # --- nweb-Persistence (Tabelle browse_remote_job) ----------------------------------------
-
-    def nweb(self):
-        """ nweb-Persistence oder None (dann nur im Speicher) """
-        root = self.getRoot()
-        nw = getattr(root, 'nweb', None) if root is not None else None
-        if nw is None or not hasattr(nw, 'dml'):
-            return None
-        if not self.table_created:
-            self.create_table(nw)
-        return nw
 
     def create_table(self, nw):
         nw.dml(f"""CREATE TABLE IF NOT EXISTS {self.TABLE} (
@@ -336,7 +327,6 @@ class BrowseRemote(r.BaseJobExecutor, RemoteJobMixin, BrowseView):
             result TEXT
         )""")
         nw.dml(f"CREATE INDEX IF NOT EXISTS {self.TABLE}_rt ON {self.TABLE} (runner, target)")
-        self.table_created = True
 
     def save_entry(self, e: dict):
         """ unter remote_lock: Anfrage speichern, bei Abschluss aeltere abgeschlossene zu (op, arg) entfernen """

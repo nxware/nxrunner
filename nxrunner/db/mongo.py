@@ -166,9 +166,31 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
     def execute_jobs(self, data=dict()):
         count = 0
         for job in self.find('nweb', 'jobs', sort='ts'):
-            if self.process_job(job):
-                count += 1
+            try:
+                if self.process_job(job):
+                    count += 1
+            except Exception as e:
+                self.error(f"MongoDB Job {job.get('_id')} fehlgeschlagen: {type(e).__name__}: {e}")
         return self.success(count=count, ui_reload=True)
+
+    def job_log_str(self, job_data: dict, max_len: int = 200) -> str:
+        """ Kurzform eines Jobs fuers Log, verschluesselte Jobs ohne Inhalt """
+        if job_data.get('type') == 'crypt':
+            return 'crypt'
+        s = json.dumps(job_data, default=str)
+        return s if len(s) <= max_len else s[:max_len] + '...'
+
+    def result_log_str(self, result, crypted: bool = False) -> str:
+        """
+          Ergebnis fuers Log: success immer mit Wert, sonst nur die Schluessel.
+          Bei verschluesselten Jobs nur success, damit nichts vom Inhalt im Log landet.
+        """
+        if not isinstance(result, dict):
+            return type(result).__name__
+        parts = [f"success={result.get('success')}"] if crypted or 'success' in result else []
+        if not crypted:
+            parts += [str(k) for k in result.keys() if k != 'success']
+        return ', '.join(parts)
 
     def execute_collect_files(self, data: dict):
         db = data.get('db', 'nweb')
@@ -211,7 +233,9 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
         job_data = {k: v for k, v in job.items() if k not in ('_id', 'target', 'ts')}
         crypted = job_data.get('type') == 'crypt'
         if executor.canExecute(job_data):
+            self.info(f"MongoDB Job {job['_id']}: {self.job_log_str(job_data)}")
             result = executor.execute(job_data)
+            self.info(f"MongoDB Job {job['_id']} Ergebnis: {self.result_log_str(result, crypted)}")
             self.delete_one('nweb', 'jobs', dict(_id=job['_id']))
             if not isinstance(result, dict):
                 result = dict(result=result)
@@ -225,6 +249,7 @@ class MongoDB(r.BaseJobExecutor, JobStoreMixin):
                 result['guid'] = job['guid']
             self.insert_one('nweb', 'results', result)
             return True
+        self.info(f"MongoDB Job {job['_id']} nicht ausfuehrbar, bleibt liegen: {self.job_log_str(job_data)}")
         return False
 
     def bson_safe(self, value):

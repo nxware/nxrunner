@@ -1,5 +1,4 @@
 
-import functools
 import io
 import os
 import re
@@ -13,7 +12,7 @@ from nwebclient import dev as d
 from nwebclient import NWebClient
 from nwebclient import NWebGroup
 
-from nxrunner.system import Wsl
+from nxrunner.system import Wsl, is_wsl
 
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')
@@ -80,15 +79,6 @@ LIGHTBOX_JS = '''
   window.nwdLightbox = true;
 })();
 '''
-
-
-@functools.lru_cache(maxsize=1)
-def is_wsl():
-    try:
-        with open('/proc/version') as f:
-            return 'microsoft' in f.read().lower()
-    except OSError:
-        return False
 
 
 def file_url(path) -> str:
@@ -259,15 +249,7 @@ class NWebDir(r.BaseJobExecutor):
 
     def wsl(self) -> Wsl:
         """ Wsl-Runner des Dispatchers (Tag wsl), sonst eine eigene Instanz """
-        disp = self.getParentClass(r.LazyDispatcher)
-        if disp is not None:
-            runners = disp.byTag('wsl')
-            if len(runners) > 0:
-                return runners[0]
-            runner = disp.get_runner('wsl')
-            if isinstance(runner, Wsl):
-                return runner
-        return Wsl()
+        return Wsl.of(self)
 
     def sync_deleted(self):
         """

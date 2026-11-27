@@ -5,6 +5,7 @@
     DbBrowser('sqlite:///pfad/x.db')            # auch 'x.db' oder ':memory:'
     DbBrowser('postgresql://user:pw@host:5432/db')   # psycopg2 bzw. psycopg
     DbBrowser('mysql://user:pw@host:3306/db')        # pymysql
+    DbBrowser(':nweb:')                              # nweb-Persistence des Root-Runners (Arg DB)
 
   Seiten: SQL ausfuehren, DB-Objekte (Tabellen, Views, ...), Tabelle mit Struktur und Daten als Grid,
   Datensaetze anlegen, bearbeiten und loeschen.
@@ -25,8 +26,11 @@ from nwebclient import util as u
 from nwebclient import web as w
 from nwebclient.runner import op
 
+from nxrunner.db.nwebtable import root_nweb, dbapi_connection
+
 NULL_TOKEN = '\\N'
 ROWID = '__rowid__'
+NWEB_CONNECTION = ':nweb:'
 
 
 def connect(connection_str: str):
@@ -57,19 +61,51 @@ def connect(connection_str: str):
 class Dialect:
     """ Unterschiede der Datenbanken: Parameter-Stil, Quoting und Metadaten """
 
+    MODULE_NAMES = {'sqlite3': 'sqlite', 'pymysql': 'mysql', 'MySQLdb': 'mysql', 'mysql': 'mysql',
+                    'psycopg2': 'postgres', 'psycopg': 'postgres', 'pg8000': 'postgres'}
+    PARAMSTYLES = {'sqlite': 'qmark', 'mysql': 'format', 'postgres': 'pyformat'}
+
     def __init__(self, conn):
         self.conn = conn
-        module = type(conn).__module__.split('.')[0]
-        self.module = module
-        self.paramstyle = getattr(sys.modules.get(module), 'paramstyle', 'qmark')
-        if module == 'sqlite3':
-            self.name = 'sqlite'
-        elif module in ('pymysql', 'MySQLdb', 'mysql'):
-            self.name = 'mysql'
-        elif module in ('psycopg2', 'psycopg', 'pg8000'):
-            self.name = 'postgres'
-        else:
-            self.name = 'generic'
+        self.module = type(conn).__module__.split('.')[0]
+        self.name = self.detect_name()
+        default = self.PARAMSTYLES.get(self.name, 'qmark')
+        self.paramstyle = getattr(sys.modules.get(self.module), 'paramstyle', default)
+
+    def detect_name(self) -> str:
+        """ Datenbank anhand der Connection-Klasse, sonst durch Abfragen erkennen """
+        import sqlite3
+        if isinstance(self.conn, sqlite3.Connection):
+            return 'sqlite'
+        if self.module in self.MODULE_NAMES:
+            return self.MODULE_NAMES[self.module]
+        if self.probe("SELECT name FROM sqlite_master LIMIT 1"):
+            return 'sqlite'
+        if self.probe("SELECT DATABASE()"):
+            return 'mysql'
+        if self.probe("SELECT current_schema()"):
+            return 'postgres'
+        return 'generic'
+
+    def probe(self, sql: str) -> bool:
+        """ True, wenn sql fehlerfrei ausgefuehrt werden kann (Fehler werden zurueckgerollt) """
+        try:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(sql)
+                cur.fetchall()
+                return True
+            finally:
+                cur.close()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return False
+
+    def describe(self) -> str:
+        return f"{self.name} ({type(self.conn).__module__}.{type(self.conn).__name__}, {self.paramstyle})"
 
     def quote(self, ident: str) -> str:
         if self.name == 'mysql':
@@ -125,7 +161,8 @@ class Dialect:
 class DbBrowser(r.BaseJobExecutor):
     """
       Zeigt DB-Objekte und Tabellen (Struktur und Daten), fuehrt SQL aus, bearbeitet Datensaetze.
-      :param connection: DB-API-2.0-Connection oder Connection-String (siehe connect)
+      :param connection: DB-API-2.0-Connection, Connection-String (siehe connect) oder ':nweb:' fuer die
+                         nweb-Persistence des Root-Runners (wird erst beim ersten Zugriff aufgeloest)
     """
 
     def __init__(self, connection=None, type='dbbrowser', args: u.Args = None, page_size: int = 100):
@@ -133,12 +170,34 @@ class DbBrowser(r.BaseJobExecutor):
         if connection is None:
             connection = (args or u.Args()).get('db_url', ':memory:')
         self.connection_str = connection if isinstance(connection, str) else None
-        self.conn = connect(connection) if isinstance(connection, str) else connection
-        self.dialect = Dialect(self.conn)
+        if connection == NWEB_CONNECTION:
+            self._conn = None  # Root-Runner ist erst nach dem Laden bekannt
+        else:
+            self._conn = connect(connection) if isinstance(connection, str) else connection
+        self._dialect = None
         self.page_size = page_size
         self.define_row_sigs()
 
     # --- Datenbank -----------------------------------------------------------------------------------
+
+    @property
+    def conn(self):
+        if self._conn is None:
+            self._conn = self.nweb_connection()
+        return self._conn
+
+    @property
+    def dialect(self) -> Dialect:
+        if self._dialect is None:
+            self._dialect = Dialect(self.conn)
+        return self._dialect
+
+    def nweb_connection(self):
+        """ DB-API-Verbindung der nweb-Persistence des Root-Runners """
+        conn = dbapi_connection(root_nweb(self))
+        if conn is None:
+            raise RuntimeError('nweb-Persistence nicht verfuegbar (Arg DB setzen)')
+        return conn
 
     def query(self, sql: str, params=None, limit: int = None):
         """ :return: (columns, rows, rowcount), columns ist leer bei Anweisungen ohne Ergebnis """
@@ -376,7 +435,14 @@ class DbBrowser(r.BaseJobExecutor):
             if params.get('sql'):
                 self.ui_sql_result(p, params['sql'])
         with p.section(h="Objekte"):
+            self.ui_dialect(p)
             self.ui_objects(p)
+
+    def ui_dialect(self, p: b.Page):
+        try:
+            p.prop("Datenbank", w.escape(self.dialect.describe()))
+        except Exception as e:
+            p.div("Error: " + w.escape(str(e)), _class='error')
 
     def ui_sql_form(self, p: b.Page, sql: str):
         p(f'<form method="get" action="">')

@@ -1,3 +1,4 @@
+import functools
 import os
 import re
 import shutil
@@ -7,6 +8,16 @@ from nwebclient import runner as r
 from nwebclient import base as b
 from nwebclient import web as w
 from nwebclient import dev as d
+
+
+@functools.lru_cache(maxsize=1)
+def is_wsl() -> bool:
+    """ True, wenn der Prozess in der WSL laeuft (/proc/version enthaelt microsoft) """
+    try:
+        with open('/proc/version') as f:
+            return 'microsoft' in f.read().lower()
+    except OSError:
+        return False
 
 
 class Wsl(r.BaseJobExecutor):
@@ -52,11 +63,20 @@ class Wsl(r.BaseJobExecutor):
 
     @staticmethod
     def is_wsl():
-        try:
-            with open('/proc/version') as f:
-                return 'microsoft' in f.read().lower()
-        except OSError:
-            return False
+        return is_wsl()
+
+    @classmethod
+    def of(cls, runner) -> 'Wsl':
+        """ Wsl-Runner des Dispatchers von runner (Tag wsl bzw. Typ wsl), sonst eine eigene Instanz """
+        disp = runner.getParentClass(r.LazyDispatcher)
+        if disp is not None:
+            runners = disp.byTag('wsl')
+            if len(runners) > 0:
+                return runners[0]
+            found = disp.get_runner('wsl')
+            if isinstance(found, cls):
+                return found
+        return cls()
 
     @staticmethod
     def windows_exe(name):

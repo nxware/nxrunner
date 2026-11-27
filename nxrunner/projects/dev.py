@@ -1,5 +1,7 @@
 """
-  python -m nxbot.dev ci jobname
+  python -m nxrunner.projects.dev ci jobname
+
+  (verschoben aus nxbot.dev)
 
   before Python 3.10 install tomli
 """
@@ -803,7 +805,7 @@ class Projects(r.BaseJobExecutor):
 
     @staticmethod
     def docker():
-        from nxbot.linux import Docker
+        from nxrunner.linux import Docker
         return Docker()
 
     @op("Startet einen CodeServer (openvscode-server im Docker) mit allen Projekten aus nweb.json:repos "
@@ -1387,7 +1389,7 @@ class ProjectDir(r.BaseJobExecutor):
 
     def part_codeserver(self, p: base.Page, params={}):
         p.h1("CodeServer")
-        from nxbot.linux import Docker
+        from nxrunner.linux import Docker
         d = Docker()
         port = int(params.get('port', 3000))
         name = 'dev' + self.type
