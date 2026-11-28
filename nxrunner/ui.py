@@ -89,6 +89,41 @@ class NxRunner(McpSystem, r.AutoDispatcher):
             self.error('Favoriten: ' + str(e))
             return None
 
+    def execute_runners(self, data):
+        """ geladene und konfigurierte Runner als [{name, cls, loaded}] (z.B. fuer nxrunner tui) """
+        loaded = self.instances
+        runners = [{'name': name, 'cls': type(runner).__name__, 'loaded': True} for name, runner in loaded.items()]
+        runners += [{'name': name, 'cls': str(cls), 'loaded': False}
+                    for name, cls in self.classes.items() if name not in loaded]
+        return self.success('ok', runners=sorted(runners, key=lambda x: x['name']))
+
+    def terminal_runner(self, data):
+        """ Runner zu data['runner'] fuer die TerminalPage-Ops oder None """
+        name = str(data.get('runner', '')).strip()
+        return self.get_runner(name) if name and name in self.entries else None
+
+    def execute_parts(self, data):
+        """ op=parts runner=<type>: Namen der part_*-Seiten eines Runners (fuer nxrunner tui) """
+        from nxrunner.terminal_page import part_names
+        runner = self.terminal_runner(data)
+        if runner is None:
+            return self.fail('Unbekannter Runner: ' + str(data.get('runner')))
+        return self.success('ok', parts=part_names(runner))
+
+    def execute_terminal_page(self, data):
+        """ op=terminal_page runner=<type> page=<name> [...]: part_<name> als Terminal-Text (TerminalPage) """
+        from nxrunner.terminal_page import render_part
+        runner = self.terminal_runner(data)
+        if runner is None:
+            return self.fail('Unbekannter Runner: ' + str(data.get('runner')))
+        name = str(data.get('page', 'index'))
+        params = {k: v for k, v in data.items() if k not in ('op', 'runner', 'page')}
+        params.update({self.key: data['runner'], data['runner']: name})
+        try:
+            return render_part(runner, name, params)
+        except Exception as e:
+            return self.fail(f'Fehler in part_{name}: {e}')
+
     def ui_data(self):
         instances = [{'name': name, 'cls': type(runner).__name__} for name, runner in self.instances.items()]
         classes = [{'name': name, 'cls': str(cls)} for name, cls in self.classes.items() if name not in self.instances]

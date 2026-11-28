@@ -905,7 +905,79 @@ class SshBot(BaseJobExecutor):
 
     # ------------------------------------------------------------------- UI
 
+    def nav(self, p: b.Page, active=None):
+        """ obere Navigation, active = Titel der aktuellen Seite """
+        p.nav(("Index", self.link(self.part_index), "Verbinden und Übersicht"),
+              ("Config", self.link(self.part_config), "Hosts aus ~/.ssh/config"),
+              ("Verbindung", self.link(self.part_connection), "Installationsschritte und Terminal"),
+              ("Output", self.link(self.part_output), "Gesamte Konsolenausgabe"),
+              ("Status", self.link(self.part_status), "Installierte Tools auf dem entfernten System"),
+              ("Pakete", self.link(self.part_sysinfo), "Installierte Pakete auf dem entfernten System"),
+              active=active)
+
+    @staticmethod
+    def parse_ssh_config(text: str) -> list:
+        """ Bloecke der SSH-Konfiguration [(patterns, {option: wert})], Optionen klein, erster Wert gilt """
+        blocks = []
+        current = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, _, value = line.replace('=', ' ', 1).partition(' ')
+            key, value = key.lower(), value.strip().strip('"')
+            if key in ('host', 'match'):
+                current = (value.split() if key == 'host' else [], {})
+                blocks.append(current)
+            elif current is not None:
+                current[1].setdefault(key, value)
+        return blocks
+
+    @classmethod
+    def ssh_config_hosts(cls, path='~/.ssh/config') -> list:
+        """ Hosts (ohne Wildcards) aus der SSH-Konfiguration: [{host, hostname, user, port, identityfile}] """
+        file = Path(path).expanduser()
+        if not file.is_file():
+            return []
+        blocks = cls.parse_ssh_config(file.read_text(encoding='utf-8', errors='replace'))
+        defaults = {}
+        for patterns, opts in blocks:
+            if '*' in patterns:
+                for k, v in opts.items():
+                    defaults.setdefault(k, v)
+        res = []
+        for patterns, opts in blocks:
+            for name in patterns:
+                if any(c in name for c in '*?!'):
+                    continue
+                o = {**defaults, **opts}
+                res.append({'host': name, 'hostname': o.get('hostname', name), 'user': o.get('user', ''),
+                            'port': o.get('port', '22'), 'identityfile': o.get('identityfile', '')})
+        return res
+
+    def config_connect_btn(self, e):
+        params = {'host': e['host'], 'port': e['port'], 'username': e['user'] or 'pi'}
+        hint = f"Verbindet mit {params['username']}@{e['hostname']}:{e['port']} (Host {e['host']})"
+        return w.button_js("Connect", f'sshbot_connect_host({json.dumps(params)}, this);', hint=hint)
+
+    def part_config(self, p: b.Page, params={}):
+        self.nav(p, "Config")
+        with p.section(h="Hosts aus ~/.ssh/config"):
+            try:
+                hosts = self.ssh_config_hosts()
+            except Exception as e:
+                p(w.alert_info(f"~/.ssh/config nicht lesbar: {html.escape(str(e))}"))
+                return
+            col = w.Grid.col
+            p.grid(hosts, [col('host', "Host"), col('hostname', "HostName"), col('user', "User"),
+                           col('port', "Port"), col('identityfile', "IdentityFile"),
+                           col('actions', '', html=True, sortable=False, value=self.config_connect_btn)],
+                   params, search=True, empty="Keine Hosts in ~/.ssh/config")
+            p('<div id="sshbot_connect_msg" style="color:#c0392b; white-space:pre-wrap"></div>')
+            p.script(self.JS_CONNECT.replace('__TYPE__', self.type))
+
     def part_index(self, p: b.Page, params={}):
+        self.nav(p, "Index")
         with p.section(h="SSH Bot"):
             p.p("Mit dem SshBot kann man ein Linux System per SSH einrichten.")
             if self.is_connected():
@@ -945,6 +1017,7 @@ class SshBot(BaseJobExecutor):
             ])
 
     def part_connection(self, p: b.Page, params={}):
+        self.nav(p, "Verbindung")
         if not self.is_connected():
             p.h1("SSH Bot")
             p.div("Keine Verbindung. " + w.a("Verbinden &raquo;", self.link('index')))
@@ -982,6 +1055,7 @@ class SshBot(BaseJobExecutor):
         p.script('window.SSHBOT_CFG = ' + json.dumps(cfg) + ';' + self.JS_CONNECTION)
 
     def part_status(self, p: b.Page, params={}):
+        self.nav(p, "Status")
         p.p("Gibt an welches Tool auf dem entfernten System installiert ist")
         if not self.is_connected():
             p.div("Keine Verbindung.")
@@ -991,6 +1065,7 @@ class SshBot(BaseJobExecutor):
         p.pre(html.escape(self.run_for_stdout('ls -1 ~/dev')))
 
     def part_sysinfo(self, p: b.Page, params={}):
+        self.nav(p, "Pakete")
         if not self.is_connected():
             p.div("Keine Verbindung.")
             return
@@ -998,22 +1073,19 @@ class SshBot(BaseJobExecutor):
             p.prop(pkg, self.is_installed(pkg))
 
     def part_debug(self, p: b.Page, params={}):
+        self.nav(p)
         p.h2("Docker")
         p("TODO start container")
 
     def part_output(self, p: b.Page, params={}):
+        self.nav(p, "Output")
         p.h1("SSH Output")
         p.pre(html.escape(self._console.text()))
 
     JS_CONNECT = """
-    function sshbot_connect(ev) {
-      ev.preventDefault();
-      const form = ev.target;
-      const msg = document.getElementById('sshbot_connect_msg');
-      const data = new URLSearchParams(new FormData(form));
+    function sshbot_do_connect(data, btn, msg) {
       data.set('type', '__TYPE__');
       data.set('op', 'connect');
-      const btn = form.querySelector('button');
       btn.disabled = true; msg.style.color = ''; msg.textContent = 'Verbinde ...';
       fetch(location.protocol + '//' + location.host + '/', {method: 'POST', body: data})
         .then(r => r.json()).then(res => {
@@ -1021,7 +1093,16 @@ class SshBot(BaseJobExecutor):
           if (res.success && res.redirect) { location.href = res.redirect; }
           else { msg.style.color = '#c0392b'; msg.textContent = res.message || JSON.stringify(res); }
         }).catch(e => { btn.disabled = false; msg.textContent = String(e); });
+    }
+    function sshbot_connect(ev) {
+      ev.preventDefault();
+      const form = ev.target;
+      sshbot_do_connect(new URLSearchParams(new FormData(form)), form.querySelector('button'),
+                        document.getElementById('sshbot_connect_msg'));
       return false;
+    }
+    function sshbot_connect_host(params, btn) {
+      sshbot_do_connect(new URLSearchParams(params), btn, document.getElementById('sshbot_connect_msg'));
     }
     """
 

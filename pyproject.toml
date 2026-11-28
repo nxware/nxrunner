@@ -11,7 +11,7 @@ nxrunner = "nxrunner.__main__:main"
 [project.optional-dependencies]
 full = ["pymongo", "buenavista", "pihole6api", "py-trello", "pydub", "smbprotocol", "paramiko", "docker",
         "smbus2", "bleak", "pillow", "requests", "beautifulsoup4", "flask",
-        "google-api-python-client", "google-auth-oauthlib", "cryptography", "pyte"]
+        "google-api-python-client", "google-auth-oauthlib", "cryptography", "pyte", "sounddevice"]
 mongo = ["pymongo"]
 smb = ["smbprotocol"]
 ssh = ["paramiko"]
@@ -19,6 +19,8 @@ docker = ["docker"]
 google = ["google-api-python-client", "google-auth-oauthlib"]
 crypt = ["cryptography"]
 terminal = ["pyte"]
+audio = ["sounddevice"]
+tui = ["textual", "requests"]
 
 [project.urls]
 Repository = "https://github.com/nxware/nxrunner"
@@ -31,11 +33,14 @@ include = [ "nxrunner/**/*.py", "nxrunner/resources/*" ]
 
 [project.entry-points.nweb_runner]
 mongo = "nxrunner.db.mongo:MongoDB"
+dbbrowser = "nxrunner.db.browser.DbBrowser"
 smb = "nxrunner.fs:Smb"
 browse = "nxrunner.fs:Browse"
 pihole_api = "nxrunner.apis:PiHoleApi"
 trello = "nxrunner.apis:Trello"
 audio_convert = "nxrunner.audio:Convert"
+morse = "nxrunner.audio:Morse"
+morse_soundcard = "nxrunner.audio:MorseSoundcard"
 joystick = "nxrunner.hw.i2c:JoystickM5"
 as5600 = "nxrunner.hw.i2c:AS5600"
 fs3000 = "nxrunner.hw.i2c:FS3000"
@@ -75,6 +80,16 @@ scene = "nxrunner.animate:Scene"
 nwebdir = "nxrunner.nweb:NWebDir"
 google_calendar = "nxrunner.apis.google:CalendarAPI"
 website = "nxrunner.web:WebsiteController"
+
+linux = "nxrunner.linux:System"
+sshbot = "nxrunner.linux:SshBot"
+docker = "nxrunner.linux:Docker"
+stirling-pdf = "nxrunner.linux:SterlingPdf"
+selenium = "nxrunner.linux:Selenium"
+samba = "nxrunner.linux:Samba"
+usbdevices = "nxrunner.linux:USBDevices"
+wcams = "nxrunner.linux:Webcams"
+wcam = "nxrunner.linux:Webcam"
 
 [nx]
 pydeps="-xx nxrunner"

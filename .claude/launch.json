@@ -6,6 +6,24 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "nwebclient.runner", "--rest", "--port", "7171", "--executor", "nxrunner.system.terminal:Terminal"],
       "port": 7171
+    },
+    {
+      "name": "nxrunner-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "nxrunner", "serv", "--port", "7272", "--SERVER", "flask"],
+      "port": 7272
+    },
+    {
+      "name": "morse-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "nwebclient.runner", "--rest", "--port", "7373", "--executor", "nxrunner.audio:Morse"],
+      "port": 7373
+    },
+    {
+      "name": "morse-soundcard-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "nwebclient.runner", "--rest", "--port", "7374", "--executor", "nxrunner.audio:MorseSoundcard"],
+      "port": 7374
     }
   ]
 }

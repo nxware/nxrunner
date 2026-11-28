@@ -114,11 +114,23 @@ def serv():
     r.run(args, ui.NxRunner())
 
 
+def tui(args):
+    try:
+        from nxrunner import tui as t
+    except ModuleNotFoundError as e:
+        print(f"Modul fehlt: {e.name} -> pip install nxrunner[tui]")
+        return
+    t.main(args)
+
+
 def help():
     print("Usage:")
     print("")
     print("  nxrunner serv            (oder: python -m nxrunner serv)")
     print("        [--host] [--port] [--web_secured 1 --web_password_hash --web_user]")
+    print("  nxrunner tui             Terminal-Oberflaeche fuer einen laufenden nxrunner (REST)")
+    print("        [--url http://localhost:7070 | --host --port] [--user --password]")
+    print("        (oder NXRUNNER_URL, NXRUNNER_USER, NXRUNNER_PASSWORD)")
     print("  nxrunner deps")
     print("  nxrunner install pkg")
     print("")
@@ -136,6 +148,8 @@ def main():
             deps_for_pkg("nxrunner")
         case "serv":
             serv()
+        case "tui":
+            tui(args)
         case 'install':
             install(args.shift('nxrunner'))
         case 'install_deps':

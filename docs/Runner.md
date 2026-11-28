@@ -529,7 +529,7 @@ Variablen: `port`, `host`, `timeout`
 
 ### Deployments
 
-`nxrunner.projects:Deployments(type='deployments', ssh='ssh', connect_timeout=5, timeout=60, update_timeout=600)`
+`nxrunner.projects:Deployments(type='deployments', ssh='ssh', connect_timeout=5, timeout=60, update_timeout=600, send_to=None)`
 
 Git-Checkouts auf entfernten Rechnern. Die Deployments stehen im Arg `deployment` (ein Eintrag oder eine Liste):
 
@@ -549,8 +549,9 @@ Upstream-Branch. Der Status wird, wenn vorhanden, in der nweb-Persistence (Setti
 gespeichert; für offline Geräte (v.a. `mobile`) zeigt das Grid den letzten bekannten Stand mit „offline“.
 
 Die Seite **Hosts** zeigt je SSH-Host der Deployments die Ausgaben der Befehle aus dem Arg `hostinfo`
-(alle Befehle in einem SSH-Aufruf je Host). Die Werte werden mit Zeitstempel im Setting `deployments.host.<sshhost>`
-gespeichert und bleiben sichtbar, wenn der Host offline ist (Tooltip „Stand …“ je Wert):
+(alle Befehle in einem SSH-Aufruf je Host). Die Hosts stehen in der Tabelle `deployment_hosts` der
+nweb-Persistence (ohne Persistence nur im Speicher); die Werte werden dort mit Zeitstempel gespeichert und
+bleiben sichtbar, wenn der Host offline ist (Tooltip „Stand …“ je Wert):
 
 ```yaml
 hostinfo:
@@ -565,6 +566,13 @@ hostinfo:
 | `op=check [name]` | ein bzw. alle Deployments mit origin vergleichen |
 | `op=update name` | `git pull` und danach `update_cmd` im Verzeichnis `path` ausführen, anschließend prüfen |
 | `op=hostinfo [host]` | Host-Infos (Arg `hostinfo`) eines bzw. aller SSH-Hosts abfragen und speichern |
+| `op=send [url] [host] [ssh] [remote_type]` | Diesen Rechner bei der Deployments-Instanz unter `url` (Standard `send_to`) als mobilen Host eintragen |
+| `op=add_host host [ssh] [mobile]` | Host in `deployment_hosts` eintragen/aktualisieren (Gegenstück zu `send`) |
+| `op=remove_host host` | Eingetragenen Host entfernen |
+
+Neben den SSH-Hosts der Deployments zeigt die Seite **Hosts** die per `send` eingetragenen Rechner (Badge
+„gesendet“, SSH-Ziel `<benutzer>@<IP>`). Mit `send_to='http://server:7070/'` sendet sich der Runner 2 s nach dem
+Start selbst, z.B. als Runner unter `networks` des nxbot-NetworkBot, sobald das Heimnetz verbunden ist.
 
 ---
 

@@ -20,23 +20,33 @@ Deployments: Git-Checkouts auf entfernten Rechnern per SSH pruefen und aktualisi
           python_version: python -V
           df: df -h / | tail -n 1
 
+    Hosts senden: send(url) traegt diesen Rechner bei der Deployments-Instanz unter url als mobilen Host ein
+    (op add_host), z.B. automatisch beim Start: nxrunner.projects:Deployments(send_to='http://server:7070/')
+
     Job:
         {"type": "deployments", "op": "check", "name": "raspi5-nwebclient"}
         {"type": "deployments", "op": "update", "name": "raspi5-nwebclient"}
         {"type": "deployments", "op": "hostinfo", "host": "raspi5"}
+        {"type": "deployments", "op": "send", "url": "http://server:7070/"}
+        {"type": "deployments", "op": "add_host", "host": "handy", "ssh": "pi@10.0.0.5", "mobile": 1}
 
 Der Status (Version lokal/origin) wird, wenn vorhanden, in der nweb-Persistence (Setting deployments.status.<name>)
-gespeichert, ebenso die Host-Infos mit Zeitstempel (Setting deployments.host.<sshhost>), sodass bei mobilen Geraeten, die gerade offline sind, der letzte bekannte Stand angezeigt wird.
+gespeichert. Hosts (gesendete Eintraege und Host-Infos mit Zeitstempel) stehen in der Tabelle deployment_hosts,
+sodass bei mobilen Geraeten, die gerade offline sind, der letzte bekannte Stand angezeigt wird.
 SSH laeuft mit BatchMode (Schluessel/Agent noetig, keine Passwortabfrage).
 """
 import concurrent.futures
+import getpass
 import html
 import json
 import posixpath
 import shlex
+import socket
 import subprocess
+import threading
 import time
 
+from nwebclient import nx
 from nwebclient import runner as r
 from nwebclient import base
 from nwebclient import util as u
@@ -83,6 +93,103 @@ class Deployment:
                 'mobile': self.mobile}
 
 
+class HostDB:
+    """
+    Tabelle deployment_hosts der nweb-Persistence des JobRunners, ohne Persistence nur im Speicher.
+
+    Spalten: host (Name), ssh (Ziel fuer ssh, leer = host), mobile, remote (per send/add_host eingetragen),
+    info (JSON der Host-Infos), updated (Zeitstempel)
+    """
+    TABLE = 'deployment_hosts'
+    COLUMNS = ('host', 'ssh', 'mobile', 'remote', 'info', 'updated')
+
+    def __init__(self, owner: r.BaseJobExecutor):
+        self.owner = owner
+        self.table_created = False
+        self.mem = {}
+        self.lock = threading.RLock()
+
+    def nweb(self):
+        """ nweb-Persistence des JobRunners oder None, legt beim ersten Zugriff die Tabelle an """
+        root = self.owner.getRoot()
+        nw = getattr(root, 'nweb', None) if root is not None and root is not self.owner else None
+        if nw is None or not hasattr(nw, 'dml') or not hasattr(nw, 'select'):
+            return None
+        if not self.table_created:
+            try:
+                nw.dml(f"""CREATE TABLE IF NOT EXISTS {self.TABLE} (
+                    host VARCHAR(128) NOT NULL PRIMARY KEY,
+                    ssh VARCHAR(255) DEFAULT NULL,
+                    mobile INTEGER DEFAULT 0,
+                    remote INTEGER DEFAULT 0,
+                    info TEXT DEFAULT NULL,
+                    updated INTEGER DEFAULT NULL
+                )""")
+                self.table_created = True
+            except Exception as e:
+                self.owner.error(f"Tabelle {self.TABLE}: {e}")
+                return None
+        return nw
+
+    def available(self) -> bool:
+        return self.nweb() is not None
+
+    @classmethod
+    def to_row(cls, values) -> dict:
+        row = dict(zip(cls.COLUMNS, values))
+        try:
+            row['info'] = json.loads(row['info']) if row.get('info') else {}
+        except ValueError:
+            row['info'] = {}
+        row['mobile'] = bool(row.get('mobile'))
+        row['remote'] = bool(row.get('remote'))
+        return row
+
+    def all(self) -> list:
+        nw = self.nweb()
+        if nw is None:
+            with self.lock:
+                return [dict(row) for row in self.mem.values()]
+        rows = nw.select(f"SELECT {', '.join(self.COLUMNS)} FROM {self.TABLE} ORDER BY host")
+        return [self.to_row(row) for row in rows]
+
+    def get(self, host) -> dict:
+        nw = self.nweb()
+        if nw is None:
+            with self.lock:
+                return dict(self.mem.get(host) or {})
+        rows = nw.select(f"SELECT {', '.join(self.COLUMNS)} FROM {self.TABLE} WHERE host = ?", [host])
+        return self.to_row(rows[0]) if rows else {}
+
+    def save(self, host, **values):
+        """ Legt den Host an oder aendert die uebergebenen Spalten (ssh, mobile, remote, info) """
+        values['updated'] = int(time.time())
+        with self.lock:
+            nw = self.nweb()
+            if nw is None:
+                row = self.mem.setdefault(host, {'host': host, 'ssh': None, 'mobile': False, 'remote': False,
+                                                 'info': {}, 'updated': None})
+                row.update(values)
+                return
+            db_values = {k: (json.dumps(v) if k == 'info' else int(v) if isinstance(v, bool) else v)
+                         for k, v in values.items()}
+            cols = list(db_values)
+            if nw.select(f"SELECT host FROM {self.TABLE} WHERE host = ?", [host]):
+                nw.dml(f"UPDATE {self.TABLE} SET {', '.join(c + ' = ?' for c in cols)} WHERE host = ?",
+                       [db_values[c] for c in cols] + [host])
+            else:
+                nw.dml(f"INSERT INTO {self.TABLE} (host, {', '.join(cols)}) VALUES ({', '.join(['?'] * (len(cols) + 1))})",
+                       [host] + [db_values[c] for c in cols])
+
+    def delete(self, host):
+        with self.lock:
+            nw = self.nweb()
+            if nw is None:
+                self.mem.pop(host, None)
+            else:
+                nw.dml(f"DELETE FROM {self.TABLE} WHERE host = ?", [host])
+
+
 class Deployments(r.BaseJobExecutor):
     """
       Deployments (Git-Checkouts per SSH) aus dem Arg 'deployment': Version mit origin vergleichen, aktualisieren
@@ -104,7 +211,12 @@ class Deployments(r.BaseJobExecutor):
                      'echo "SUBJECT=$(git log -1 --format=%s)"; '
                      'echo "DATE=$(git log -1 --format=%cI)"')
 
-    def __init__(self, type='deployments', ssh='ssh', connect_timeout=5, timeout=60, update_timeout=600):
+    def __init__(self, type='deployments', ssh='ssh', connect_timeout=5, timeout=60, update_timeout=600,
+                 send_to=None):
+        """
+        :param send_to: URL einer anderen Instanz, bei deren Deployments sich dieser Rechner beim Start
+                        als mobiler Host eintraegt (siehe send)
+        """
         super().__init__(type)
         self.ssh_bin = ssh
         self.connect_timeout = int(connect_timeout)
@@ -113,7 +225,11 @@ class Deployments(r.BaseJobExecutor):
         self.status_cache = {}
         self.last_output = ''
         self.last_cmd = ''
+        self.hostdb = HostDB(self)
+        self.send_to = send_to
         self.define_vars('connect_timeout', 'timeout', 'update_timeout')
+        if send_to:
+            self.delayed(2, lambda: self.send(send_to))
 
     # ------------------------------------------------------------------
     # Konfiguration
@@ -150,10 +266,27 @@ class Deployments(r.BaseJobExecutor):
         raise KeyError(f"Deployment {name} nicht gefunden")
 
     def hosts(self) -> dict:
-        """ SSH-Hosts der Deployments {sshhost: mobile}, mobil wenn eines der Deployments mobil ist """
+        """
+        Hosts {name: {'host', 'ssh', 'mobile', 'remote'}}: SSH-Hosts der Deployments (mobil, wenn eines der
+        Deployments mobil ist) und die per send/add_host eingetragenen Hosts der Tabelle
+        """
         res = {}
         for dep in self.deployments():
-            res[dep.sshhost] = res.get(dep.sshhost, False) or dep.mobile
+            e = res.setdefault(dep.sshhost, {'host': dep.sshhost, 'ssh': dep.sshhost, 'mobile': False,
+                                             'remote': False})
+            e['mobile'] = e['mobile'] or dep.mobile
+        try:
+            rows = self.hostdb.all()
+        except Exception as e:
+            self.error(f"{HostDB.TABLE} lesen: {e}")
+            rows = []
+        for row in rows:
+            if not row.get('remote'):
+                continue
+            e = res.setdefault(row['host'], {'host': row['host'], 'ssh': row['host'], 'mobile': False})
+            e['ssh'] = row.get('ssh') or e['ssh']
+            e['mobile'] = e['mobile'] or row.get('mobile', False)
+            e['remote'] = True
         return res
 
     def hostinfo_cmds(self) -> dict:
@@ -190,7 +323,17 @@ class Deployments(r.BaseJobExecutor):
         self.store('status.' + name, status)
 
     def get_hostinfo(self, host) -> dict:
-        return self.load('host.' + host)
+        try:
+            return self.hostdb.get(host).get('info') or {}
+        except Exception as e:
+            self.error(f"{HostDB.TABLE} lesen: {e}")
+            return {}
+
+    def save_hostinfo(self, host, info: dict):
+        try:
+            self.hostdb.save(host, info=info)
+        except Exception as e:
+            self.error(f"{HostDB.TABLE} schreiben: {e}")
 
     # ------------------------------------------------------------------
     # SSH
@@ -269,12 +412,18 @@ class Deployments(r.BaseJobExecutor):
                 values[key].append(line)
         return {k: '\n'.join(v).strip() for k, v in values.items()}
 
-    def query_host(self, host) -> dict:
-        """ Fragt die hostinfo-Werte von host ab, bei offline bleiben die alten Werte mit ihrem Zeitstempel """
+    def query_host(self, host, ssh=None) -> dict:
+        """
+        Fragt die hostinfo-Werte von host ab, bei offline bleiben die alten Werte mit ihrem Zeitstempel
+
+        :param ssh: Ziel fuer ssh, Standard ist der Eintrag des Hosts bzw. host
+        """
+        if ssh is None:
+            ssh = (self.hosts().get(host) or {}).get('ssh') or host
         cmds = self.hostinfo_cmds()
         info = dict(self.get_hostinfo(host))
         info['checked'] = now = time.time()
-        code, out = self.ssh(host, self.hostinfo_script(cmds)) if cmds else (0, '')
+        code, out = self.ssh(ssh, self.hostinfo_script(cmds)) if cmds else (0, '')
         if code in (255, 124):
             info.update(online=False, error=out.strip())
         else:
@@ -282,12 +431,73 @@ class Deployments(r.BaseJobExecutor):
             for key, value in self.parse_hostinfo(out).items():
                 values[key] = {'value': value, 'time': now}
             info.update(online=True, error='', last_online=now, values=values)
-        self.store('host.' + host, info)
+        self.save_hostinfo(host, info)
         return info
 
     def query_hosts(self, hosts: list) -> dict:
+        entries = self.hosts()
+        targets = [(entries.get(h) or {}).get('ssh') or h for h in hosts]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            return dict(zip(hosts, pool.map(self.query_host, hosts)))
+            return dict(zip(hosts, pool.map(self.query_host, hosts, targets)))
+
+    # ------------------------------------------------------------------
+    # Hosts senden / eintragen
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def own_host_entry(host: str = '', ssh: str = '') -> dict:
+        """ Eintrag dieses Rechners: Name = Hostname, ssh = <benutzer>@<eigene IP> """
+        host = host or socket.gethostname()
+        if not ssh:
+            try:
+                user = getpass.getuser()
+            except Exception:
+                user = ''
+            ip = nx.get_ip()
+            ssh = f"{user}@{ip}" if user else ip
+        return {'host': host, 'ssh': ssh, 'mobile': 1}
+
+    @op("Diesen Rechner bei der Deployments-Instanz unter url als mobilen Host eintragen",
+        success={'host': 'dict'}, name='send')
+    def send(self, url: str = '', host: str = '', ssh: str = '', remote_type: str = 'deployments'):
+        """
+        :param url: Adresse der anderen Instanz, z.B. http://server:7070/ (leer = send_to)
+        :param host: Name des Hosts, Standard ist der Hostname
+        :param ssh: Ziel fuer ssh, Standard ist <benutzer>@<eigene IP>
+        :param remote_type: Name des Deployments-Runners auf der anderen Instanz
+        """
+        url = url or self.send_to
+        if not url:
+            return self.fail("keine url angegeben")
+        entry = self.own_host_entry(host, ssh)
+        res = r.remote(url, {'type': remote_type, 'op': 'add_host', **entry})
+        if not isinstance(res, dict) or not res.get('success'):
+            msg = (res.get('message') or res.get('error') or '') if isinstance(res, dict) else str(res)
+            self.error(f"send an {url} fehlgeschlagen: {msg}")
+            return self.fail(f"Senden an {url} fehlgeschlagen: {msg}", host=entry)
+        self.info(f"Host {entry['host']} ({entry['ssh']}) an {url} gesendet")
+        return self.success(f"{entry['host']} an {url} gesendet", host=entry)
+
+    @op("Host eintragen bzw. aktualisieren (wird von send einer anderen Instanz aufgerufen)",
+        success={'host': 'dict'}, name='add_host')
+    def add_host(self, host: str = '', ssh: str = '', mobile: str = '1'):
+        """
+        :param host: Name des Hosts
+        :param ssh: Ziel fuer ssh, z.B. pi@10.0.0.5 (leer = host)
+        :param mobile: 1, wenn der Host nicht immer online ist
+        """
+        host = str(host or '').strip()
+        if not host:
+            return self.fail("host fehlt")
+        self.hostdb.save(host, ssh=str(ssh or '').strip() or None, mobile=as_bool(mobile), remote=True)
+        return self.success(f"Host {host} eingetragen", host=self.hostdb.get(host), ui_reload=True)
+
+    @op("Per send/add_host eingetragenen Host entfernen", success={}, name='remove_host')
+    def remove_host(self, host: str = ''):
+        if not self.hostdb.get(host):
+            return self.fail(f"Host {host} nicht gefunden")
+        self.hostdb.delete(host)
+        return self.success(f"Host {host} entfernt", ui_reload=True)
 
     # ------------------------------------------------------------------
     # Operationen
@@ -495,26 +705,46 @@ class Deployments(r.BaseJobExecutor):
         cmds = self.hostinfo_cmds()
         with p.section(h="Hosts"):
             if not hosts:
-                p(w.alert_info(f"Keine Hosts, Deployments im Arg '{self.ARG_KEY}' eintragen."))
-                return
-            if not cmds:
-                p(w.alert_info(f"Keine Befehle, im Arg '{self.HOSTINFO_KEY}' eintragen (schluessel: befehl)."))
-            rows = [{'host': h, 'mobile': m, 'info': self.get_hostinfo(h)} for h, m in hosts.items()]
-            p.grid(rows, self.host_cols(cmds), params, search=True)
-            p.div(self.btn("Alle abfragen", 'hostinfo', "Fragt die Host-Infos aller Hosts per SSH ab"))
+                p(w.alert_info(f"Keine Hosts, Deployments im Arg '{self.ARG_KEY}' eintragen oder von einer "
+                               f"anderen Instanz senden (op send)."))
+            else:
+                if not cmds:
+                    p(w.alert_info(f"Keine Befehle, im Arg '{self.HOSTINFO_KEY}' eintragen (schluessel: befehl)."))
+                rows = [{**e, 'info': self.get_hostinfo(h)} for h, e in hosts.items()]
+                p.grid(rows, self.host_cols(cmds), params, search=True)
+                p.div(self.btn("Alle abfragen", 'hostinfo', "Fragt die Host-Infos aller Hosts per SSH ab"))
+        with p.section(h="Diesen Host senden"):
+            p.input('url', id='deployments_send_url', value=self.send_to or '')
+            p(self.action_btn_parametric("Senden", {'type': self.type, 'op': 'send', 'url': '#deployments_send_url'}))
+            p.pre('', id='result')
 
     def host_cols(self, cmds: dict):
         col = w.Grid.col
-        cols = [col('host', "Host"), col('mobile', "Mobil", value=lambda e: 'ja' if e['mobile'] else '')]
+        cols = [col('host', "Host", html=True, value=self.col_host),
+                col('mobile', "Mobil", value=lambda e: 'ja' if e['mobile'] else '')]
         for key, cmd in cmds.items():
             cols.append(col(key, key, html=True, value=lambda e, k=key: self.col_hostvalue(e, k),
                             sort=lambda e, k=key: self.hostvalue(e, k).get('value', ''),
                             td={'title': lambda e, c=cmd: c}))
         cols += [col('checked', "Geprüft", html=True, value=self.col_host_checked,
                      sort=lambda e: e['info'].get('checked') or 0),
-                 col('actions', '', html=True, sortable=False,
-                     value=lambda e: self.btn("Abfragen", 'hostinfo', "Host-Infos per SSH abfragen", host=e['host']))]
+                 col('actions', '', html=True, sortable=False, value=self.col_host_actions)]
         return cols
+
+    @staticmethod
+    def col_host(e):
+        res = esc(e['host'])
+        if e.get('ssh') and e['ssh'] != e['host']:
+            res += f' <small>{esc(e["ssh"])}</small>'
+        if e.get('remote'):
+            res += ' <span class="badge tag" title="Per send von einem anderen Rechner eingetragen">gesendet</span>'
+        return res
+
+    def col_host_actions(self, e):
+        res = self.btn("Abfragen", 'hostinfo', "Host-Infos per SSH abfragen", host=e['host'])
+        if e.get('remote'):
+            res += self.btn("Entfernen", 'remove_host', "Eingetragenen Host entfernen", host=e['host'])
+        return res
 
     @staticmethod
     def hostvalue(e, key) -> dict:
