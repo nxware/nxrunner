@@ -460,7 +460,7 @@ class LinkDiagnosis:
         if not wan:
             return Check("NAT", 'fail', "keine NAT-Regeln gesetzt", "Verbindung neu aufbauen (edge)")
         if self.nos.nat_backend == 'nft':
-            ok, out = self.nos.nft('list', 'table', 'ip', NFT_TABLE)
+            ok, out = self.nos.nft('list', 'table', 'ip', self.nos.nft_table)
             missing = [] if ok and 'masquerade' in out else ['masquerade']
         else:
             missing = [i for i, rule in enumerate(self.nos.nat_rules(wan)) if not self.nos.iptables(rule, '-C')[0]]
@@ -546,7 +546,91 @@ def _proc_name(pid):
         return '?'
 
 
-class NetworkOverSerial(r.BaseJobExecutor):
+class InternetSharing:
+    """
+    edge: teilt die Internetverbindung (IP-Forwarding + NAT) mit Geraeten hinter dem Interface self.ifname.
+    Erwartet self.cmd, self.wan, self.ifname, self.share_src (Quelladresse/-netz) und self.nft_table.
+    """
+
+    nat_wan = None  # Interface, fuer das NAT-Regeln gesetzt wurden
+    nat_backend = None  # iptables oder nft
+    forward_before = None  # ip_forward vor dem Start
+    nft_table = NFT_TABLE
+
+    @property
+    def share_src(self):
+        return f'{self.client_ip}/32'
+
+    def nat_rules(self, wan) -> list:
+        src = self.share_src
+        return [['-t', 'nat', '{}', 'POSTROUTING', '-s', src, '-o', wan, '-j', 'MASQUERADE'],
+                ['{}', 'FORWARD', '-i', self.ifname, '-o', wan, '-s', src, '-j', 'ACCEPT'],
+                ['{}', 'FORWARD', '-i', wan, '-o', self.ifname, '-d', src, '-m', 'conntrack',
+                 '--ctstate', 'RELATED,ESTABLISHED', '-j', 'ACCEPT']]
+
+    def iptables(self, rule, action):
+        return self.cmd.run(which('iptables') or 'iptables', '-w', *[action if a == '{}' else a for a in rule])
+
+    def nft(self, *args):
+        return self.cmd.run(which('nft') or 'nft', *args)
+
+    def nft_rules(self, wan) -> list:
+        """ eigene Tabelle, wird beim Trennen komplett geloescht """
+        t = ['ip', self.nft_table]
+        return [['add', 'table', *t],
+                ['add', 'chain', *t, 'postrouting', '{ type nat hook postrouting priority 100 ; policy accept ; }'],
+                ['add', 'rule', *t, 'postrouting', 'ip', 'saddr', self.share_src, 'oifname', wan, 'masquerade'],
+                ['add', 'chain', *t, 'forward', '{ type filter hook forward priority 0 ; policy accept ; }'],
+                ['add', 'rule', *t, 'forward', 'iifname', self.ifname, 'oifname', wan, 'accept'],
+                ['add', 'rule', *t, 'forward', 'iifname', wan, 'oifname', self.ifname,
+                 'ct', 'state', 'related,established', 'accept']]
+
+    def enable_sharing(self):
+        wan = self.wan or default_route_dev()
+        if not wan:
+            raise RuntimeError("Keine Internetverbindung (Standardroute) zum Teilen gefunden")
+        ok, out = self.cmd.run('sysctl', '-n', 'net.ipv4.ip_forward', root=False)
+        self.forward_before = out.strip() if ok else None
+        ok, out = self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=1')
+        if not ok:
+            raise RuntimeError("IP-Forwarding nicht aktivierbar: " + out)
+        self.nat_backend = nat_backend()
+        if self.nat_backend == 'iptables':
+            self.enable_iptables(wan)
+        elif self.nat_backend == 'nft':
+            self.enable_nft(wan)
+        else:
+            raise RuntimeError("Weder iptables noch nft gefunden: sudo apt install nftables (oder iptables)")
+        self.nat_wan = wan
+
+    def enable_iptables(self, wan):
+        for rule in self.nat_rules(wan):
+            if not self.iptables(rule, '-C')[0]:  # nur einmal eintragen, vorne vor evtl. DROP/REJECT-Regeln
+                ok, out = self.iptables(rule, '-I')
+                if not ok:
+                    raise RuntimeError("iptables: " + out)
+
+    def enable_nft(self, wan):
+        self.nft('delete', 'table', 'ip', self.nft_table)  # Reste eines frueheren Starts
+        for rule in self.nft_rules(wan):
+            ok, out = self.nft(*rule)
+            if not ok:
+                raise RuntimeError("nft: " + out)
+
+    def disable_sharing(self):
+        if self.nat_wan and self.nat_backend == 'nft':
+            self.nft('delete', 'table', 'ip', self.nft_table)
+        elif self.nat_wan:
+            for rule in self.nat_rules(self.nat_wan):
+                while self.iptables(rule, '-C')[0] and self.iptables(rule, '-D')[0]:
+                    pass
+        self.nat_wan = None
+        if self.forward_before == '0':
+            self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=0')
+        self.forward_before = None
+
+
+class NetworkOverSerial(InternetSharing, r.BaseJobExecutor):
     """
     Netzwerkverbindung über einen Serial-Port mit PPP. Rolle edge teilt das Internet (NAT), client nutzt es.
     """
@@ -667,78 +751,6 @@ class NetworkOverSerial(r.BaseJobExecutor):
         time.sleep(1)
         if self.proc.poll() is not None:
             raise RuntimeError("pppd beendet sich sofort: " + ' | '.join(list(self.log)[-5:]))
-
-    # ------------------------------------------------------------------
-    # edge: Internet teilen
-    # ------------------------------------------------------------------
-
-    def nat_rules(self, wan) -> list:
-        src = f'{self.client_ip}/32'
-        return [['-t', 'nat', '{}', 'POSTROUTING', '-s', src, '-o', wan, '-j', 'MASQUERADE'],
-                ['{}', 'FORWARD', '-i', self.ifname, '-o', wan, '-s', src, '-j', 'ACCEPT'],
-                ['{}', 'FORWARD', '-i', wan, '-o', self.ifname, '-d', src, '-m', 'conntrack',
-                 '--ctstate', 'RELATED,ESTABLISHED', '-j', 'ACCEPT']]
-
-    def iptables(self, rule, action):
-        return self.cmd.run(which('iptables') or 'iptables', '-w', *[action if a == '{}' else a for a in rule])
-
-    def nft(self, *args):
-        return self.cmd.run(which('nft') or 'nft', *args)
-
-    def nft_rules(self, wan) -> list:
-        """ eigene Tabelle, wird beim Trennen komplett geloescht """
-        t = ['ip', NFT_TABLE]
-        return [['add', 'table', *t],
-                ['add', 'chain', *t, 'postrouting', '{ type nat hook postrouting priority 100 ; policy accept ; }'],
-                ['add', 'rule', *t, 'postrouting', 'ip', 'saddr', self.client_ip, 'oifname', wan, 'masquerade'],
-                ['add', 'chain', *t, 'forward', '{ type filter hook forward priority 0 ; policy accept ; }'],
-                ['add', 'rule', *t, 'forward', 'iifname', self.ifname, 'oifname', wan, 'accept'],
-                ['add', 'rule', *t, 'forward', 'iifname', wan, 'oifname', self.ifname,
-                 'ct', 'state', 'related,established', 'accept']]
-
-    def enable_sharing(self):
-        wan = self.wan or default_route_dev()
-        if not wan:
-            raise RuntimeError("Keine Internetverbindung (Standardroute) zum Teilen gefunden")
-        ok, out = self.cmd.run('sysctl', '-n', 'net.ipv4.ip_forward', root=False)
-        self.forward_before = out.strip() if ok else None
-        ok, out = self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=1')
-        if not ok:
-            raise RuntimeError("IP-Forwarding nicht aktivierbar: " + out)
-        self.nat_backend = nat_backend()
-        if self.nat_backend == 'iptables':
-            self.enable_iptables(wan)
-        elif self.nat_backend == 'nft':
-            self.enable_nft(wan)
-        else:
-            raise RuntimeError("Weder iptables noch nft gefunden: sudo apt install nftables (oder iptables)")
-        self.nat_wan = wan
-
-    def enable_iptables(self, wan):
-        for rule in self.nat_rules(wan):
-            if not self.iptables(rule, '-C')[0]:  # nur einmal eintragen, vorne vor evtl. DROP/REJECT-Regeln
-                ok, out = self.iptables(rule, '-I')
-                if not ok:
-                    raise RuntimeError("iptables: " + out)
-
-    def enable_nft(self, wan):
-        self.nft('delete', 'table', 'ip', NFT_TABLE)  # Reste eines frueheren Starts
-        for rule in self.nft_rules(wan):
-            ok, out = self.nft(*rule)
-            if not ok:
-                raise RuntimeError("nft: " + out)
-
-    def disable_sharing(self):
-        if self.nat_wan and self.nat_backend == 'nft':
-            self.nft('delete', 'table', 'ip', NFT_TABLE)
-        elif self.nat_wan:
-            for rule in self.nat_rules(self.nat_wan):
-                while self.iptables(rule, '-C')[0] and self.iptables(rule, '-D')[0]:
-                    pass
-        self.nat_wan = None
-        if self.forward_before == '0':
-            self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=0')
-        self.forward_before = None
 
     # ------------------------------------------------------------------
     # client: Route

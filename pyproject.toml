@@ -69,6 +69,7 @@ crowpanel = "nxrunner.devices.epaper:EspEPaperDashboard"
 
 network_manager = "nxrunner.network.networkmanager:NetworkManager"
 network_serial_setup = "nxrunner.network.serial:SerialSetup"
+network_rs485 = "nxrunner.network.rs485:NetworkOverRS485"
 projects = "nxrunner.projects:Projects"
 deployments = "nxrunner.projects:Deployments"
 anemometer_kalib = "nxrunner.app.anemometer:AnemometerKalibrierung"
