@@ -20,6 +20,7 @@ Zwei Rechner werden ueber eine serielle Leitung (USB-Seriell-Adapter, UART, Null
         {"type": "network_serial", "op": "stop"}       Verbindung trennen und den Serial-Port freigeben
         {"type": "network_serial", "op": "status"}
         {"type": "network_serial", "op": "check"}      Voraussetzungen pruefen
+        {"type": "network_serial", "op": "diagnose"}   laufende Verbindung testen (Ping, Route, NAT, DNS)
         {"type": "serial_setup", "op": "apply", "role": "client", "device": "/dev/ttyUSB0", "baud": "115200"}
 
     Voraussetzungen (Linux): Paket ppp (pppd, /dev/ppp), beim edge iptables, fuer den WLAN-Hotspot NetworkManager
@@ -125,6 +126,14 @@ class Cmd:
 
 def which(name):
     return shutil.which(name) or next((p for p in (f'/usr/sbin/{name}', f'/sbin/{name}') if os.path.exists(p)), None)
+
+
+NFT_TABLE = 'nxserial'  # eigene nftables-Tabelle des edge, wenn kein iptables installiert ist
+
+
+def nat_backend():
+    """ iptables (bevorzugt) oder nft fuer das NAT des edge, None wenn keins vorhanden """
+    return 'iptables' if which('iptables') else ('nft' if which('nft') else None)
 
 
 class Check:
@@ -336,10 +345,10 @@ class SerialNetChecks:
         return Check("ModemManager", 'ok', "nicht aktiv")
 
     def check_iptables(self):
-        path = which('iptables')
-        if path:
-            return Check("iptables", 'ok', path)
-        return Check("iptables", 'fail', "nicht installiert", "sudo apt install iptables")
+        backend = nat_backend()
+        if backend:
+            return Check("NAT-Werkzeug", 'ok', f"{backend} ({which(backend)})")
+        return Check("NAT-Werkzeug", 'fail', "weder iptables noch nft installiert", "sudo apt install nftables")
 
     def check_wan(self):
         wan = self.wan or default_route_dev()
@@ -361,6 +370,155 @@ class SerialNetChecks:
             return Check("Standardroute", 'warn', f"bereits über {dev}",
                          "Die Route über PPP wird mit kleinerer Metrik zusätzlich gesetzt")
         return Check("Standardroute", 'ok', dev or "keine, wird über PPP gesetzt")
+
+
+LOG_HINTS = (('LCP: timeout', "Gegenstelle antwortet nicht (Kabel TX/RX, Baudrate, pppd auf der Gegenseite?)"),
+             ('Serial link appears to be disconnected', "Serial-Link getrennt (LCP-Echo ohne Antwort)"),
+             ('Modem hangup', "Leitung aufgelegt (DCD/local?)"),
+             ('LCP terminated by peer', "Gegenstelle hat die Verbindung beendet"),
+             ('Loopback detected', "Echo der eigenen Daten: TX und RX kurzgeschlossen oder Konsole/getty auf dem Port"),
+             ('IPCP: timeout', "IP-Aushandlung scheitert (IP-Adressen beider Seiten passend?)"),
+             ('Connection terminated', "Verbindung beendet"))
+
+
+class LinkDiagnosis:
+    """ Prueft die laufende Verbindung Schicht fuer Schicht: Serial/PPP, Gegenstelle, Routing, NAT, DNS """
+
+    def __init__(self, nos: 'NetworkOverSerial'):
+        self.nos, self.cmd = nos, nos.cmd
+
+    def run(self) -> list:
+        checks = [self.check_pppd(), self.check_interface(), self.check_counters(), self.check_log(),
+                  self.check_peer()]
+        if self.nos.role == 'edge':
+            checks += [self.check_forward(), self.check_nat(), self.check_forward_policy(), self.check_wan_internet()]
+        else:
+            checks += [self.check_route(), self.check_internet_via_ppp(), self.check_resolv(), self.check_dns()]
+        return [c for c in checks if c is not None]
+
+    def ping(self, host, ifname=None, count=3):
+        args = ['ping', '-n', '-c', count, '-W', 2] + (['-I', ifname] if ifname else []) + [host]
+        ok, out = self.cmd.run(*args, root=False, timeout=count * 3 + 5)
+        m = re.search(r'(\d+)% packet loss', out)
+        return ok, (m.group(0) if m else out.splitlines()[-1] if out else "keine Ausgabe")
+
+    def check_pppd(self):
+        if self.nos.is_running():
+            return Check("pppd", 'ok', "läuft")
+        return Check("pppd", 'fail', "läuft nicht", "Verbinden drücken, pppd-Ausgabe ansehen")
+
+    def check_interface(self):
+        if not self.nos.is_up():
+            return Check("PPP-Interface", 'fail', f"{self.nos.ifname} existiert nicht",
+                         "PPP-Aushandlung nicht abgeschlossen: Serial-Link prüfen (siehe pppd-Ausgabe)")
+        addr = self.nos.ip_addr()
+        if self.nos.local_ip not in addr:
+            return Check("PPP-Interface", 'warn', f"{self.nos.ifname} ohne IP {self.nos.local_ip}", addr)
+        return Check("PPP-Interface", 'ok', f"{self.nos.ifname} {self.nos.local_ip} -> {self.nos.remote_ip}")
+
+    def check_counters(self):
+        stats = self.nos.link_stats()
+        if not stats:
+            return None
+        rx, err = stats.get('rx_packets', 0), stats.get('rx_errors', 0) + stats.get('rx_frame_errors', 0)
+        msg = f"RX {rx} Pakete, {err} Fehler, TX {stats.get('tx_packets', 0)} Pakete"
+        if rx == 0:
+            return Check("Serial-Daten", 'fail', msg, "Es kommt nichts an: RX/TX gekreuzt? GND verbunden? Baudrate?")
+        if err * 20 > rx:
+            return Check("Serial-Daten", 'warn', msg, "Viele Fehler: Baudrate senken, Kabel/GND prüfen, Flusssteuerung;"
+                                                      " bleibt es bei niedriger Baudrate, Adapter tauschen"
+                                                      " (gefälschte FTDI-Chips verlieren unter Dauerlast Daten)")
+        return Check("Serial-Daten", 'ok', msg)
+
+    def check_log(self):
+        text = '\n'.join(self.nos.log)
+        found = [hint for pattern, hint in LOG_HINTS if pattern in text]
+        if 'LL address' in text and 'local  IP address' not in text:
+            found.append("IPv6 ausgehandelt, aber keine IPv4-Adresse (IPCP): laufen beide Seiten mit "
+                         "unterschiedlicher Rolle (edge/client)?")
+        if found:
+            return Check("pppd-Meldungen", 'warn', '; '.join(found))
+        return Check("pppd-Meldungen", 'ok', "keine bekannten Fehlermeldungen")
+
+    def check_peer(self):
+        if not self.nos.is_up():
+            return None
+        ok, msg = self.ping(self.nos.remote_ip, self.nos.ifname)
+        if ok:
+            return Check("Gegenstelle", 'ok', f"{self.nos.remote_ip}: {msg}", "Serial-Link und PPP funktionieren")
+        return Check("Gegenstelle", 'fail', f"{self.nos.remote_ip} nicht erreichbar: {msg}",
+                     "PPP steht, aber keine IP-Pakete: Firewall (INPUT) oder Fehler auf der Leitung")
+
+    def check_forward(self):
+        ok, out = self.cmd.run('sysctl', '-n', 'net.ipv4.ip_forward', root=False, timeout=5)
+        if ok and out.strip() == '1':
+            return Check("IP-Forwarding", 'ok', "aktiv")
+        return Check("IP-Forwarding", 'fail', "aus: " + out, "sudo sysctl -w net.ipv4.ip_forward=1")
+
+    def check_nat(self):
+        wan = self.nos.nat_wan
+        if not wan:
+            return Check("NAT", 'fail', "keine NAT-Regeln gesetzt", "Verbindung neu aufbauen (edge)")
+        if self.nos.nat_backend == 'nft':
+            ok, out = self.nos.nft('list', 'table', 'ip', NFT_TABLE)
+            missing = [] if ok and 'masquerade' in out else ['masquerade']
+        else:
+            missing = [i for i, rule in enumerate(self.nos.nat_rules(wan)) if not self.nos.iptables(rule, '-C')[0]]
+        if missing:
+            return Check("NAT", 'fail', f"Regeln fehlen über {wan}: {missing}", "Verbindung neu aufbauen")
+        return Check("NAT", 'ok', f"MASQUERADE {self.nos.client_ip} über {wan} ({self.nos.nat_backend})")
+
+    def check_forward_policy(self):
+        first, hint = '', ''
+        if which('iptables'):
+            ok, out = self.nos.iptables(['-S', 'FORWARD'], '')
+            first = out.splitlines()[0] if ok and out else out
+        if which('nft'):
+            nok, nout = self.nos.nft('list', 'ruleset')
+            if nok and re.search(r'hook forward .*policy drop', nout) and 'xt ' not in nout:
+                hint = "nftables-Tabelle mit forward policy drop gefunden (firewalld/nftables), dort freigeben"
+        return Check("FORWARD-Kette", 'warn' if hint else 'ok', first or "keine DROP-Policy gefunden", hint)
+
+    def check_wan_internet(self):
+        wan = self.nos.nat_wan or default_route_dev()
+        ok, msg = self.ping('1.1.1.1', wan, count=2)
+        return Check("Internet (edge)", 'ok' if ok else 'fail', f"1.1.1.1 über {wan}: {msg}")
+
+    def check_route(self):
+        dev = default_route_dev()
+        ok, out = self.cmd.run('ip', '-4', 'route', 'get', '1.1.1.1', root=False, timeout=5)
+        via = re.search(r'\bdev\s+(\S+)', out)
+        via = via.group(1) if via else dev
+        if via == self.nos.ifname:
+            return Check("Standardroute", 'ok', f"1.1.1.1 über {via}")
+        return Check("Standardroute", 'fail', f"1.1.1.1 geht über {via}, nicht über {self.nos.ifname}",
+                     f"sudo ip route replace default dev {self.nos.ifname} metric {self.nos.route_metric}")
+
+    def check_internet_via_ppp(self):
+        if not self.nos.is_up():
+            return None
+        ok, msg = self.ping('1.1.1.1', self.nos.ifname, count=2)
+        if ok:
+            return Check("Internet über edge", 'ok', f"1.1.1.1: {msg}")
+        return Check("Internet über edge", 'fail', f"1.1.1.1: {msg}",
+                     "Gegenstelle erreichbar, aber kein Internet: auf dem edge Diagnose ausführen (NAT/Forwarding)")
+
+    def check_resolv(self):
+        try:
+            with open('/etc/resolv.conf') as f:
+                servers = re.findall(r'^nameserver\s+(\S+)', f.read(), re.M)
+        except OSError as e:
+            return Check("DNS-Server", 'fail', str(e))
+        return Check("DNS-Server", 'ok' if servers else 'fail', ', '.join(servers) or "keine in /etc/resolv.conf",
+                     "" if servers else "nameserver 1.1.1.1 in /etc/resolv.conf eintragen")
+
+    def check_dns(self):
+        try:
+            addr = socket.gethostbyname('example.org')
+            return Check("Namensauflösung", 'ok', f"example.org -> {addr}")
+        except OSError as e:
+            return Check("Namensauflösung", 'fail', str(e),
+                         "Ping auf 1.1.1.1 ok? Dann liegt es an DNS: /etc/resolv.conf bzw. systemd-resolved prüfen")
 
 
 def device_users(device, cmd: Cmd = None) -> list:
@@ -412,12 +570,17 @@ class NetworkOverSerial(r.BaseJobExecutor):
         self.lock = threading.RLock()
         self.log = collections.deque(maxlen=self.LOG_LINES)
         self.nat_wan = None  # Interface, fuer das NAT-Regeln gesetzt wurden
+        self.nat_backend = None  # iptables oder nft
         self.forward_before = None  # ip_forward vor dem Start (edge)
         self.last_error = ''
+        self.last_diagnosis = None  # (Uhrzeit, [Check]) des letzten Verbindungstests
+        self.route_thread = None  # haelt die Default-Route ueber PPP (client)
         self.define_vars('role', 'device', 'baud', 'flow', 'wifi_share', 'wifi_ssid', 'last_error')
         atexit.register(self.release_on_exit)
         if yes(autostart):
             threading.Timer(2, self.start).start()
+        elif self.is_running():  # pppd aus einem frueheren Runner laeuft weiter
+            self.ensure_route_watcher()
 
     # ------------------------------------------------------------------
     # Eigenschaften
@@ -462,7 +625,7 @@ class NetworkOverSerial(r.BaseJobExecutor):
                 'nodetach', 'noauth', 'local', 'lock', 'persist', 'maxfail', '0', 'holdoff', '3',
                 'lcp-echo-interval', '5', 'lcp-echo-failure', '4', 'unit', str(self.unit),
                 'linkname', self.linkname, 'mtu', str(self.mtu), 'mru', str(self.mtu),
-                'nodefaultroute']
+                'nodefaultroute', 'noccp']  # keine Kompression: bei Leitungsfehlern ständige CCP-Resets
         args += {'rtscts': ['crtscts'], 'xonxoff': ['xonxoff']}.get(self.flow, ['nocrtscts'])
         if self.role == 'edge':
             args += ['ms-dns', self.dns] if self.dns else []
@@ -517,7 +680,21 @@ class NetworkOverSerial(r.BaseJobExecutor):
                  '--ctstate', 'RELATED,ESTABLISHED', '-j', 'ACCEPT']]
 
     def iptables(self, rule, action):
-        return self.cmd.run('iptables', '-w', *[action if a == '{}' else a for a in rule])
+        return self.cmd.run(which('iptables') or 'iptables', '-w', *[action if a == '{}' else a for a in rule])
+
+    def nft(self, *args):
+        return self.cmd.run(which('nft') or 'nft', *args)
+
+    def nft_rules(self, wan) -> list:
+        """ eigene Tabelle, wird beim Trennen komplett geloescht """
+        t = ['ip', NFT_TABLE]
+        return [['add', 'table', *t],
+                ['add', 'chain', *t, 'postrouting', '{ type nat hook postrouting priority 100 ; policy accept ; }'],
+                ['add', 'rule', *t, 'postrouting', 'ip', 'saddr', self.client_ip, 'oifname', wan, 'masquerade'],
+                ['add', 'chain', *t, 'forward', '{ type filter hook forward priority 0 ; policy accept ; }'],
+                ['add', 'rule', *t, 'forward', 'iifname', self.ifname, 'oifname', wan, 'accept'],
+                ['add', 'rule', *t, 'forward', 'iifname', wan, 'oifname', self.ifname,
+                 'ct', 'state', 'related,established', 'accept']]
 
     def enable_sharing(self):
         wan = self.wan or default_route_dev()
@@ -528,19 +705,37 @@ class NetworkOverSerial(r.BaseJobExecutor):
         ok, out = self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=1')
         if not ok:
             raise RuntimeError("IP-Forwarding nicht aktivierbar: " + out)
-        for rule in self.nat_rules(wan):
-            if not self.iptables(rule, '-C')[0]:  # nur einmal eintragen
-                ok, out = self.iptables(rule, '-A')
-                if not ok:
-                    raise RuntimeError("iptables: " + out)
+        self.nat_backend = nat_backend()
+        if self.nat_backend == 'iptables':
+            self.enable_iptables(wan)
+        elif self.nat_backend == 'nft':
+            self.enable_nft(wan)
+        else:
+            raise RuntimeError("Weder iptables noch nft gefunden: sudo apt install nftables (oder iptables)")
         self.nat_wan = wan
 
+    def enable_iptables(self, wan):
+        for rule in self.nat_rules(wan):
+            if not self.iptables(rule, '-C')[0]:  # nur einmal eintragen, vorne vor evtl. DROP/REJECT-Regeln
+                ok, out = self.iptables(rule, '-I')
+                if not ok:
+                    raise RuntimeError("iptables: " + out)
+
+    def enable_nft(self, wan):
+        self.nft('delete', 'table', 'ip', NFT_TABLE)  # Reste eines frueheren Starts
+        for rule in self.nft_rules(wan):
+            ok, out = self.nft(*rule)
+            if not ok:
+                raise RuntimeError("nft: " + out)
+
     def disable_sharing(self):
-        if self.nat_wan:
+        if self.nat_wan and self.nat_backend == 'nft':
+            self.nft('delete', 'table', 'ip', NFT_TABLE)
+        elif self.nat_wan:
             for rule in self.nat_rules(self.nat_wan):
                 while self.iptables(rule, '-C')[0] and self.iptables(rule, '-D')[0]:
                     pass
-            self.nat_wan = None
+        self.nat_wan = None
         if self.forward_before == '0':
             self.cmd.run('sysctl', '-w', 'net.ipv4.ip_forward=0')
         self.forward_before = None
@@ -559,14 +754,27 @@ class NetworkOverSerial(r.BaseJobExecutor):
             time.sleep(0.5)
         return False
 
+    def ensure_route_watcher(self):
+        """ startet den Routen-Thread (client), falls er nicht schon laeuft """
+        if self.role != 'client' or not self.default_route:
+            return
+        if self.route_thread is None or not self.route_thread.is_alive():
+            self.route_thread = threading.Thread(target=self.route_watcher, daemon=True)
+            self.route_thread.start()
+
+    def has_default_route(self) -> bool:
+        ok, out = self.cmd.run('ip', '-4', 'route', 'show', 'default', 'dev', self.ifname, root=False, timeout=5)
+        return ok and 'default' in out
+
     def route_watcher(self):
-        """ Setzt die Default-Route, sobald das Interface oben ist (auch nach Reconnect durch persist) """
-        while self.proc is not None and self.proc.poll() is None:
-            if self.wait_up(timeout=10):
+        """
+        Setzt die Default-Route ueber PPP, solange pppd laeuft (auch fuer ein pppd aus einem frueheren Runner),
+        und stellt sie wieder her, wenn sie nach einem Reconnect (persist) oder durch NetworkManager fehlt
+        """
+        while self.is_running():
+            if self.wait_up(timeout=10) and not self.has_default_route():
                 self.cmd.run('ip', 'route', 'replace', 'default', 'dev', self.ifname, 'metric', self.route_metric)
-                while self.is_up() and self.proc is not None and self.proc.poll() is None:
-                    time.sleep(3)
-            time.sleep(1)
+            time.sleep(3)
 
     def ip_addr(self) -> str:
         ok, out = self.cmd.run('ip', '-4', '-o', 'addr', 'show', 'dev', self.ifname, root=False, timeout=5)
@@ -580,6 +788,7 @@ class NetworkOverSerial(r.BaseJobExecutor):
         """ :return: (ok, nachricht) """
         with self.lock:
             if self.is_running():
+                self.ensure_route_watcher()
                 return True, "läuft bereits"
             checks = self.checks().run()
             failed = [c for c in checks if c.level == 'fail']
@@ -594,8 +803,7 @@ class NetworkOverSerial(r.BaseJobExecutor):
                 self.last_error = str(e)
                 self.stop()
                 return False, str(e)
-            if self.role == 'client' and self.default_route:
-                threading.Thread(target=self.route_watcher, daemon=True).start()
+            self.ensure_route_watcher()
             self.last_error = ''
             msg = f"pppd gestartet ({self.role}, {self.device} @ {self.baud})"
             return True, msg + self.start_wifi()
@@ -703,6 +911,13 @@ class NetworkOverSerial(r.BaseJobExecutor):
         checks = self.checks().run()
         return self.success(ok=SerialNetChecks.ok(checks), checks=[c.to_dict() for c in checks])
 
+    @op("Laufende Verbindung testen: Serial/PPP, Gegenstelle, Routing, NAT, DNS",
+        success={'checks': 'list', 'ok': 'bool'}, fail={}, name='diagnose')
+    def op_diagnose(self):
+        checks = LinkDiagnosis(self).run()
+        self.last_diagnosis = (time.strftime('%H:%M:%S'), checks)
+        return self.success(ok=SerialNetChecks.ok(checks), checks=[c.to_dict() for c in checks], ui_reload=True)
+
     @op("Einstellungen ändern (nur gestoppt)", result={'success': 'bool', 'message': 'str'}, name='configure')
     def op_configure(self, role: str = '', device: str = '', baud: str = '', flow: str = '', wifi_share: str = '',
                      wifi_ssid: str = '', wifi_password: str = '', wifi_ifname: str = ''):
@@ -731,7 +946,8 @@ class NetworkOverSerial(r.BaseJobExecutor):
                     up=self.is_up(), ifname=self.ifname, local_ip=self.local_ip, remote_ip=self.remote_ip,
                     addr=self.ip_addr() if self.is_up() else '', nat_wan=self.nat_wan or '',
                     wifi_share=self.wifi_share, wifi_active=wifi is not None and wifi.is_active(),
-                    wifi_ssid=self.wifi_ssid if wifi is not None else '', last_error=self.last_error)
+                    wifi_ssid=self.wifi_ssid if wifi is not None else '', last_error=self.last_error,
+                    stats=self.link_stats())
 
     # ------------------------------------------------------------------
     # UI
@@ -743,8 +959,7 @@ class NetworkOverSerial(r.BaseJobExecutor):
     def part_index(self, p: base.Page, params={}):
         self.part_state(p)
         self.part_settings(p)
-        with p.section(h="Voraussetzungen"):
-            part_checks(p, self.checks().run())
+        self.part_link_stats(p)
         with p.expandable("pppd-Ausgabe", expanded=False):
             p.pre(esc('\n'.join(self.log) or "Noch keine Ausgabe"))
 
@@ -762,6 +977,41 @@ class NetworkOverSerial(r.BaseJobExecutor):
                   + self.btn("Trennen", 'stop', "Beendet pppd, entfernt NAT-Regeln und gibt den Serial-Port frei")
                   + self.btn("Neu verbinden", 'restart', "Trennt und baut die Verbindung neu auf"))
             self.part_wifi(p, status)
+
+    def part_link_stats(self, p: base.Page):
+        """ Zaehler des PPP-Interfaces (RX/TX Pakete, Bytes, Fehler) """
+        with p.section(h="Verbindung"):
+            stats = self.link_stats()
+            if not stats:
+                p.p("Interface " + esc(self.ifname) + " ist nicht aktiv, keine Statistik verfügbar")
+            for key, title in STAT_TITLES:
+                if key in stats:
+                    p.prop(title, format_bytes(stats[key]) if key.endswith('_bytes') else str(stats[key]))
+            p.div(self.btn("Verbindung testen", 'diagnose',
+                           "Pingt Gegenstelle und Internet, prüft Route, NAT und DNS und zeigt, wo es hakt")
+                  + self.btn("Voraussetzungen prüfen", 'check', "Prüft pppd, Serial-Port und Rechte für die Verbindung"))
+            self.part_diagnosis(p)
+
+    def part_diagnosis(self, p: base.Page):
+        if self.last_diagnosis is None:
+            return
+        when, checks = self.last_diagnosis
+        p.p("Verbindungstest von " + esc(when))
+        rows = [dict(c.to_dict(), state=LEVEL_TITLE.get(c.level, c.level)) for c in checks]
+        p.grid(rows, [w.Grid.col('state', "Status"), w.Grid.col('name', "Prüfung"),
+                      w.Grid.col('message', "Ergebnis"), w.Grid.col('hint', "Hinweis")], empty="Keine Prüfungen")
+
+    def link_stats(self) -> dict:
+        """ Liest /sys/class/net/<ifname>/statistics, leer wenn das Interface nicht existiert """
+        base_dir = f'/sys/class/net/{self.ifname}/statistics'
+        res = {}
+        for key, _ in STAT_TITLES:
+            try:
+                with open(os.path.join(base_dir, key)) as f:
+                    res[key] = int(f.read().strip())
+            except (OSError, ValueError):
+                continue
+        return res
 
     def part_wifi(self, p: base.Page, status):
         if self.wifi is None:
@@ -786,6 +1036,18 @@ class NetworkOverSerial(r.BaseJobExecutor):
 # ----------------------------------------------------------------------
 
 LEVEL_TITLE = {'ok': "OK", 'warn': "Hinweis", 'fail': "Fehlt"}
+
+STAT_TITLES = (('rx_packets', "RX Pakete"), ('rx_bytes', "RX Daten"), ('rx_errors', "RX Fehler"),
+               ('rx_dropped', "RX Verworfen"), ('rx_frame_errors', "RX Frame-Fehler"),
+               ('rx_over_errors', "RX Überlauf"), ('tx_packets', "TX Pakete"), ('tx_bytes', "TX Daten"),
+               ('tx_errors', "TX Fehler"), ('tx_dropped', "TX Verworfen"))
+
+
+def format_bytes(n: int) -> str:
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if n < 1024 or unit == 'GiB':
+            return f"{n} {unit}" if unit == 'B' else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 def part_checks(p: base.Page, checks: list):
